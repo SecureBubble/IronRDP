@@ -63,6 +63,7 @@ struct SessionBuilderInner {
     proxy_address: Option<String>,
     auth_token: Option<String>,
     pcb: Option<String>,
+    load_balance_info: Option<String>,
     kdc_proxy_url: Option<String>,
     client_name: String,
     desktop_size: DesktopSize,
@@ -103,6 +104,7 @@ impl Default for SessionBuilderInner {
             proxy_address: None,
             auth_token: None,
             pcb: None,
+            load_balance_info: None,
             kdc_proxy_url: None,
             client_name: "ironrdp-web".to_owned(),
             desktop_size: DesktopSize {
@@ -245,6 +247,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         iron_remote_desktop::extension_match! {
             match ext;
             |pcb: String| { self.0.borrow_mut().pcb = Some(pcb) };
+            |load_balance_info: String| { self.0.borrow_mut().load_balance_info = Some(load_balance_info) };
             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
@@ -402,6 +405,20 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let enable_credssp = self.0.borrow().enable_credssp;
         config.enable_credssp = enable_credssp;
+
+        // RDP load-balance info / routing token. When set, it becomes the X.224
+        // Connection Request routing token (`Cookie: msts=<value>\r\n`) instead of the
+        // default `mstshash=<username>` cookie, so a broker/proxy can route the session.
+        // IronRDP's `routing_token()` re-adds the `Cookie: msts=` prefix, so strip it
+        // here to tolerate callers passing either the bare value or the full cookie form.
+        let load_balance_info = self.0.borrow().load_balance_info.clone();
+        if let Some(load_balance_info) = load_balance_info {
+            let value = load_balance_info
+                .strip_prefix("Cookie: msts=")
+                .unwrap_or(&load_balance_info)
+                .to_owned();
+            config.request_data = Some(ironrdp::pdu::nego::NegoRequestData::routing_token(value));
+        }
 
         let (input_events_tx, input_events_rx) = mpsc::unbounded();
 

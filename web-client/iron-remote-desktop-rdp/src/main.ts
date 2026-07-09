@@ -30,6 +30,14 @@ export function preConnectionBlob(pcb: string): Extension {
     return new Extension('pcb', pcb);
 }
 
+// RDP load-balance info / routing token. The value is sent as the X.224
+// Connection Request routing token (`Cookie: msts=<value>\r\n`); a leading
+// `Cookie: msts=` in the passed string is stripped on the Rust side so callers
+// may pass either the bare value or the full cookie form.
+export function loadBalanceInfo(info: string): Extension {
+    return new Extension('load_balance_info', info);
+}
+
 export function displayControl(enable: boolean): Extension {
     return new Extension('display_control', enable);
 }
