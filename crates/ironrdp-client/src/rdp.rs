@@ -19,7 +19,7 @@ use ironrdp_pdu::input::mouse::PointerFlags;
 #[cfg(any(feature = "dvc-pipe-proxy", all(windows, feature = "dvc-com-plugin")))]
 use ironrdp_pdu::pdu_other_err;
 use ironrdp_session::image::DecodedImage;
-use ironrdp_session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult, fast_path};
+use ironrdp_session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason, SessionResult, fast_path};
 use ironrdp_svc::SvcMessage;
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
 use ironrdp_tokio::{FramedWrite, single_sequence_step_read, split_tokio_framed};
@@ -737,15 +737,16 @@ async fn active_session(
     // Deactivation-Reactivation Sequence; `ActiveStage` no longer carries it.
     let connection_activation = connection_result.connection_activation;
 
-    let mut active_stage = ActiveStage::new(
-        connection_result.static_channels,
-        connection_result.user_channel_id,
-        connection_result.io_channel_id,
-        connection_result.share_id,
-        connection_result.compression_type,
-        connection_result.enable_server_pointer,
-        connection_result.pointer_software_rendering,
-    );
+    let mut active_stage = ActiveStageBuilder {
+        static_channels: connection_result.static_channels,
+        user_channel_id: connection_result.user_channel_id,
+        io_channel_id: connection_result.io_channel_id,
+        share_id: connection_result.share_id,
+        compression_type: connection_result.compression_type,
+        enable_server_pointer: connection_result.enable_server_pointer,
+        pointer_software_rendering: connection_result.pointer_software_rendering,
+    }
+    .build();
 
     // Timer interval for driving clipboard lock timeouts.
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(5));

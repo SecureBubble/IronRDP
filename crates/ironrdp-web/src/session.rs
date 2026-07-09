@@ -30,7 +30,7 @@ use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, fast_path};
+use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason, fast_path};
 use ironrdp_core::WriteBuf;
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
 use rgb::AsPixels as _;
@@ -664,15 +664,16 @@ impl iron_remote_desktop::Session for Session {
         // Deactivation-Reactivation Sequence; `ActiveStage` no longer carries it.
         let connection_activation = connection_result.connection_activation;
 
-        let mut active_stage = ActiveStage::new(
-            connection_result.static_channels,
-            connection_result.user_channel_id,
-            connection_result.io_channel_id,
-            connection_result.share_id,
-            connection_result.compression_type,
-            connection_result.enable_server_pointer,
-            connection_result.pointer_software_rendering,
-        );
+        let mut active_stage = ActiveStageBuilder {
+            static_channels: connection_result.static_channels,
+            user_channel_id: connection_result.user_channel_id,
+            io_channel_id: connection_result.io_channel_id,
+            share_id: connection_result.share_id,
+            compression_type: connection_result.compression_type,
+            enable_server_pointer: connection_result.enable_server_pointer,
+            pointer_software_rendering: connection_result.pointer_software_rendering,
+        }
+        .build();
 
         // Timer interval for driving clipboard lock timeouts (5 second interval)
         let mut cleanup_interval = IntervalStream::new(5_000).fuse();

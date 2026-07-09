@@ -16,7 +16,7 @@ use ironrdp::server::{
     RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, TlsIdentityCtx,
 };
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{self, ActiveStage, ActiveStageOutput};
+use ironrdp::session::{self, ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_async::{Framed, FramedWrite as _};
 use ironrdp_testsuite_extra as _;
 use ironrdp_tls::TlsStream;
@@ -325,15 +325,16 @@ where
                 // Retain the connection activation sequence so the client closure can drive its
                 // own Deactivation-Reactivation Sequence; `ActiveStage` no longer carries it.
                 let connection_activation = connection_result.connection_activation;
-                let active_stage = ActiveStage::new(
-                    connection_result.static_channels,
-                    connection_result.user_channel_id,
-                    connection_result.io_channel_id,
-                    connection_result.share_id,
-                    connection_result.compression_type,
-                    connection_result.enable_server_pointer,
-                    connection_result.pointer_software_rendering,
-                );
+                let active_stage = ActiveStageBuilder {
+                    static_channels: connection_result.static_channels,
+                    user_channel_id: connection_result.user_channel_id,
+                    io_channel_id: connection_result.io_channel_id,
+                    share_id: connection_result.share_id,
+                    compression_type: connection_result.compression_type,
+                    enable_server_pointer: connection_result.enable_server_pointer,
+                    pointer_software_rendering: connection_result.pointer_software_rendering,
+                }
+                .build();
                 let (active_stage, mut upgraded_framed) = clientfn(
                     active_stage,
                     connection_activation,

@@ -36,16 +36,35 @@ pub struct ActiveStage {
     enable_server_pointer: bool,
 }
 
-impl ActiveStage {
-    pub fn new(
-        static_channels: StaticChannelSet,
-        user_channel_id: u16,
-        io_channel_id: u16,
-        share_id: u32,
-        compression_type: Option<PduCompressionType>,
-        enable_server_pointer: bool,
-        pointer_software_rendering: bool,
-    ) -> Self {
+/// Builder for [`ActiveStage`].
+///
+/// All fields are required; they are typically taken straight from the connector's
+/// `ConnectionResult` once the connection sequence is finalized.
+pub struct ActiveStageBuilder {
+    pub static_channels: StaticChannelSet,
+    pub user_channel_id: u16,
+    pub io_channel_id: u16,
+    pub share_id: u32,
+    /// The bulk compression type that was negotiated, if any.
+    pub compression_type: Option<PduCompressionType>,
+    /// Enable server-side pointer updates (client-side pointer rendering).
+    pub enable_server_pointer: bool,
+    /// Use software rendering mode for pointer bitmap generation.
+    pub pointer_software_rendering: bool,
+}
+
+impl ActiveStageBuilder {
+    pub fn build(self) -> ActiveStage {
+        let Self {
+            static_channels,
+            user_channel_id,
+            io_channel_id,
+            share_id,
+            compression_type,
+            enable_server_pointer,
+            pointer_software_rendering,
+        } = self;
+
         let x224_processor = x224::Processor::new(static_channels, user_channel_id, io_channel_id, share_id);
 
         // Create bulk decompressor if compression was negotiated
@@ -73,13 +92,15 @@ impl ActiveStage {
         }
         .build();
 
-        Self {
+        ActiveStage {
             x224_processor,
             fast_path_processor,
             enable_server_pointer,
         }
     }
+}
 
+impl ActiveStage {
     pub fn update_mouse_pos(&mut self, x: u16, y: u16) {
         self.fast_path_processor.update_mouse_pos(x, y);
     }
