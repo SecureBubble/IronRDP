@@ -970,8 +970,6 @@ async fn active_session(
                             })?;
                         }
                         if let ConnectionActivationState::Finalized {
-                            io_channel_id,
-                            user_channel_id,
                             desktop_size,
                             share_id,
                             enable_server_pointer,
@@ -982,8 +980,8 @@ async fn active_session(
                             image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
                             active_stage.set_fastpath_processor(
                                 fast_path::ProcessorBuilder {
-                                    io_channel_id,
-                                    user_channel_id,
+                                    io_channel_id: connection_activation.io_channel_id(),
+                                    user_channel_id: connection_activation.user_channel_id(),
                                     share_id,
                                     enable_server_pointer,
                                     pointer_software_rendering,

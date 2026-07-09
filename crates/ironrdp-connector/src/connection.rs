@@ -562,7 +562,7 @@ impl Sequence for ClientConnector {
                     // Server Deactivate All PDU before the Server Demand Active PDU (sent
                     // by e.g. Windows Server and gnome-remote-desktop); mirror it here and
                     // wait for the next input.
-                    ConnectionActivationState::CapabilitiesExchange { .. } => (
+                    ConnectionActivationState::CapabilitiesExchange => (
                         written,
                         ClientConnectorState::CapabilitiesExchange { connection_activation },
                     ),
@@ -583,16 +583,14 @@ impl Sequence for ClientConnector {
                 } else {
                     match connection_activation.connection_activation_state() {
                         ConnectionActivationState::Finalized {
-                            io_channel_id,
-                            user_channel_id,
                             desktop_size,
                             share_id,
                             enable_server_pointer,
                             pointer_software_rendering,
                         } => ClientConnectorState::Connected {
                             result: ConnectionResult {
-                                io_channel_id,
-                                user_channel_id,
+                                io_channel_id: connection_activation.io_channel_id(),
+                                user_channel_id: connection_activation.user_channel_id(),
                                 share_id,
                                 static_channels: mem::take(&mut self.static_channels),
                                 desktop_size,

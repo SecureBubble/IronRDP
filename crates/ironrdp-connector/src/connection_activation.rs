@@ -25,17 +25,29 @@ use crate::{
 pub struct ConnectionActivationSequence {
     state: ConnectionActivationState,
     config: Config,
+    // The MCS channel IDs are invariant for the whole life of the sequence: they are negotiated
+    // once and never change, even across a Deactivation-Reactivation Sequence. They are stored
+    // here (rather than duplicated into every state variant) so that `reset` is total.
+    io_channel_id: u16,
+    user_channel_id: u16,
 }
 
 impl ConnectionActivationSequence {
     pub fn new(config: Config, io_channel_id: u16, user_channel_id: u16) -> Self {
         Self {
-            state: ConnectionActivationState::CapabilitiesExchange {
-                io_channel_id,
-                user_channel_id,
-            },
+            state: ConnectionActivationState::CapabilitiesExchange,
             config,
+            io_channel_id,
+            user_channel_id,
         }
+    }
+
+    pub fn io_channel_id(&self) -> u16 {
+        self.io_channel_id
+    }
+
+    pub fn user_channel_id(&self) -> u16 {
+        self.user_channel_id
     }
 
     /// Returns the current state as a district type, rather than `&dyn State` provided by [`Self::state`].
@@ -46,31 +58,10 @@ impl ConnectionActivationSequence {
     /// Resets the sequence back to the initial `CapabilitiesExchange` state so it can be driven
     /// again, e.g. to run the Deactivation-Reactivation Sequence.
     ///
-    /// The instance is reset in place. If the original is still needed, clone it first
-    /// (`let mut cloned = seq.clone(); cloned.reset();`).
+    /// The instance is reset in place, and this is valid from any state. If the original is still
+    /// needed, clone it first (`let mut cloned = seq.clone(); cloned.reset();`).
     pub fn reset(&mut self) {
-        match &self.state {
-            ConnectionActivationState::CapabilitiesExchange {
-                io_channel_id,
-                user_channel_id,
-            }
-            | ConnectionActivationState::ConnectionFinalization {
-                io_channel_id,
-                user_channel_id,
-                ..
-            }
-            | ConnectionActivationState::Finalized {
-                io_channel_id,
-                user_channel_id,
-                ..
-            } => {
-                self.state = ConnectionActivationState::CapabilitiesExchange {
-                    io_channel_id: *io_channel_id,
-                    user_channel_id: *user_channel_id,
-                };
-            }
-            ConnectionActivationState::Consumed => {}
-        }
+        self.state = ConnectionActivationState::CapabilitiesExchange;
     }
 }
 
@@ -79,7 +70,7 @@ impl Sequence for ConnectionActivationSequence {
         match &self.state {
             ConnectionActivationState::Consumed => None,
             ConnectionActivationState::Finalized { .. } => None,
-            ConnectionActivationState::CapabilitiesExchange { .. } => Some(&ironrdp_pdu::X224_HINT),
+            ConnectionActivationState::CapabilitiesExchange => Some(&ironrdp_pdu::X224_HINT),
             ConnectionActivationState::ConnectionFinalization {
                 connection_finalization,
                 ..
@@ -98,10 +89,10 @@ impl Sequence for ConnectionActivationSequence {
                     "connector sequence state is finalized or consumed (this is a bug)"
                 ));
             }
-            ConnectionActivationState::CapabilitiesExchange {
-                io_channel_id,
-                user_channel_id,
-            } => {
+            ConnectionActivationState::CapabilitiesExchange => {
+                let io_channel_id = self.io_channel_id;
+                let user_channel_id = self.user_channel_id;
+
                 debug!("Capabilities Exchange");
 
                 let send_data_indication_ctx =
@@ -132,10 +123,7 @@ impl Sequence for ConnectionActivationSequence {
                     debug!(
                         "Skipping Server Deactivate All PDU received during Capabilities Exchange, awaiting Server Demand Active"
                     );
-                    self.state = ConnectionActivationState::CapabilitiesExchange {
-                        io_channel_id,
-                        user_channel_id,
-                    };
+                    self.state = ConnectionActivationState::CapabilitiesExchange;
                     return Ok(Written::Nothing);
                 }
 
@@ -203,8 +191,6 @@ impl Sequence for ConnectionActivationSequence {
                 (
                     Written::from_size(written)?,
                     ConnectionActivationState::ConnectionFinalization {
-                        io_channel_id,
-                        user_channel_id,
                         desktop_size,
                         share_id,
                         connection_finalization: ConnectionFinalizationSequence::new(
@@ -216,8 +202,6 @@ impl Sequence for ConnectionActivationSequence {
                 )
             }
             ConnectionActivationState::ConnectionFinalization {
-                io_channel_id,
-                user_channel_id,
                 desktop_size,
                 share_id,
                 mut connection_finalization,
@@ -228,16 +212,12 @@ impl Sequence for ConnectionActivationSequence {
 
                 let next_state = if !connection_finalization.state.is_terminal() {
                     ConnectionActivationState::ConnectionFinalization {
-                        io_channel_id,
-                        user_channel_id,
                         desktop_size,
                         share_id,
                         connection_finalization,
                     }
                 } else {
                     ConnectionActivationState::Finalized {
-                        io_channel_id,
-                        user_channel_id,
                         desktop_size,
                         share_id,
                         enable_server_pointer: self.config.enable_server_pointer,
@@ -259,20 +239,13 @@ impl Sequence for ConnectionActivationSequence {
 pub enum ConnectionActivationState {
     #[default]
     Consumed,
-    CapabilitiesExchange {
-        io_channel_id: u16,
-        user_channel_id: u16,
-    },
+    CapabilitiesExchange,
     ConnectionFinalization {
-        io_channel_id: u16,
-        user_channel_id: u16,
         desktop_size: DesktopSize,
         share_id: u32,
         connection_finalization: ConnectionFinalizationSequence,
     },
     Finalized {
-        io_channel_id: u16,
-        user_channel_id: u16,
         desktop_size: DesktopSize,
         share_id: u32,
         enable_server_pointer: bool,
@@ -284,7 +257,7 @@ impl State for ConnectionActivationState {
     fn name(&self) -> &'static str {
         match self {
             ConnectionActivationState::Consumed => "Consumed",
-            ConnectionActivationState::CapabilitiesExchange { .. } => "CapabilitiesExchange",
+            ConnectionActivationState::CapabilitiesExchange => "CapabilitiesExchange",
             ConnectionActivationState::ConnectionFinalization { .. } => "ConnectionFinalization",
             ConnectionActivationState::Finalized { .. } => "Finalized",
         }

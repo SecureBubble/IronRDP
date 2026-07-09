@@ -90,8 +90,6 @@ async fn test_deactivation_reactivation() {
                             }
 
                             if let connector::connection_activation::ConnectionActivationState::Finalized {
-                                io_channel_id,
-                                user_channel_id,
                                 desktop_size,
                                 share_id,
                                 enable_server_pointer,
@@ -104,8 +102,8 @@ async fn test_deactivation_reactivation() {
                                 // Update the active stage with the new channel IDs and pointer settings.
                                 stage.set_fastpath_processor(
                                     session::fast_path::ProcessorBuilder {
-                                        io_channel_id,
-                                        user_channel_id,
+                                        io_channel_id: connection_activation.io_channel_id(),
+                                        user_channel_id: connection_activation.user_channel_id(),
                                         share_id,
                                         enable_server_pointer,
                                         pointer_software_rendering,

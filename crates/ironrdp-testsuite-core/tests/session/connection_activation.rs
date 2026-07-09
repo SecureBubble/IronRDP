@@ -89,7 +89,7 @@ fn deactivate_all_during_capabilities_exchange_stays_in_same_state() {
     assert!(
         matches!(
             seq.connection_activation_state(),
-            ConnectionActivationState::CapabilitiesExchange { .. }
+            ConnectionActivationState::CapabilitiesExchange
         ),
         "state should remain CapabilitiesExchange after DeactivateAll"
     );
@@ -139,4 +139,81 @@ fn demand_active_after_deactivate_all_transitions_to_connection_finalization() {
         ),
         "state should transition to ConnectionFinalization after DemandActive"
     );
+}
+
+#[test]
+fn reset_from_consumed_rearms_sequence() {
+    let config = test_config();
+    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID);
+    let mut output = WriteBuf::new();
+
+    // Force the sequence into the `Consumed` sentinel: `step` does `mem::take(&mut self.state)`
+    // and then bails on invalid input, leaving `Consumed` behind.
+    let result = seq.step(&[], &mut output);
+    assert!(result.is_err(), "stepping with invalid input should fail");
+    assert!(
+        matches!(seq.connection_activation_state(), ConnectionActivationState::Consumed),
+        "a failed step leaves the sequence in the Consumed sentinel state"
+    );
+    assert!(seq.next_pdu_hint().is_none(), "a Consumed sequence is not drivable");
+
+    // reset must re-arm the sequence regardless of the current (Consumed) state.
+    seq.reset();
+
+    assert!(
+        matches!(
+            seq.connection_activation_state(),
+            ConnectionActivationState::CapabilitiesExchange
+        ),
+        "reset should return to CapabilitiesExchange from any state, including Consumed"
+    );
+    assert!(
+        seq.next_pdu_hint().is_some(),
+        "the sequence should be drivable again after reset"
+    );
+    // Channel IDs are retained for the whole lifecycle, including across Consumed.
+    assert_eq!(seq.io_channel_id(), IO_CHANNEL_ID);
+    assert_eq!(seq.user_channel_id(), USER_CHANNEL_ID);
+}
+
+#[test]
+fn reset_from_connection_finalization_rearms_sequence() {
+    let config = test_config();
+    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID);
+    let mut output = WriteBuf::new();
+
+    // Drive to ConnectionFinalization via a Server Demand Active.
+    let demand_active_frame =
+        encode_server_share_control(ShareControlPdu::ServerDemandActive(SERVER_DEMAND_ACTIVE.clone()));
+    seq.step(&demand_active_frame, &mut output).unwrap();
+    assert!(matches!(
+        seq.connection_activation_state(),
+        ConnectionActivationState::ConnectionFinalization { .. }
+    ));
+
+    seq.reset();
+
+    assert!(
+        matches!(
+            seq.connection_activation_state(),
+            ConnectionActivationState::CapabilitiesExchange
+        ),
+        "reset should return a mid-sequence instance to CapabilitiesExchange"
+    );
+    assert!(seq.next_pdu_hint().is_some());
+}
+
+#[test]
+fn reset_is_idempotent() {
+    let config = test_config();
+    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID);
+
+    seq.reset();
+    seq.reset();
+
+    assert!(matches!(
+        seq.connection_activation_state(),
+        ConnectionActivationState::CapabilitiesExchange
+    ));
+    assert!(seq.next_pdu_hint().is_some());
 }
