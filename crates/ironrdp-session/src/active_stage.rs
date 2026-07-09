@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
 use ironrdp_bulk::BulkCompressor;
-use ironrdp_connector::ConnectionResult;
-use ironrdp_connector::connection_activation::ConnectionActivationSequence;
 use ironrdp_core::{ReadCursor, WriteBuf};
 use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_dvc::{DrdynvcClient, DvcProcessor, DynamicVirtualChannel};
@@ -15,7 +13,7 @@ use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
 use ironrdp_pdu::slow_path::{self, GraphicsUpdateType};
 use ironrdp_pdu::{Action, mcs};
-use ironrdp_svc::{SvcMessage, SvcProcessor, SvcProcessorMessages};
+use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages};
 use tracing::{debug, info, warn};
 
 use crate::fast_path::UpdateKind;
@@ -39,17 +37,19 @@ pub struct ActiveStage {
 }
 
 impl ActiveStage {
-    pub fn new(connection_result: ConnectionResult) -> Self {
-        let x224_processor = x224::Processor::new(
-            connection_result.static_channels,
-            connection_result.user_channel_id,
-            connection_result.io_channel_id,
-            connection_result.share_id,
-            connection_result.connection_activation,
-        );
+    pub fn new(
+        static_channels: StaticChannelSet,
+        user_channel_id: u16,
+        io_channel_id: u16,
+        share_id: u32,
+        compression_type: Option<PduCompressionType>,
+        enable_server_pointer: bool,
+        pointer_software_rendering: bool,
+    ) -> Self {
+        let x224_processor = x224::Processor::new(static_channels, user_channel_id, io_channel_id, share_id);
 
         // Create bulk decompressor if compression was negotiated
-        let bulk_decompressor = connection_result.compression_type.and_then(|ct| {
+        let bulk_decompressor = compression_type.and_then(|ct| {
             let bulk_ct = to_bulk_compression_type(ct);
             match BulkCompressor::new(bulk_ct) {
                 Ok(compressor) => {
@@ -64,11 +64,11 @@ impl ActiveStage {
         });
 
         let fast_path_processor = fast_path::ProcessorBuilder {
-            io_channel_id: connection_result.io_channel_id,
-            user_channel_id: connection_result.user_channel_id,
-            share_id: connection_result.share_id,
-            enable_server_pointer: connection_result.enable_server_pointer,
-            pointer_software_rendering: connection_result.pointer_software_rendering,
+            io_channel_id,
+            user_channel_id,
+            share_id,
+            enable_server_pointer,
+            pointer_software_rendering,
             bulk_decompressor,
         }
         .build();
@@ -76,7 +76,7 @@ impl ActiveStage {
         Self {
             x224_processor,
             fast_path_processor,
-            enable_server_pointer: connection_result.enable_server_pointer,
+            enable_server_pointer,
         }
     }
 
@@ -320,7 +320,12 @@ pub enum ActiveStageOutput {
     },
     PointerBitmap(Arc<DecodedPointer>),
     Terminate(GracefulDisconnectReason),
-    DeactivateAll(Box<ConnectionActivationSequence>),
+    /// Received a Server Deactivate All PDU. The consumer should execute the
+    /// [Deactivation-Reactivation Sequence] by driving its own retained
+    /// connection activation sequence.
+    ///
+    /// [Deactivation-Reactivation Sequence]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
+    DeactivateAll,
     /// Server Initiate Multitransport Request. The application should establish a
     /// sideband UDP transport using the provided request parameters.
     ///
@@ -357,7 +362,7 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
 
                 Ok(Self::Terminate(desc))
             }
-            x224::ProcessorOutput::DeactivateAll(cas) => Ok(Self::DeactivateAll(cas)),
+            x224::ProcessorOutput::DeactivateAll => Ok(Self::DeactivateAll),
             x224::ProcessorOutput::MultitransportRequest(pdu) => Ok(Self::MultitransportRequest(pdu)),
             x224::ProcessorOutput::AutoDetect(request) => Ok(Self::AutoDetect(request)),
             // GraphicsUpdate and PointerUpdate are consumed in ActiveStage::process()

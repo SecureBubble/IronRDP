@@ -660,7 +660,19 @@ impl iron_remote_desktop::Session for Session {
         // Reused across frames so per-region extraction doesn't allocate on every draw.
         let mut draw_buffer = WriteBuf::new();
 
-        let mut active_stage = ActiveStage::new(connection_result);
+        // We retain and drive our own connection activation sequence for the
+        // Deactivation-Reactivation Sequence; `ActiveStage` no longer carries it.
+        let connection_activation = connection_result.connection_activation;
+
+        let mut active_stage = ActiveStage::new(
+            connection_result.static_channels,
+            connection_result.user_channel_id,
+            connection_result.io_channel_id,
+            connection_result.share_id,
+            connection_result.compression_type,
+            connection_result.enable_server_pointer,
+            connection_result.pointer_software_rendering,
+        );
 
         // Timer interval for driving clipboard lock timeouts (5 second interval)
         let mut cleanup_interval = IntervalStream::new(5_000).fuse();
@@ -987,7 +999,7 @@ impl iron_remote_desktop::Session for Session {
                             hotspot_y,
                         })?;
                     }
-                    ActiveStageOutput::DeactivateAll(mut box_connection_activation) => {
+                    ActiveStageOutput::DeactivateAll => {
                         // Execute the Deactivation-Reactivation Sequence:
                         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                         debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
@@ -999,11 +1011,11 @@ impl iron_remote_desktop::Session for Session {
                             requested_resize = None;
                         }
 
+                        let mut connection_activation = connection_activation.reset_clone();
                         let mut buf = WriteBuf::new();
                         'activation_seq: loop {
                             let written =
-                                single_sequence_step_read(&mut framed, &mut *box_connection_activation, &mut buf)
-                                    .await?;
+                                single_sequence_step_read(&mut framed, &mut connection_activation, &mut buf).await?;
 
                             if written.size().is_some() {
                                 self.writer_tx
@@ -1018,7 +1030,7 @@ impl iron_remote_desktop::Session for Session {
                                 share_id,
                                 enable_server_pointer,
                                 pointer_software_rendering,
-                            } = box_connection_activation.connection_activation_state()
+                            } = connection_activation.connection_activation_state()
                             {
                                 debug!("Deactivation-Reactivation Sequence completed");
                                 image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);

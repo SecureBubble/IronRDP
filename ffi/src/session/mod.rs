@@ -15,7 +15,13 @@ pub mod ffi {
     use crate::utils::ffi::{BytesSlice, Position, VecU8};
 
     #[diplomat::opaque]
-    pub struct ActiveStage(pub ironrdp::session::ActiveStage);
+    pub struct ActiveStage(
+        pub ironrdp::session::ActiveStage,
+        // The connection activation sequence is retained here (rather than inside the session's
+        // `ActiveStage`) so the Deactivation-Reactivation Sequence can be driven on the FFI side,
+        // across the C# boundary.
+        pub ironrdp::connector::connection_activation::ConnectionActivationSequence,
+    );
 
     #[diplomat::opaque]
     pub struct ActiveStageOutput(pub ironrdp::session::ActiveStageOutput);
@@ -39,12 +45,35 @@ pub mod ffi {
 
     impl ActiveStage {
         pub fn new(connection_result: &mut ConnectionResult) -> Result<Box<Self>, Box<IronRdpError>> {
-            Ok(Box::new(ActiveStage(ironrdp::session::ActiveStage::new(
-                connection_result
-                    .0
-                    .take()
-                    .ok_or_else(|| ValueConsumedError::for_item("connection_result"))?,
-            ))))
+            let connection_result = connection_result
+                .0
+                .take()
+                .ok_or_else(|| ValueConsumedError::for_item("connection_result"))?;
+
+            // Retain the connection activation sequence so we can drive the
+            // Deactivation-Reactivation Sequence ourselves; the session's `ActiveStage`
+            // no longer carries it.
+            let connection_activation = connection_result.connection_activation;
+
+            let stage = ironrdp::session::ActiveStage::new(
+                connection_result.static_channels,
+                connection_result.user_channel_id,
+                connection_result.io_channel_id,
+                connection_result.share_id,
+                connection_result.compression_type,
+                connection_result.enable_server_pointer,
+                connection_result.pointer_software_rendering,
+            );
+
+            Ok(Box::new(ActiveStage(stage, connection_activation)))
+        }
+
+        /// Resets and returns the retained connection activation sequence.
+        ///
+        /// Call this upon receiving a [`ActiveStageOutputType::DeactivateAll`] output to drive the
+        /// Deactivation-Reactivation Sequence.
+        pub fn reset_connection_activation(&self) -> Box<ConnectionActivationSequence> {
+            Box::new(ConnectionActivationSequence(Box::new(self.1.reset_clone())))
         }
 
         pub fn process(
@@ -213,7 +242,7 @@ pub mod ffi {
                 ironrdp::session::ActiveStageOutput::PointerPosition { .. } => ActiveStageOutputType::PointerPosition,
                 ironrdp::session::ActiveStageOutput::PointerBitmap { .. } => ActiveStageOutputType::PointerBitmap,
                 ironrdp::session::ActiveStageOutput::Terminate { .. } => ActiveStageOutputType::Terminate,
-                ironrdp::session::ActiveStageOutput::DeactivateAll { .. } => ActiveStageOutputType::DeactivateAll,
+                ironrdp::session::ActiveStageOutput::DeactivateAll => ActiveStageOutputType::DeactivateAll,
                 ironrdp::session::ActiveStageOutput::MultitransportRequest { .. } => {
                     ActiveStageOutputType::MultitransportRequest
                 }
@@ -266,18 +295,6 @@ pub mod ffi {
             match &self.0 {
                 ironrdp::session::ActiveStageOutput::Terminate(reason) => Ok(GracefulDisconnectReason(reason.clone())),
                 _ => Err(IncorrectEnumTypeError::on_variant("Terminate")
-                    .of_enum("ActiveStageOutput")
-                    .into()),
-            }
-            .map(Box::new)
-        }
-
-        pub fn get_deactivate_all(&self) -> Result<Box<ConnectionActivationSequence>, Box<IronRdpError>> {
-            match &self.0 {
-                ironrdp::session::ActiveStageOutput::DeactivateAll(cas) => {
-                    Ok(ConnectionActivationSequence(cas.clone()))
-                }
-                _ => Err(IncorrectEnumTypeError::on_variant("DeactivateAll")
                     .of_enum("ActiveStageOutput")
                     .into()),
             }

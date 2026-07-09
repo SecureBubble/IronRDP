@@ -516,7 +516,7 @@ public partial class MainWindow : Window
                 }
                 else if (output.GetEnumType() == ActiveStageOutputType.DeactivateAll)
                 {
-                    var activationSequence = output.GetDeactivateAll();
+                    var activationSequence = _activeStage!.ResetConnectionActivation();
                     var writeBuf = WriteBuf.New();
                     while (true)
                     {
