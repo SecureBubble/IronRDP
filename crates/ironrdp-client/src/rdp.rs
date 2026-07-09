@@ -735,7 +735,7 @@ async fn active_session(
 
     // We retain and drive our own connection activation sequence for the
     // Deactivation-Reactivation Sequence; `ActiveStage` no longer carries it.
-    let connection_activation = connection_result.connection_activation;
+    let mut connection_activation = connection_result.connection_activation;
 
     let mut active_stage = ActiveStageBuilder {
         static_channels: connection_result.static_channels,
@@ -956,7 +956,7 @@ async fn active_session(
                     // Deactivation-Reactivation Sequence:
                     // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                     debug!("Executing Deactivation-Reactivation Sequence");
-                    let mut connection_activation = connection_activation.reset_clone();
+                    connection_activation.reset();
                     let mut buf = WriteBuf::new();
                     'activation_seq: loop {
                         let written = single_sequence_step_read(&mut reader, &mut connection_activation, &mut buf)

@@ -50,7 +50,7 @@ async fn test_deactivation_reactivation() {
     );
     client_server(
         client_config,
-        |mut stage, connection_activation, mut framed, display_tx| async move {
+        |mut stage, mut connection_activation, mut framed, display_tx| async move {
             display_tx
                 .send(DisplayUpdate::Resize(DesktopSize {
                     width: 2048,
@@ -67,7 +67,7 @@ async fn test_deactivation_reactivation() {
                         // Execute the Deactivation-Reactivation Sequence:
                         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                         debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
-                        let mut connection_activation = connection_activation.reset_clone();
+                        connection_activation.reset();
                         let mut buf = pdu::WriteBuf::new();
                         'activation_seq: loop {
                             let written = ironrdp_async::single_sequence_step_read(

@@ -43,12 +43,12 @@ impl ConnectionActivationSequence {
         self.state
     }
 
-    #[must_use]
-    pub fn reset_clone(&self) -> Self {
-        self.clone().reset()
-    }
-
-    fn reset(mut self) -> Self {
+    /// Resets the sequence back to the initial `CapabilitiesExchange` state so it can be driven
+    /// again, e.g. to run the Deactivation-Reactivation Sequence.
+    ///
+    /// The instance is reset in place. If the original is still needed, clone it first
+    /// (`let mut cloned = seq.clone(); cloned.reset();`).
+    pub fn reset(&mut self) {
         match &self.state {
             ConnectionActivationState::CapabilitiesExchange {
                 io_channel_id,
@@ -68,10 +68,8 @@ impl ConnectionActivationSequence {
                     io_channel_id: *io_channel_id,
                     user_channel_id: *user_channel_id,
                 };
-
-                self
             }
-            ConnectionActivationState::Consumed => self,
+            ConnectionActivationState::Consumed => {}
         }
     }
 }

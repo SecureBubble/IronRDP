@@ -662,7 +662,7 @@ impl iron_remote_desktop::Session for Session {
 
         // We retain and drive our own connection activation sequence for the
         // Deactivation-Reactivation Sequence; `ActiveStage` no longer carries it.
-        let connection_activation = connection_result.connection_activation;
+        let mut connection_activation = connection_result.connection_activation;
 
         let mut active_stage = ActiveStageBuilder {
             static_channels: connection_result.static_channels,
@@ -1012,7 +1012,7 @@ impl iron_remote_desktop::Session for Session {
                             requested_resize = None;
                         }
 
-                        let mut connection_activation = connection_activation.reset_clone();
+                        connection_activation.reset();
                         let mut buf = WriteBuf::new();
                         'activation_seq: loop {
                             let written =

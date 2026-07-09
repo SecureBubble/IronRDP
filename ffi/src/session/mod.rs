@@ -74,7 +74,10 @@ pub mod ffi {
         /// Call this upon receiving a [`ActiveStageOutputType::DeactivateAll`] output to drive the
         /// Deactivation-Reactivation Sequence.
         pub fn reset_connection_activation(&self) -> Box<ConnectionActivationSequence> {
-            Box::new(ConnectionActivationSequence(Box::new(self.1.reset_clone())))
+            // Hand out a fresh sequence to drive, keeping our retained instance as the template.
+            let mut cloned = self.1.clone();
+            cloned.reset();
+            Box::new(ConnectionActivationSequence(Box::new(cloned)))
         }
 
         pub fn process(
