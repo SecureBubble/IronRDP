@@ -305,7 +305,9 @@
         remoteDesktopService.setOnCanvasResized(canvasResized);
 
         initListeners();
+    }
 
+    function dispatchReady() {
         let result = { irgUserInteraction: publicAPI.getExposedFunctions() };
 
         loggingService.info('Component ready');
@@ -344,7 +346,14 @@
         loggingService.verbose = verbose === 'true';
         loggingService.info('Dom ready');
         await initcanvas();
+        // Register the clipboard callback BEFORE announcing readiness. Consumers
+        // typically call connect() synchronously in the `ready` handler, and the
+        // CLIPRDR static virtual channel is only advertised (in GCC) when the
+        // clipboard callback was registered on the SessionBuilder before connect.
+        // initClipboard() is what registers it, so `ready` must be dispatched only
+        // after it completes — otherwise the client silently connects without CLIPRDR.
         await clipboardService.initClipboard();
+        dispatchReady();
     });
 
     onDestroy(() => {
