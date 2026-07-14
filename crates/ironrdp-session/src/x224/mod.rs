@@ -9,7 +9,7 @@ use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use ironrdp_pdu::x224::X224;
 use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages, client_encode_svc_messages};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{SessionError, SessionErrorExt as _, SessionResult, reason_err};
 
@@ -139,7 +139,11 @@ impl Processor {
             process_svc_messages(response_pdus, channel_id, data_ctx.initiator_id)
                 .map(|data| vec![ProcessorOutput::ResponseFrame(data)])
         } else {
-            Err(reason_err!("X224", "unexpected channel received: ID {channel_id}"))
+            // Be liberal like mstsc: a PDU addressed to an unknown/unjoined channel
+            // (e.g. a stray channel-0 Send Data Indication emitted by a proxy) is
+            // ignored rather than tearing down the whole session.
+            warn!(channel_id, "Ignoring data for an unexpected/unjoined channel");
+            Ok(Vec::new())
         }
     }
 
