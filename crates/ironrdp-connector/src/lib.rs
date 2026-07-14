@@ -258,6 +258,15 @@ pub struct Config {
     /// [\[MS-RDPBCGR\] 2.2.1.3.7]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/861f2bbb-6ca2-4c5a-8c44-0714fa901e70
     /// [`MultiTransportChannelData`]: ironrdp_pdu::gcc::MultiTransportChannelData
     pub multitransport_flags: Option<gcc::MultiTransportFlags>,
+
+    /// Advertise support for the RDPEGFX graphics pipeline
+    /// ([`ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL`]).
+    ///
+    /// Only set this when the client actually attaches a graphics-pipeline
+    /// dynamic virtual channel handler (`ironrdp-egfx`'s `GraphicsPipelineClient`).
+    /// Without the handler, the server may open the graphics DVC and the client
+    /// would reject it, forcing a bitmap fallback.
+    pub support_graphics_pipeline: bool,
 }
 
 ironrdp_core::assert_impl!(Config: Send, Sync);

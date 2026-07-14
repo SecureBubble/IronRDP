@@ -1506,6 +1506,10 @@ fn build_config(
         timezone_info: TimezoneInfo::default(),
         alternate_shell: String::new(),
         work_dir: String::new(),
+        // We always attach a GraphicsPipelineClient (see `connect`), so advertise
+        // RDPEGFX so the server opens the graphics DVC and drives eGFX instead of
+        // the legacy bitmap/Surface-Bits path.
+        support_graphics_pipeline: true,
     }
 }
 
