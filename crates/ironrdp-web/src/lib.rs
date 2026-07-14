@@ -18,6 +18,7 @@ extern crate time as _;
 mod canvas;
 mod clipboard;
 mod error;
+mod graphics;
 mod image;
 mod input;
 mod network_client;

@@ -22,6 +22,7 @@ use ironrdp::connector::credssp::KerberosConfig;
 use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
+use ironrdp_egfx::client::GraphicsPipelineClient;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
@@ -42,6 +43,7 @@ use web_sys::HtmlCanvasElement;
 
 use crate::canvas::Canvas;
 use crate::clipboard;
+use crate::graphics::{WasmGraphicsHandler, WasmGraphicsMessageProxy};
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::error::IronError;
 use crate::image::extract_partial_image;
@@ -491,6 +493,12 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let use_display_control = self.0.borrow().use_display_control;
 
+        // EGFX (MS-RDPEGFX) graphics pipeline. The handler composites server
+        // surface operations into RGBA buffers and ships decoded output regions
+        // to this run loop via `input_events_tx`. Tier 1: progressive + bitmap
+        // (no H.264), so no decoder is passed to the pipeline client.
+        let graphics_handler = WasmGraphicsHandler::new(WasmGraphicsMessageProxy::new(input_events_tx.clone()));
+
         let (connection_result, ws) = connect(ConnectParams {
             ws,
             config,
@@ -505,6 +513,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name,
             computer_name: client_name.clone(),
             use_display_control,
+            graphics_handler: Some(graphics_handler),
         })
         .await?;
 
@@ -545,6 +554,10 @@ pub(crate) enum RdpInputEvent {
     /// ready for delivery to JS. See [`crate::printer::PrinterBackendMessage`].
     Printer(crate::printer::PrinterBackendMessage),
     FastPath(FastPathInputEvents),
+    /// An EGFX-decoded output region, ready to blit to the canvas. Sent by
+    /// [`crate::graphics::WasmGraphicsHandler`] (which is `Send` and cannot touch
+    /// the `!Send` canvas) so the run loop can draw it.
+    Graphics(GraphicsRegion),
     Resize {
         width: u32,
         height: u32,
@@ -552,6 +565,17 @@ pub(crate) enum RdpInputEvent {
         physical_size: Option<(u32, u32)>,
     },
     TerminateSession,
+}
+
+/// A decoded RGBA region positioned in output (desktop) coordinates.
+#[derive(Debug)]
+pub(crate) struct GraphicsRegion {
+    pub(crate) x: u32,
+    pub(crate) y: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// Row-major RGBA8888, `width * height * 4` bytes.
+    pub(crate) data: Vec<u8>,
 }
 
 pub(crate) struct SessionTerminationInfo {
@@ -833,6 +857,24 @@ impl iron_remote_desktop::Session for Session {
                         RdpInputEvent::FastPath(events) => {
                             active_stage.process_fastpath_input(&mut image, &events)
                                 .context("fast path input events processing")?
+                        }
+                        RdpInputEvent::Graphics(region) => {
+                            // EGFX-decoded region → blit straight to the canvas. The
+                            // handler already composited into its surface buffers, so
+                            // this is a direct paint (no ActiveStage involvement).
+                            let right = region.x.saturating_add(region.width).saturating_sub(1);
+                            let bottom = region.y.saturating_add(region.height).saturating_sub(1);
+                            let rect = ironrdp::pdu::geometry::InclusiveRectangle {
+                                left: region.x.min(u32::from(u16::MAX)) as u16,
+                                top: region.y.min(u32::from(u16::MAX)) as u16,
+                                right: right.min(u32::from(u16::MAX)) as u16,
+                                bottom: bottom.min(u32::from(u16::MAX)) as u16,
+                            };
+                            let mut data = region.data;
+                            if let Err(e) = gui.draw(&mut data, rect) {
+                                warn!(error = format!("{e:#}"), "failed to draw EGFX region");
+                            }
+                            Vec::new()
                         }
                         RdpInputEvent::Resize { width, height, scale_factor, physical_size } => {
                             debug!(width, height, scale_factor, "Resize event received");
@@ -1521,6 +1563,7 @@ struct ConnectParams {
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
     use_display_control: bool,
+    graphics_handler: Option<WasmGraphicsHandler>,
 }
 
 fn default_printer_driver_name() -> String {
@@ -1570,6 +1613,7 @@ async fn connect(
         printer_driver_name,
         computer_name,
         use_display_control,
+        graphics_handler,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
@@ -1597,10 +1641,19 @@ async fn connect(
         );
     }
 
-    if use_display_control {
-        connector.attach_static_channel(
-            DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new()))),
-        );
+    // Both DisplayControl and the EGFX graphics pipeline are dynamic virtual
+    // channels, so they ride the same single DRDYNVC static channel.
+    if use_display_control || graphics_handler.is_some() {
+        let mut drdynvc = DrdynvcClient::new();
+        if use_display_control {
+            drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+        }
+        if let Some(graphics_handler) = graphics_handler {
+            // Tier 1: no H.264 decoder → the pipeline client auto-filters AVC
+            // capability sets and advertises the V8 (progressive/bitmap) path.
+            drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(Box::new(graphics_handler), None));
+        }
+        connector.attach_static_channel(drdynvc);
     }
 
     let (upgraded, server_public_key) =
