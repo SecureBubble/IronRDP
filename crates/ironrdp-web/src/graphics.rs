@@ -23,7 +23,7 @@ use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineHandler, Surface};
 use ironrdp_egfx::pdu::{
     CacheToSurfacePdu, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
 };
-use tracing::{trace, warn};
+use tracing::warn;
 
 use crate::session::{GraphicsRegion, RdpInputEvent};
 
@@ -173,7 +173,6 @@ impl WasmGraphicsHandler {
 
 impl GraphicsPipelineHandler for WasmGraphicsHandler {
     fn on_reset_graphics(&mut self, width: u32, height: u32) {
-        trace!(width, height, "EGFX reset graphics");
         self.output_width = width;
         self.output_height = height;
     }

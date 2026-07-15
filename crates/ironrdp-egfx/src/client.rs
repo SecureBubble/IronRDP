@@ -75,6 +75,7 @@ use crate::pdu::{
 /// Max capacity to keep for decompressed buffer when cleared.
 const MAX_DECOMPRESSED_BUFFER_CAPACITY: usize = 16384; // 16 KiB
 
+
 // ============================================================================
 // Surface Management
 // ============================================================================
@@ -869,13 +870,24 @@ impl DvcProcessor for GraphicsPipelineClient {
             .decompress(payload, &mut self.decompressed_buffer)
             .map_err(|e| decode_err!(e))?;
 
-        // Decode all PDUs first (cursor borrows decompressed_buffer)
+        // Decode all PDUs first (cursor borrows decompressed_buffer).
+        //
+        // Be tolerant: a single undecodable PDU in a segment must NOT discard the
+        // whole segment (e.g. a desktop WireToSurface2 frame batched with a PDU
+        // ironrdp can't yet decode). Stop decoding at the first failure but still
+        // process everything decoded before it, and log which PDU broke so it can
+        // be fixed.
         let mut pdus = Vec::new();
         {
             let mut cursor = ReadCursor::new(self.decompressed_buffer.as_slice());
             while !cursor.is_empty() {
-                let pdu: GfxPdu = decode_cursor(&mut cursor).map_err(|e| decode_err!(e))?;
-                pdus.push(pdu);
+                match decode_cursor::<GfxPdu>(&mut cursor) {
+                    Ok(pdu) => pdus.push(pdu),
+                    Err(e) => {
+                        warn!(error = %e, decoded_ok = pdus.len(), "EGFX PDU decode failed; processing prior PDUs in segment");
+                        break;
+                    }
+                }
             }
         }
 

@@ -828,16 +828,25 @@ impl TileState {
             crate::dwt::decode(&mut cr_buf, &mut dwt_temp);
         }
 
-        // YCbCr to RGBA conversion
+        // YCbCr to RGBA conversion.
+        //
+        // The reconstructed Y/Cb/Cr coefficients are ×32-scaled: RemoteFX servers
+        // left-shift the spatial-domain components by 5 before the integer 5/3 DWT
+        // to preserve precision (Y runs to ±~4000, not ±128). The inverse DWT here
+        // keeps that scale, so we must descale by 32 (>>5) and apply the +128 luma
+        // level shift AFTER descaling — the same convention as the classic RFX path
+        // (ironrdp-session color_conversion::ycbcr_to_rgba). The `>>21` folds the
+        // BT.601 fixed-point >>16 together with the ÷32 descale (16 + 5 = 21).
+        // Verified: YCbCr [1,2,3] -> RGB [128,127,128], matching the canonical path.
         for i in 0..64 * 64 {
-            let y = i32::from(y_buf[i]) + 128;
+            let y = i32::from(y_buf[i]) << 16;
             let cb = i32::from(cb_buf[i]);
             let cr = i32::from(cr_buf[i]);
 
-            // ITU-R BT.601 YCbCr to RGB conversion
-            let r = y + ((cr * 91881 + 32768) >> 16);
-            let g = y - ((cb * 22554 + cr * 46802 + 32768) >> 16);
-            let b = y + ((cb * 116130 + 32768) >> 16);
+            // ITU-R BT.601 YCbCr to RGB conversion (descaled by 32).
+            let r = 128 + ((y + cr * 91881) >> 21);
+            let g = 128 + ((y - cb * 22554 - cr * 46802) >> 21);
+            let b = 128 + ((y + cb * 116130) >> 21);
 
             let off = i * 4;
             pixels[off] = clamp_u8(r);
@@ -1045,6 +1054,14 @@ struct ProgressiveContext {
 /// ```
 pub struct ProgressiveDecoder {
     contexts: BTreeMap<u32, ProgressiveContext>,
+    /// The `reduce_extrapolate` (DWT band-layout) flag from the most recent
+    /// CONTEXT block seen on ANY context. Real servers (Windows RDP) open a new
+    /// `codec_context_id` for many frames but only ever send the SYNC + CONTEXT
+    /// blocks once, expecting the decoder to keep applying the same codec-wide
+    /// DWT mode. Without this, every frame that opens a fresh context id without
+    /// repeating the CONTEXT block was rejected with `MissingBlock("CONTEXT")`,
+    /// freezing the screen after the very first frame.
+    default_reduce_extrapolate: Option<bool>,
 }
 
 impl ProgressiveDecoder {
@@ -1052,6 +1069,7 @@ impl ProgressiveDecoder {
     pub fn new() -> Self {
         Self {
             contexts: BTreeMap::new(),
+            default_reduce_extrapolate: None,
         }
     }
 
@@ -1093,11 +1111,19 @@ impl ProgressiveDecoder {
             ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
             _ => None,
         }) {
-            Some(v) => v,
+            Some(v) => {
+                // Remember the codec-wide DWT mode for later context ids that
+                // omit the CONTEXT block.
+                self.default_reduce_extrapolate = Some(v);
+                v
+            }
             None => self
                 .contexts
                 .get(&codec_context_id)
                 .map(|c| c.surface.use_reduce_extrapolate)
+                // Fall back to the last CONTEXT block seen on any context id
+                // before giving up (see `default_reduce_extrapolate`).
+                .or(self.default_reduce_extrapolate)
                 .ok_or(ProgressiveDecodeError::MissingBlock("CONTEXT"))?,
         };
 
@@ -1162,6 +1188,29 @@ impl ProgressiveDecoder {
     clippy::similar_names,
     reason = "q_y/q_cb/q_cr are standard component quant index names"
 )]
+/// Resolve the per-component progressive quant tables for a tile's `quality`.
+///
+/// `quality == 0xFF` is the RFX "full quality" sentinel: the server sends no
+/// progressive quant entry for it (the region's `quant_prog_vals` may be empty)
+/// and the tile is refined losslessly. This mirrors FreeRDP's `quantProgValFull`.
+/// Otherwise `quality` indexes the region's progressive quant table.
+fn progressive_quant_for(
+    quality: u8,
+    prog_quant_vals: &[ironrdp_pdu::codecs::rfx::progressive::ProgressiveCodecQuant],
+) -> Result<[ComponentCodecQuant; 3], ProgressiveDecodeError> {
+    if quality == 0xFF {
+        return Ok([ComponentCodecQuant::LOSSLESS; 3]);
+    }
+    let pq_idx = usize::from(quality);
+    let pq = prog_quant_vals
+        .get(pq_idx)
+        .ok_or(ProgressiveDecodeError::InvalidQuantIndex {
+            index: pq_idx,
+            table_len: prog_quant_vals.len(),
+        })?;
+    Ok([pq.y_quant, pq.cb_quant, pq.cr_quant])
+}
+
 fn decode_tile_block(
     surface: &mut SurfaceTiles,
     tile_block: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>,
@@ -1228,19 +1277,12 @@ fn decode_tile_block(
                 });
             }
 
-            let pq_idx = usize::from(tile.quality);
-            if pq_idx >= prog_quant_vals.len() {
-                return Err(ProgressiveDecodeError::InvalidQuantIndex {
-                    index: pq_idx,
-                    table_len: prog_quant_vals.len(),
-                });
-            }
-            let pq = &prog_quant_vals[pq_idx];
+            let prog_quants = progressive_quant_for(tile.quality, prog_quant_vals)?;
 
             tile_state.decode_first(
                 [tile.y_data, tile.cb_data, tile.cr_data],
                 [&quant_vals[q_y], &quant_vals[q_cb], &quant_vals[q_cr]],
-                [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                prog_quants,
                 [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
                 tile.quality,
                 use_reduce_extrapolate,
@@ -1265,19 +1307,12 @@ fn decode_tile_block(
                 return Ok(Vec::new());
             }
 
-            let pq_idx = usize::from(tile.quality);
-            if pq_idx >= prog_quant_vals.len() {
-                return Err(ProgressiveDecodeError::InvalidQuantIndex {
-                    index: pq_idx,
-                    table_len: prog_quant_vals.len(),
-                });
-            }
-            let pq = &prog_quant_vals[pq_idx];
+            let prog_quants = progressive_quant_for(tile.quality, prog_quant_vals)?;
 
             tile_state.decode_upgrade(
                 [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
                 [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
-                [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                prog_quants,
                 tile.quality,
             );
 

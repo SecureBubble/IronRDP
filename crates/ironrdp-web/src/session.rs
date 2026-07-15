@@ -567,6 +567,7 @@ pub(crate) enum RdpInputEvent {
     TerminateSession,
 }
 
+
 /// A decoded RGBA region positioned in output (desktop) coordinates.
 #[derive(Debug)]
 pub(crate) struct GraphicsRegion {
@@ -1475,7 +1476,11 @@ fn build_config(
             height: desktop_size.height,
         },
         bitmap: Some(connector::BitmapConfig {
-            color_depth: 16,
+            // Request a 32bpp session: with 32 the connector emits highColorDepth=24
+            // + WANT_32_BPP_SESSION in the GCC client core data. Advertising 16 here
+            // makes proxies/servers clamp the session to 16bpp (RGB565), which the
+            // eGFX renderer then misreads as 32bpp XRGB → scrambled colors.
+            color_depth: 32,
             lossy_compression: true,
             codecs: client_codecs_capabilities(&[]).expect("can't panic for &[]"),
         }),
