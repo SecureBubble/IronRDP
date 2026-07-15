@@ -1511,10 +1511,15 @@ fn build_config(
         timezone_info: TimezoneInfo::default(),
         alternate_shell: String::new(),
         work_dir: String::new(),
-        // We always attach a GraphicsPipelineClient (see `connect`), so advertise
-        // RDPEGFX so the server opens the graphics DVC and drives eGFX instead of
-        // the legacy bitmap/Surface-Bits path.
-        support_graphics_pipeline: true,
+        // eGFX (MS-RDPEGFX) is DISABLED: IronRDP's graphics-pipeline decode is an
+        // incomplete foundation — it decodes only AVC (H.264), Uncompressed and RFX
+        // Progressive, and does NOT implement the mandatory ClearCodec/Planar/NSCodec
+        // that carry the bulk of desktop UI/text (see upstream issue Devolutions/
+        // IronRDP#1158 and the `"unsupported codec"` fallback in ironrdp-egfx). That,
+        // plus the fragile stateful surface-cache/compositing, produced worse output
+        // than the fallback. Not advertising RDPEGFX makes the server use the
+        // codec-complete, self-healing legacy bitmap/Surface-Bits path.
+        support_graphics_pipeline: false,
     }
 }
 
