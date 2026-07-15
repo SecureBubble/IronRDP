@@ -41,7 +41,10 @@ impl SurfaceBuf {
         Self {
             width,
             height,
-            data: vec![0; (width.saturating_mul(height).saturating_mul(4)) as usize],
+            // Initialize to opaque WHITE (0xFF), matching FreeRDP's gdi_CreateSurface
+            // (`memset(surface->data, 0xFF, ...)`). Regions the server hasn't painted
+            // yet then blend with the light desktop instead of showing as black holes.
+            data: vec![0xFF; (width.saturating_mul(height).saturating_mul(4)) as usize],
         }
     }
 
@@ -175,6 +178,14 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
     fn on_reset_graphics(&mut self, width: u32, height: u32) {
         self.output_width = width;
         self.output_height = height;
+        // Match FreeRDP gdi_ResetGraphics: blank each existing surface to white and
+        // clear its pending invalid region; keep the surfaces, output mappings and
+        // the persistent bitmap cache. Reset the progressive codec state.
+        for s in self.surfaces.values_mut() {
+            s.data.iter_mut().for_each(|b| *b = 0xFF);
+        }
+        self.dirty.clear();
+        self.progressive.reset();
     }
 
     fn on_surface_created(&mut self, surface: &Surface) {
@@ -190,11 +201,13 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
 
     fn on_surface_mapped(&mut self, surface_id: u16, origin_x: u32, origin_y: u32) {
         self.mapped.insert(surface_id, (origin_x, origin_y));
-        // Repaint the whole surface on the next frame so it appears immediately.
-        if let Some(s) = self.surfaces.get(&surface_id) {
-            let (w, h) = (s.width, s.height);
-            self.mark_dirty(surface_id, 0, 0, w, h);
-        }
+        // Do NOT mark the whole surface dirty here. FreeRDP only ever blits the
+        // regions explicitly invalidated by decode/cache/fill ops; repainting the
+        // entire surface buffer on map pushes never-rendered (white/incomplete)
+        // tiles to the output — which, with the old black surface init, showed as
+        // large black blocks after a RESET_GRAPHICS + surface re-create. Content
+        // rendered before the map is retained via its own accumulated dirty region
+        // (see on_frame_complete).
     }
 
     fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
@@ -330,12 +343,15 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
     }
 
     fn on_frame_complete(&mut self, _frame_id: u32) {
-        // Flush the dirty region of every output-mapped surface to the run loop.
-        let dirty = core::mem::take(&mut self.dirty);
-        for (surface_id, d) in dirty {
-            let Some(&(ox, oy)) = self.mapped.get(&surface_id) else {
-                continue; // off-screen composition surface: nothing to paint yet
+        // Flush the dirty region of every output-MAPPED surface to the run loop.
+        // Unmapped surfaces keep their accumulated dirty region so it is painted
+        // once they become mapped (FreeRDP's invalidRegion persists until blitted).
+        let mapped_ids: Vec<u16> = self.mapped.keys().copied().collect();
+        for surface_id in mapped_ids {
+            let Some(d) = self.dirty.remove(&surface_id) else {
+                continue;
             };
+            let (ox, oy) = self.mapped[&surface_id];
             let Some(surface) = self.surfaces.get(&surface_id) else {
                 continue;
             };
