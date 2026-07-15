@@ -43,7 +43,7 @@ use web_sys::HtmlCanvasElement;
 
 use crate::canvas::Canvas;
 use crate::clipboard;
-use crate::graphics::{WasmGraphicsHandler, WasmGraphicsMessageProxy};
+use crate::graphics::WasmGraphicsHandler;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::error::IronError;
 use crate::image::extract_partial_image;
@@ -493,11 +493,14 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let use_display_control = self.0.borrow().use_display_control;
 
-        // EGFX (MS-RDPEGFX) graphics pipeline. The handler composites server
-        // surface operations into RGBA buffers and ships decoded output regions
-        // to this run loop via `input_events_tx`. Tier 1: progressive + bitmap
-        // (no H.264), so no decoder is passed to the pipeline client.
-        let graphics_handler = WasmGraphicsHandler::new(WasmGraphicsMessageProxy::new(input_events_tx.clone()));
+        // EGFX (MS-RDPEGFX) graphics pipeline is DISABLED (see `build_config`
+        // support_graphics_pipeline = false). We must ALSO NOT attach the graphics
+        // pipeline DVC handler: registering it makes the client answer a server
+        // `Microsoft::Windows::RDS::Graphics` DVC open and advertise eGFX caps even
+        // when the GCC early-capability flag is off. With no handler, the server
+        // uses the legacy bitmap/Surface-Bits path. To re-enable eGFX, restore the
+        // handler here AND set support_graphics_pipeline = true.
+        let graphics_handler: Option<WasmGraphicsHandler> = None;
 
         let (connection_result, ws) = connect(ConnectParams {
             ws,
@@ -513,7 +516,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name,
             computer_name: client_name.clone(),
             use_display_control,
-            graphics_handler: Some(graphics_handler),
+            graphics_handler,
         })
         .await?;
 
