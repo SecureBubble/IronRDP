@@ -14,7 +14,7 @@ use ironrdp_pdu::pointer::PointerUpdateData;
 use ironrdp_pdu::rdp::capability_sets::{CODEC_ID_NONE, CODEC_ID_REMOTEFX, CodecId};
 use ironrdp_pdu::rdp::headers::{CompressionFlags, ShareDataPdu};
 use ironrdp_pdu::surface_commands::{FrameAction, FrameMarkerPdu, SurfaceCommand};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::image::DecodedImage;
 use crate::palette::Palette;
@@ -46,6 +46,12 @@ pub struct Processor {
     bulk_decompressor: Option<BulkCompressor>,
     /// Current 8bpp color palette. Updated by Palette fast-path updates.
     palette: Palette,
+    /// Last Surface Bits codec id we logged, so a codec change (e.g. the server
+    /// switching from raw bitmap to RemoteFX) is surfaced once at INFO instead of
+    /// per-frame. Diagnostic only — lets us confirm from the browser console which
+    /// codec is actually on the wire (the web client runs at INFO, so trace/debug
+    /// codec logs are invisible).
+    logged_surface_codec: Option<u8>,
     #[cfg(feature = "qoiz")]
     zdctx: zstd_safe::DCtx<'static>,
 }
@@ -453,6 +459,15 @@ impl Processor {
 
                     trace!(?codec_id, "Surface bits");
 
+                    // Surface the codec transition once at INFO (the web client runs
+                    // at INFO). This is how we confirm RemoteFX is actually negotiated
+                    // end-to-end vs. the server falling back to raw bitmap.
+                    let raw_codec_id = bits.extended_bitmap_data.codec_id;
+                    if self.logged_surface_codec != Some(raw_codec_id) {
+                        self.logged_surface_codec = Some(raw_codec_id);
+                        info!(?codec_id, raw_codec_id, "Surface Bits codec in use");
+                    }
+
                     let destination = bits.destination;
                     // TODO(@pacmancoder): Correct rectangle conversion logic should
                     // be revisited when `rectangle_processing.rs` from
@@ -617,6 +632,7 @@ impl ProcessorBuilder {
             pointer_software_rendering: self.pointer_software_rendering,
             bulk_decompressor: self.bulk_decompressor,
             palette: Palette::system_default(),
+            logged_surface_codec: None,
             #[cfg(feature = "qoiz")]
             zdctx: zstd_safe::DCtx::default(),
         }

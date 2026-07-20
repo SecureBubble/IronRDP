@@ -1514,14 +1514,21 @@ fn build_config(
         timezone_info: TimezoneInfo::default(),
         alternate_shell: String::new(),
         work_dir: String::new(),
-        // eGFX (MS-RDPEGFX) is DISABLED: IronRDP's graphics-pipeline decode is an
-        // incomplete foundation — it decodes only AVC (H.264), Uncompressed and RFX
-        // Progressive, and does NOT implement the mandatory ClearCodec/Planar/NSCodec
-        // that carry the bulk of desktop UI/text (see upstream issue Devolutions/
-        // IronRDP#1158 and the `"unsupported codec"` fallback in ironrdp-egfx). That,
-        // plus the fragile stateful surface-cache/compositing, produced worse output
-        // than the fallback. Not advertising RDPEGFX makes the server use the
-        // codec-complete, self-healing legacy bitmap/Surface-Bits path.
+        // eGFX (MS-RDPEGFX) is DISABLED so the graphics path is classic RemoteFX
+        // (MS-RDPRFX) over Surface Bits instead. Rationale: IronRDP's eGFX decode is
+        // an incomplete foundation — it decodes only AVC (H.264), Uncompressed and RFX
+        // Progressive, and does NOT implement the ClearCodec/Planar/NSCodec that carry
+        // the bulk of desktop UI/text over eGFX (see the `"unsupported codec"` fallback
+        // in ironrdp-egfx, tracked upstream); that codec mix, plus
+        // the fragile stateful surface-cache/compositing, is what produced the artifacts.
+        // Classic RemoteFX instead encodes the WHOLE framebuffer as RFX tiles with a
+        // single mature codec that IronRDP fully decodes (ironrdp-session `rfx.rs`,
+        // dispatched from `fast_path.rs` on CODEC_ID_REMOTEFX). We advertise it via the
+        // RemoteFX bitmap codec in `bitmap.codecs` below (client_codecs_capabilities);
+        // turning eGFX off makes the (FreeRDP) proxy/server pick RemoteFX Surface Bits.
+        // NOTE: the Bubble rdp-proxy historically REQUIRED the client to announce eGFX
+        // (aborts otherwise) — this build depends on the matching proxy change that
+        // drops that mandate and enables RemoteFxCodec on both legs.
         support_graphics_pipeline: false,
     }
 }
