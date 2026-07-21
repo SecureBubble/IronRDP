@@ -276,9 +276,25 @@ export class ClipboardService {
         try {
             const mime_formats = this.clipboardDataToRecord(data);
             const clipboard_item = new ClipboardItem(mime_formats);
-            this.runWhenWindowFocused(() => {
+            // The write must run while the document is focused. Previously this was a
+            // fire-and-forget `navigator.clipboard.write()` with no await/catch: when it
+            // rejected (NotAllowedError — the document lost focus, or the user-activation
+            // window expired while the remote clipboard data round-tripped through the
+            // proxy), the copy was silently dropped. That is the "sometimes works,
+            // sometimes not" symptom. Await + catch, and on failure re-defer the write
+            // onto the focus queue so it retries the next time the window regains focus.
+            this.runWhenWindowFocused(async () => {
                 this.lastReceivedClipboardData = this.clipboardDataToClipboardItemsRecord(data);
-                navigator.clipboard.write([clipboard_item]);
+                try {
+                    await navigator.clipboard.write([clipboard_item]);
+                } catch (err) {
+                    console.warn('Clipboard write failed, retrying on next focus:', err);
+                    runWhenFocusedQueue.enqueue(() => {
+                        navigator.clipboard.write([clipboard_item]).catch((retryErr) => {
+                            console.warn('Clipboard write retry failed:', retryErr);
+                        });
+                    });
+                }
             });
         } catch (err) {
             console.error('Failed to set client clipboard: ' + err);
