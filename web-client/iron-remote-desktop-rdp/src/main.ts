@@ -46,6 +46,13 @@ export function kdcProxyUrl(url: string): Extension {
     return new Extension('kdc_proxy_url', url);
 }
 
+// RemoteApp-style published app: run this program as the session shell (RDP
+// "alternate shell") instead of the full desktop. Forwarded by the Bubble proxy to
+// the target on its back leg. Empty string => normal desktop.
+export function alternateShell(shell: string): Extension {
+    return new Extension('alternate_shell', shell);
+}
+
 export function outboundMessageSizeLimit(limit: number): Extension {
     return new Extension('outbound_message_size_limit', limit);
 }

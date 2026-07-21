@@ -67,6 +67,9 @@ struct SessionBuilderInner {
     pcb: Option<String>,
     load_balance_info: Option<String>,
     kdc_proxy_url: Option<String>,
+    // RemoteApp-style "published app": program to run as the session shell instead
+    // of the full desktop (RDP alternate shell). Empty/None => normal desktop.
+    alternate_shell: Option<String>,
     client_name: String,
     desktop_size: DesktopSize,
 
@@ -108,6 +111,7 @@ impl Default for SessionBuilderInner {
             pcb: None,
             load_balance_info: None,
             kdc_proxy_url: None,
+            alternate_shell: None,
             client_name: "ironrdp-web".to_owned(),
             desktop_size: DesktopSize {
                 width: DEFAULT_WIDTH,
@@ -251,6 +255,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |pcb: String| { self.0.borrow_mut().pcb = Some(pcb) };
             |load_balance_info: String| { self.0.borrow_mut().load_balance_info = Some(load_balance_info) };
             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
+            |alternate_shell: String| { self.0.borrow_mut().alternate_shell = Some(alternate_shell) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |outbound_message_size_limit: f64| {
@@ -407,6 +412,16 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let enable_credssp = self.0.borrow().enable_credssp;
         config.enable_credssp = enable_credssp;
+
+        // RemoteApp-style published app: run a single program as the session shell
+        // (RDP "alternate shell") instead of the full desktop. The API supplies the
+        // program path per app; the Bubble proxy forwards this alternate shell to the
+        // target on its back leg, so clicking an app opens a full session running just
+        // that app (session ends when the app closes). Empty => normal desktop.
+        let alternate_shell = self.0.borrow().alternate_shell.clone();
+        if let Some(alternate_shell) = alternate_shell {
+            config.alternate_shell = alternate_shell;
+        }
 
         // RDP load-balance info / routing token. When set, it becomes the X.224
         // Connection Request routing token (`Cookie: msts=<value>\r\n`) instead of the
