@@ -46,6 +46,11 @@ pub struct Processor {
     bulk_decompressor: Option<BulkCompressor>,
     /// Current 8bpp color palette. Updated by Palette fast-path updates.
     palette: Palette,
+    /// Raw drawing-order updates (`numberOrders` + order list) received since the
+    /// last drain. Held undecoded so a consumer can extract RAIL Window List
+    /// orders via `ironrdp-rdperp` without coupling the session to it. Drained by
+    /// [`Processor::take_orders`].
+    pending_orders: Vec<Vec<u8>>,
     /// Last Surface Bits codec id we logged, so a codec change (e.g. the server
     /// switching from raw bitmap to RemoteFX) is surfaced once at INFO instead of
     /// per-frame. Diagnostic only — lets us confirm from the browser console which
@@ -59,6 +64,13 @@ pub struct Processor {
 impl Processor {
     pub fn update_mouse_pos(&mut self, x: u16, y: u16) {
         self.mouse_pos_update = Some((x, y));
+    }
+
+    /// Drain the raw drawing-order updates received since the last call. Each
+    /// entry is a fast-path `Orders` update body (`numberOrders` + order list),
+    /// ready to be decoded by a Window List consumer (`ironrdp-rdperp`).
+    pub fn take_orders(&mut self) -> Vec<Vec<u8>> {
+        core::mem::take(&mut self.pending_orders)
     }
 
     /// Process input fast path frame and return list of updates.
@@ -168,6 +180,10 @@ impl Processor {
             Ok(FastPathUpdate::Palette(palette_data)) => {
                 trace!("Received palette update");
                 self.palette.process_update(palette_data);
+            }
+            Ok(FastPathUpdate::Orders(orders)) => {
+                trace!(len = orders.len(), "Received drawing-order update");
+                self.pending_orders.push(orders.to_vec());
             }
             Err(e) => {
                 // FIXME: This seems to be a way of special-handling the error case in FastPathUpdate::decode_cursor_with_code
@@ -632,6 +648,7 @@ impl ProcessorBuilder {
             pointer_software_rendering: self.pointer_software_rendering,
             bulk_decompressor: self.bulk_decompressor,
             palette: Palette::system_default(),
+            pending_orders: Vec::new(),
             logged_surface_codec: None,
             #[cfg(feature = "qoiz")]
             zdctx: zstd_safe::DCtx::default(),

@@ -22,17 +22,19 @@ use ironrdp::connector::credssp::KerberosConfig;
 use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
-use ironrdp_egfx::client::GraphicsPipelineClient;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
+use ironrdp::rdperp::client::{RailChannel, RemoteApp};
+use ironrdp::rdperp::orders::WindowOrder;
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, fast_path};
 use ironrdp_core::WriteBuf;
+use ironrdp_egfx::client::GraphicsPipelineClient;
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
@@ -43,9 +45,9 @@ use web_sys::HtmlCanvasElement;
 
 use crate::canvas::Canvas;
 use crate::clipboard;
-use crate::graphics::WasmGraphicsHandler;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::error::IronError;
+use crate::graphics::WasmGraphicsHandler;
 use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
 use crate::network_client::WasmNetworkClient;
@@ -70,6 +72,12 @@ struct SessionBuilderInner {
     // RemoteApp-style "published app": program to run as the session shell instead
     // of the full desktop (RDP alternate shell). Empty/None => normal desktop.
     alternate_shell: Option<String>,
+    // RAIL (Remote Programs) app to launch over the `rail` static channel, set via
+    // the `remote_app` extension. When present the client negotiates RAIL and
+    // launches this app (its command line travels natively). Use ONLY for non-AVD
+    // targets: AVD does RAIL over DVC + eGFX, which this classic path must not
+    // shadow — so it is opt-in and never enabled unless a caller sets it.
+    remote_app: Option<connector::RailConfig>,
     client_name: String,
     desktop_size: DesktopSize,
 
@@ -112,6 +120,7 @@ impl Default for SessionBuilderInner {
             load_balance_info: None,
             kdc_proxy_url: None,
             alternate_shell: None,
+            remote_app: None,
             client_name: "ironrdp-web".to_owned(),
             desktop_size: DesktopSize {
                 width: DEFAULT_WIDTH,
@@ -256,6 +265,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |load_balance_info: String| { self.0.borrow_mut().load_balance_info = Some(load_balance_info) };
             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
             |alternate_shell: String| { self.0.borrow_mut().alternate_shell = Some(alternate_shell) };
+            |remote_app: JsValue| { self.0.borrow_mut().remote_app = parse_remote_app(&remote_app) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |outbound_message_size_limit: f64| {
@@ -423,6 +433,12 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             config.alternate_shell = alternate_shell;
         }
 
+        // RAIL (Remote Programs): when a `remote_app` was set, enable RAIL mode —
+        // the connector advertises RAIL + Window List caps and sets INFO_RAIL, and
+        // the `rail` static channel launches the app (command line carried natively).
+        // Only ever set for non-AVD targets; AVD uses RAIL over DVC + eGFX.
+        config.rail = self.0.borrow().remote_app.clone();
+
         // RDP load-balance info / routing token. When set, it becomes the X.224
         // Connection Request routing token (`Cookie: msts=<value>\r\n`) instead of the
         // default `mstshash=<username>` cookie, so a broker/proxy can route the session.
@@ -584,7 +600,6 @@ pub(crate) enum RdpInputEvent {
     },
     TerminateSession,
 }
-
 
 /// A decoded RGBA region positioned in output (desktop) coordinates.
 #[derive(Debug)]
@@ -951,6 +966,17 @@ impl iron_remote_desktop::Session for Session {
                     }
                 }
             };
+
+            // RAIL Window List orders: the fast-path processor buffered any
+            // drawing-order updates from this frame. Decode the window lifecycle
+            // and surface it (the window *content* renders via the normal
+            // GraphicsUpdate path below). Full local-window compositing is a
+            // frontend concern; here we make the decoded state observable.
+            for orders in active_stage.take_rail_orders() {
+                for order in WindowOrder::decode_orders_update(&orders) {
+                    log_rail_window_order(&order);
+                }
+            }
 
             for out in outputs {
                 match out {
@@ -1470,6 +1496,71 @@ fn parse_file_metadata_array(files: JsValue) -> Result<Vec<FileMetadata>, IronEr
     Ok(file_list)
 }
 
+/// Parse the `remote_app` extension value — a JS object
+/// `{ program, args?, workingDir? }` — into a RAIL config. Returns `None` when
+/// `program` is missing/empty (so RAIL stays disabled).
+fn parse_remote_app(value: &JsValue) -> Option<connector::RailConfig> {
+    let get = |key: &str| {
+        js_sys::Reflect::get(value, &JsValue::from_str(key))
+            .ok()
+            .and_then(|v| v.as_string())
+    };
+    let program = get("program").filter(|p| !p.is_empty())?;
+    Some(connector::RailConfig {
+        exe_or_file: program,
+        working_dir: get("workingDir").unwrap_or_default(),
+        arguments: get("args").unwrap_or_default(),
+    })
+}
+
+/// Log a decoded RAIL Window List order at INFO so the RemoteApp window
+/// lifecycle is observable in the browser console. This is the seam a future
+/// local-window renderer would hook to composite real windows.
+fn log_rail_window_order(order: &WindowOrder) {
+    match order {
+        WindowOrder::CreateWindow { window_id, state } => {
+            info!(
+                window_id = format!("{window_id:#x}"),
+                title = state.title.as_deref().unwrap_or(""),
+                offset = ?state.window_offset,
+                size = ?state.window_size,
+                show = ?state.show_state,
+                "RAIL: window created"
+            );
+        }
+        WindowOrder::UpdateWindow { window_id, state } => {
+            info!(
+                window_id = format!("{window_id:#x}"),
+                offset = ?state.window_offset,
+                size = ?state.window_size,
+                "RAIL: window updated"
+            );
+        }
+        WindowOrder::DeleteWindow { window_id } => {
+            info!(window_id = format!("{window_id:#x}"), "RAIL: window deleted");
+        }
+        WindowOrder::WindowIcon { window_id, cached } => {
+            info!(window_id = format!("{window_id:#x}"), cached, "RAIL: window icon");
+        }
+        WindowOrder::NotifyIcon {
+            window_id,
+            notify_id,
+            deleted,
+        } => {
+            info!(
+                window_id = format!("{window_id:#x}"),
+                notify_id, deleted, "RAIL: notify icon"
+            );
+        }
+        WindowOrder::Desktop {
+            active_window_id,
+            window_ids,
+        } => {
+            info!(active = ?active_window_id, count = window_ids.len(), "RAIL: monitored desktop / z-order");
+        }
+    }
+}
+
 fn build_config(
     username: String,
     password: String,
@@ -1545,6 +1636,9 @@ fn build_config(
         // (aborts otherwise) — this build depends on the matching proxy change that
         // drops that mandate and enables RemoteFxCodec on both legs.
         support_graphics_pipeline: false,
+        // RAIL (Remote Programs) is populated after build (from the `remoteApp`
+        // extension); None means a normal desktop/alternate-shell session.
+        rail: None,
     }
 }
 
@@ -1660,10 +1754,24 @@ async fn connect(
     // In web browser environments, we do not have an easy access to the local address of the socket.
     let dummy_client_addr = core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 33899));
 
+    // Capture the RAIL app before `config` is moved into the connector, so we can
+    // attach the matching `rail` static channel below.
+    let rail = config.rail.clone();
+
     let mut connector = ClientConnector::new(config, dummy_client_addr);
 
     if let Some(clipboard_backend) = clipboard_backend {
         connector.attach_static_channel(CliprdrClient::new(Box::new(clipboard_backend)));
+    }
+
+    // RAIL (Remote Programs): launch the published app over the `rail` channel.
+    // The connector already advertised RAIL + Window List caps and set INFO_RAIL.
+    if let Some(rail) = rail {
+        connector.attach_static_channel(RailChannel::with_app(RemoteApp {
+            exe_or_file: rail.exe_or_file,
+            working_dir: rail.working_dir,
+            arguments: rail.arguments,
+        }));
     }
 
     if let Some(printer_backend) = printer_backend {

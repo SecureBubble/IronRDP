@@ -791,6 +791,12 @@ fn create_client_info_pdu(config: &Config, client_addr: &SocketAddr) -> rdp::Cli
         flags |= ClientInfoFlags::NO_AUDIO_PLAYBACK;
     }
 
+    // RAIL (Remote Programs) mode: the server runs published applications rather
+    // than a desktop shell, and drives the `rail` static channel.
+    if config.rail.is_some() {
+        flags |= ClientInfoFlags::RAIL;
+    }
+
     // Advertise bulk compression support if configured
     let compression_type = if let Some(ct) = config.compression_type {
         flags |= ClientInfoFlags::COMPRESSION;

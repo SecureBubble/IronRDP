@@ -232,6 +232,10 @@ pub enum FastPathUpdate<'a> {
     /// Layout: pad(2) + numberColors(u32) + N x TS_COLOR_QUAD [B, G, R, pad].
     /// See MS-RDPBCGR 2.2.9.1.1.3.1.1.
     Palette(&'a [u8]),
+    /// Raw drawing-order update data (TS_FP_UPDATE_ORDERS): `numberOrders` (u16)
+    /// followed by the order list. Not interpreted here — a consumer decodes the
+    /// orders it cares about (e.g. RAIL Window List orders via `ironrdp-rdperp`).
+    Orders(&'a [u8]),
 }
 
 impl<'a> FastPathUpdate<'a> {
@@ -258,6 +262,11 @@ impl<'a> FastPathUpdate<'a> {
                 src.advance(data.len());
                 Ok(Self::Palette(data))
             }
+            UpdateCode::Orders => {
+                let data = src.remaining();
+                src.advance(data.len());
+                Ok(Self::Orders(data))
+            }
             UpdateCode::HiddenPointer => Ok(Self::Pointer(PointerUpdateData::SetHidden)),
             UpdateCode::DefaultPointer => Ok(Self::Pointer(PointerUpdateData::SetDefault)),
             UpdateCode::PositionPointer => Ok(Self::Pointer(PointerUpdateData::SetPosition(decode_cursor(src)?))),
@@ -278,6 +287,7 @@ impl<'a> FastPathUpdate<'a> {
             Self::Bitmap(_) => "Bitmap",
             Self::Pointer(_) => "Pointer",
             Self::Palette(_) => "Palette",
+            Self::Orders(_) => "Orders",
         }
     }
 }
@@ -307,6 +317,9 @@ impl Encode for FastPathUpdate<'_> {
             Self::Palette(data) => {
                 dst.write_slice(data);
             }
+            Self::Orders(data) => {
+                dst.write_slice(data);
+            }
         }
 
         Ok(())
@@ -321,6 +334,7 @@ impl Encode for FastPathUpdate<'_> {
             Self::SurfaceCommands(commands) => commands.iter().map(|c| c.size()).sum::<usize>(),
             Self::Bitmap(bitmap) => bitmap.size(),
             Self::Palette(data) => data.len(),
+            Self::Orders(data) => data.len(),
             Self::Pointer(pointer) => match pointer {
                 PointerUpdateData::SetHidden => 0,
                 PointerUpdateData::SetDefault => 0,
@@ -368,6 +382,7 @@ impl From<&FastPathUpdate<'_>> for UpdateCode {
             FastPathUpdate::SurfaceCommands(_) => Self::SurfaceCommands,
             FastPathUpdate::Bitmap(_) => Self::Bitmap,
             FastPathUpdate::Palette(_) => Self::Palette,
+            FastPathUpdate::Orders(_) => Self::Orders,
             FastPathUpdate::Pointer(action) => match action {
                 PointerUpdateData::SetHidden => Self::HiddenPointer,
                 PointerUpdateData::SetDefault => Self::DefaultPointer,

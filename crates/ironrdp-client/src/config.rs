@@ -1175,6 +1175,7 @@ impl ConfigBuilder {
             pointer_software_rendering: self.pointer_software_rendering.unwrap_or(false),
             multitransport_flags: None,
             support_graphics_pipeline: false,
+            rail: None,
             compression_type,
             performance_flags: PerformanceFlags::default(),
             timezone_info: TimezoneInfo::default(),

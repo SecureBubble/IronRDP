@@ -64,6 +64,10 @@ pub use ironrdp_rdpdr as rdpdr;
 #[doc(inline)]
 pub use ironrdp_rdpsnd as rdpsnd;
 
+#[cfg(feature = "rdperp")]
+#[doc(inline)]
+pub use ironrdp_rdperp as rdperp;
+
 #[cfg(feature = "server")]
 #[doc(inline)]
 pub use ironrdp_server as server;

@@ -53,6 +53,19 @@ export function alternateShell(shell: string): Extension {
     return new Extension('alternate_shell', shell);
 }
 
+// RAIL (Remote Programs) launch over the `rail` static channel: negotiates RAIL,
+// advertises Window List support, and launches `program` with `args` (the command
+// line travels natively in the RAIL Client Execute PDU). This is the classic,
+// non-eGFX RemoteApp path — use it ONLY for non-AVD targets. AVD does RAIL over a
+// DVC + eGFX and must keep using its own path; do not call this for AVD sessions.
+export function remoteApp(program: string, args?: string, workingDir?: string): Extension {
+    return new Extension('remote_app', {
+        program,
+        args: args ?? '',
+        workingDir: workingDir ?? '',
+    });
+}
+
 export function outboundMessageSizeLimit(limit: number): Extension {
     return new Extension('outbound_message_size_limit', limit);
 }

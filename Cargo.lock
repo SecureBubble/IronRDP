@@ -2413,6 +2413,7 @@ dependencies = [
  "ironrdp-mstsgu",
  "ironrdp-pdu",
  "ironrdp-rdpdr",
+ "ironrdp-rdperp",
  "ironrdp-rdpsnd",
  "ironrdp-server",
  "ironrdp-session",
@@ -2823,6 +2824,17 @@ dependencies = [
  "ironrdp-rdpdr",
  "ironrdp-svc",
  "nix",
+ "tracing",
+]
+
+[[package]]
+name = "ironrdp-rdperp"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.12.1",
+ "ironrdp-core",
+ "ironrdp-pdu",
+ "ironrdp-svc",
  "tracing",
 ]
 

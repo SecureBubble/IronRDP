@@ -426,6 +426,23 @@ fn create_client_confirm_active(
         }));
     }
 
+    if config.rail.is_some() {
+        // Remote Programs + Window List capability sets (MS-RDPERP §2.2.1.1).
+        // IronRDP models these as opaque capability bodies. See `ironrdp-rdperp`
+        // for the typed builders; the bytes are inlined here to keep the
+        // connector free of a channel-crate dependency.
+        //
+        // Rail body: RailSupportLevel = TS_RAIL_LEVEL_SUPPORTED (0x0001).
+        server_capability_sets.push(CapabilitySet::Rail(vec![0x01, 0x00, 0x00, 0x00]));
+        // Window List body: WndSupportLevel = TS_WINDOW_LEVEL_SUPPORTED_EX (0x0002),
+        // NumIconCaches = 3, NumIconCacheEntries = 12.
+        server_capability_sets.push(CapabilitySet::WindowList(vec![
+            0x02, 0x00, 0x00, 0x00, // WndSupportLevel
+            0x03, // NumIconCaches
+            0x0C, 0x00, // NumIconCacheEntries
+        ]));
+    }
+
     ClientConfirmActive {
         originator_id: SERVER_CHANNEL_ID,
         pdu: DemandActive {

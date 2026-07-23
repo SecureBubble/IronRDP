@@ -266,6 +266,7 @@ fn build_config(
         pointer_software_rendering: true,
         multitransport_flags: None,
         support_graphics_pipeline: false,
+        rail: None,
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,
         hardware_id: None,

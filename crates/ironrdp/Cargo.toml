@@ -31,6 +31,7 @@ svc = ["dep:ironrdp-svc"]
 dvc = ["dep:ironrdp-dvc"]
 rdpdr = ["dep:ironrdp-rdpdr"]
 rdpsnd = ["dep:ironrdp-rdpsnd"]
+rdperp = ["dep:ironrdp-rdperp"]
 displaycontrol = ["dep:ironrdp-displaycontrol"]
 echo = ["dep:ironrdp-echo"]
 mstsgu = ["dep:ironrdp-mstsgu"]
@@ -68,6 +69,7 @@ ironrdp-svc = { path = "../ironrdp-svc", version = "0.7", optional = true } # pu
 ironrdp-dvc = { path = "../ironrdp-dvc", version = "0.7", optional = true } # public
 ironrdp-rdpdr = { path = "../ironrdp-rdpdr", version = "0.6", optional = true } # public
 ironrdp-rdpsnd = { path = "../ironrdp-rdpsnd", version = "0.8", optional = true } # public
+ironrdp-rdperp = { path = "../ironrdp-rdperp", version = "0.1", optional = true } # public
 ironrdp-displaycontrol = { path = "../ironrdp-displaycontrol", version = "0.7", optional = true } # public
 ironrdp-echo = { path = "../ironrdp-echo", version = "0.3", optional = true } # public
 ironrdp-mstsgu = { path = "../ironrdp-mstsgu", version = "0.0.1", optional = true } # public

@@ -267,9 +267,27 @@ pub struct Config {
     /// Without the handler, the server may open the graphics DVC and the client
     /// would reject it, forcing a bitmap fallback.
     pub support_graphics_pipeline: bool,
+
+    /// RAIL (Remote Programs) mode. When set, the client advertises RAIL and
+    /// Window List capabilities, sets the `INFO_RAIL` client-info flag, and is
+    /// expected to attach the `rail` static channel (see `ironrdp-rdperp`) to
+    /// launch the application. `None` means a normal desktop/shell session.
+    pub rail: Option<RailConfig>,
 }
 
 ironrdp_core::assert_impl!(Config: Send, Sync);
+
+/// RAIL (Remote Programs) configuration — the application to launch, whose
+/// command line travels natively in the RAIL Client Execute PDU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RailConfig {
+    /// Executable path or published-app alias to run (`||<alias>` or a path).
+    pub exe_or_file: String,
+    /// Working directory; empty for the server default.
+    pub working_dir: String,
+    /// Command-line argument(s); empty for none.
+    pub arguments: String,
+}
 
 pub trait State: Send + fmt::Debug + 'static {
     fn name(&self) -> &'static str;

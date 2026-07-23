@@ -200,6 +200,12 @@ impl ActiveStage {
         self.fast_path_processor = processor;
     }
 
+    /// Drain raw drawing-order updates (RAIL Window List orders) received since
+    /// the last call. Decode with `ironrdp_rdperp::orders::WindowOrder`.
+    pub fn take_rail_orders(&mut self) -> Vec<Vec<u8>> {
+        self.fast_path_processor.take_orders()
+    }
+
     /// Updates the share_id used by the x224 processor for encoding ShareDataPdu.
     /// Must be called during Deactivation-Reactivation if the server assigns a new share_id.
     pub fn set_share_id(&mut self, share_id: u32) {
