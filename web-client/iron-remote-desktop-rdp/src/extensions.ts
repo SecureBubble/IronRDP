@@ -90,6 +90,24 @@ export function printerDriverName(driverName: string): Extension {
     return new Extension('printer_driver_name', driverName);
 }
 
+// Audio output (RDPSND) extension
+//
+// Registering `soundCallbacks` activates server→client audio playback. The client
+// advertises a single PCM format (44.1 kHz, stereo, 16-bit signed) and the server
+// transcodes to it, so no audio codec runs in the browser. Each received chunk is
+// delivered to `onWave(sampleRate, channels, bitsPerSample, pcm)` as raw
+// little-endian PCM; feed it to the Web Audio API for playback. `onClose` fires
+// when the server tears the audio stream down.
+
+export interface SoundCallbacks {
+    onWave: (sampleRate: number, channels: number, bitsPerSample: number, pcm: Uint8Array) => void;
+    onClose?: () => void;
+}
+
+export function soundCallbacks(callbacks: SoundCallbacks): Extension {
+    return new Extension('sound_callbacks', callbacks as unknown);
+}
+
 // Runtime operation extensions (invoked via Session.invokeExtension())
 
 export function requestFileContents(params: {

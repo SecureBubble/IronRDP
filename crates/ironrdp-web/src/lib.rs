@@ -25,6 +25,7 @@ mod network_client;
 mod printer;
 mod rdp_file;
 mod session;
+mod sound;
 
 mod wasm_bridge {
     use tracing::debug;

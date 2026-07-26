@@ -52,6 +52,7 @@ use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
 use crate::network_client::WasmNetworkClient;
 use crate::printer::{JsPrinterStreamCallbacks, WasmPrinter, WasmPrinterBackend, wasm_printer_pair};
+use crate::sound::{JsSoundCallbacks, WasmSound, WasmSoundBackend, wasm_sound_pair};
 
 const DEFAULT_WIDTH: u16 = 1280;
 const DEFAULT_HEIGHT: u16 = 720;
@@ -102,6 +103,10 @@ struct SessionBuilderInner {
     printer_device_id: Option<u32>,
     printer_driver_name: Option<String>,
 
+    // Setting sound callbacks activates RDPSND audio playback (server → client).
+    invalid_sound_callbacks: bool,
+    sound_callbacks: Option<JsSoundCallbacks>,
+
     use_display_control: bool,
     enable_credssp: bool,
     outbound_message_size_limit: Option<usize>,
@@ -145,6 +150,9 @@ impl Default for SessionBuilderInner {
             printer_name: None,
             printer_device_id: None,
             printer_driver_name: None,
+
+            invalid_sound_callbacks: false,
+            sound_callbacks: None,
 
             use_display_control: false,
             enable_credssp: true,
@@ -338,6 +346,21 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     Some(printer_driver_name)
                 };
             };
+            // Registering sound callbacks activates RDPSND server→client audio.
+            |sound_callbacks: JsValue| {
+                let mut inner = self.0.borrow_mut();
+                match parse_sound_callbacks(sound_callbacks) {
+                    Ok(callbacks) => {
+                        inner.invalid_sound_callbacks = false;
+                        inner.sound_callbacks = Some(callbacks);
+                    }
+                    Err(error) => {
+                        inner.invalid_sound_callbacks = true;
+                        inner.sound_callbacks = None;
+                        warn!(%error, "Invalid sound_callbacks; audio playback requires an onWave function");
+                    }
+                }
+            };
         }
 
         self.clone()
@@ -372,6 +395,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_name,
             printer_device_id,
             printer_driver_name,
+            invalid_sound_callbacks,
+            sound_callbacks,
             outbound_message_size_limit,
         );
 
@@ -413,6 +438,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_name = inner.printer_name.clone();
             printer_device_id = inner.printer_device_id;
             printer_driver_name = inner.printer_driver_name.clone();
+            invalid_sound_callbacks = inner.invalid_sound_callbacks;
+            sound_callbacks = inner.sound_callbacks.clone();
             outbound_message_size_limit = inner.outbound_message_size_limit;
         }
 
@@ -477,6 +504,24 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                 "printer redirection requires valid print_job_stream_callbacks"
             )));
         }
+
+        if invalid_sound_callbacks {
+            return Err(IronError::from(anyhow::anyhow!(
+                "audio playback requires valid sound_callbacks"
+            )));
+        }
+
+        // Build the RDPSND audio pair when JS sound callbacks were registered.
+        // Enabling audio also clears the NO_AUDIO_PLAYBACK client-info flag so the
+        // server redirects sound to us instead of playing it on the host.
+        let (sound_backend, sound) = match sound_callbacks {
+            Some(callbacks) => {
+                let (backend, sound) = wasm_sound_pair(input_events_tx.clone(), callbacks);
+                config.enable_audio_playback = true;
+                (Some(backend), Some(sound))
+            }
+            None => (None, None),
+        };
 
         // Build the virtual-printer pair when JS printer callbacks were
         // registered via extension(). Backend is Send (holds the mpsc proxy
@@ -545,6 +590,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_device_id,
             printer_name,
             printer_driver_name,
+            sound_backend,
             computer_name: client_name.clone(),
             use_display_control,
             graphics_handler,
@@ -574,6 +620,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             connection_result: RefCell::new(Some(connection_result)),
             clipboard: RefCell::new(Some(clipboard)),
             printer: RefCell::new(Some(printer)),
+            sound: RefCell::new(Some(sound)),
         })
     }
 }
@@ -587,6 +634,9 @@ pub(crate) enum RdpInputEvent {
     /// Printer backend → event loop: a print job finished and its bytes are
     /// ready for delivery to JS. See [`crate::printer::PrinterBackendMessage`].
     Printer(crate::printer::PrinterBackendMessage),
+    /// Sound backend → event loop: a chunk of PCM audio is ready for delivery to
+    /// JS (Web Audio). See [`crate::sound::SoundBackendMessage`].
+    Sound(crate::sound::SoundBackendMessage),
     FastPath(FastPathInputEvents),
     /// An EGFX-decoded output region, ready to blit to the canvas. Sent by
     /// [`crate::graphics::WasmGraphicsHandler`] (which is `Send` and cannot touch
@@ -638,6 +688,7 @@ pub(crate) struct Session {
     rdp_reader: RefCell<Option<ReadHalf<WebSocket>>>,
     clipboard: RefCell<Option<Option<WasmClipboard>>>,
     printer: RefCell<Option<Option<WasmPrinter>>>,
+    sound: RefCell<Option<Option<WasmSound>>>,
 }
 
 impl Session {
@@ -707,6 +758,7 @@ impl iron_remote_desktop::Session for Session {
 
         let mut clipboard = self.clipboard.borrow_mut().take().expect("run called only once");
         let mut wasm_printer = self.printer.borrow_mut().take().expect("run called only once");
+        let wasm_sound = self.sound.borrow_mut().take().expect("run called only once");
 
         let mut framed = ironrdp_futures::LocalFuturesFramed::new(rdp_reader);
 
@@ -935,6 +987,17 @@ impl iron_remote_desktop::Session for Session {
                                 wasm_printer.process_message(message);
                             } else {
                                 warn!("Printer event received, but no printer is configured");
+                            }
+                            Vec::new()
+                        }
+                        RdpInputEvent::Sound(message) => {
+                            // Like the printer, the RDPSND backend is Send-only and
+                            // lives in the SVC processor; `WasmSound` owns the JS
+                            // callback (!Send) and lives here. Forward the PCM chunk.
+                            if let Some(ref wasm_sound) = wasm_sound {
+                                wasm_sound.process_message(message);
+                            } else {
+                                warn!("Sound event received, but no audio backend is configured");
                             }
                             Vec::new()
                         }
@@ -1398,6 +1461,17 @@ fn parse_print_job_stream_callbacks(callbacks: JsValue) -> anyhow::Result<JsPrin
     })
 }
 
+fn parse_sound_callbacks(callbacks: JsValue) -> anyhow::Result<JsSoundCallbacks> {
+    let callbacks = callbacks
+        .dyn_into::<js_sys::Object>()
+        .map_err(|_| anyhow::anyhow!("expected object"))?;
+
+    Ok(JsSoundCallbacks {
+        on_wave: get_required_function(&callbacks, "onWave")?,
+        on_close: get_optional_function(&callbacks, "onClose")?,
+    })
+}
+
 fn get_required_function(obj: &js_sys::Object, key: &str) -> anyhow::Result<js_sys::Function> {
     get_optional_function(obj, key)?.with_context(|| format!("missing function `{key}`"))
 }
@@ -1692,6 +1766,7 @@ struct ConnectParams {
     printer_device_id: u32,
     printer_name: String,
     printer_driver_name: String,
+    sound_backend: Option<WasmSoundBackend>,
     /// Matches the `client_name` in the connector config; used as the
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
@@ -1744,6 +1819,7 @@ async fn connect(
         printer_device_id,
         printer_name,
         printer_driver_name,
+        sound_backend,
         computer_name,
         use_display_control,
         graphics_handler,
@@ -1774,11 +1850,22 @@ async fn connect(
         }));
     }
 
+    // RDPSND (audio output). Attached when audio playback is enabled, OR as a no-op
+    // when only the printer is redirected: Windows servers only speak on RDPDR when
+    // RDPSND is advertised too (MS-RDPEFS Appendix A<1>), so the printer path needs
+    // the channel present even though it wants no sound. A real sound backend also
+    // satisfies that dependency, so it takes priority when both are configured.
+    match (sound_backend, printer_backend.is_some()) {
+        (Some(sound_backend), _) => {
+            connector.attach_static_channel(Rdpsnd::new(Box::new(sound_backend)));
+        }
+        (None, true) => {
+            connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
+        }
+        (None, false) => {}
+    }
+
     if let Some(printer_backend) = printer_backend {
-        // Windows servers only speak on RDPDR when RDPSND is advertised too
-        // (MS-RDPEFS Appendix A<1>). We do not play audio in the web client,
-        // but the no-op RDPSND processor satisfies that channel dependency.
-        connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
         connector.attach_static_channel(
             Rdpdr::new(Box::new(printer_backend), computer_name).with_printer_driver(
                 printer_device_id,

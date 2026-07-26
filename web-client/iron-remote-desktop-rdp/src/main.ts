@@ -114,5 +114,6 @@ export {
     printerName,
     printerDeviceId,
     printerDriverName,
+    soundCallbacks,
 } from './extensions';
-export type { PrintJobStreamCallbacks } from './extensions';
+export type { PrintJobStreamCallbacks, SoundCallbacks } from './extensions';
