@@ -44,6 +44,59 @@ fn main() {
     let our_dir = Path::new(&a[0]);
     let golden_dir = Path::new(&a[1]);
     let threshold: u8 = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(40);
+    // Optional 4th arg: mask that drains the progressive residual so only outline
+    // residue is counted. Either a P5 PGM, or a perop CSV (build the union of all
+    // WTS1 ClearCodec rects +2px). Width fixed at 3200 (capture surface).
+    const MW: usize = 3200;
+    const MH: usize = 1308;
+    let mask: Option<Vec<u8>> = a.get(3).map(|p| {
+        if p.ends_with(".csv") {
+            // outline-rects CSV: frame,l,t,r,b,w,h,subcodec  (l,t,r,b = cols 1..4, subcodec = last)
+            // Optional env MASK_SUBCODEC filters to one subcodec (e.g. NSCodec / RLEX / RAW).
+            let filter = std::env::var("MASK_SUBCODEC").ok();
+            let text = fs::read_to_string(p).unwrap();
+            let mut m = vec![0u8; MW * MH];
+            let mut rects = 0u32;
+            for (i, line) in text.lines().enumerate() {
+                if i == 0 { continue; }
+                let c: Vec<&str> = line.split(',').collect();
+                if c.len() < 8 { continue; }
+                let subcodec = c[c.len() - 1].trim();
+                if let Some(f) = &filter {
+                    if subcodec != f { continue; }
+                }
+                let (l, t, r, b): (i64, i64, i64, i64) = (
+                    c[1].parse().unwrap_or(0), c[2].parse().unwrap_or(0),
+                    c[3].parse().unwrap_or(0), c[4].parse().unwrap_or(0),
+                );
+                rects += 1;
+                let (x0, y0) = ((l - 2).max(0) as usize, (t - 2).max(0) as usize);
+                let (x1, y1) = ((r + 2).min(MW as i64) as usize, (b + 2).min(MH as i64) as usize);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        m[y * MW + x] = 255;
+                    }
+                }
+            }
+            let cov = m.iter().filter(|&&v| v != 0).count();
+            eprintln!("mask from CSV: {rects} rects (filter={filter:?}), coverage {:.1}%", 100.0 * cov as f64 / (MW * MH) as f64);
+            m
+        } else {
+            let bytes = fs::read(p).unwrap_or_else(|e| panic!("read mask {p}: {e}"));
+            let mut idx = 2;
+            let mut nums = [0u32; 3];
+            let mut got = 0;
+            while got < 3 {
+                while idx < bytes.len() && (bytes[idx] as char).is_whitespace() { idx += 1; }
+                let s = idx;
+                while idx < bytes.len() && (bytes[idx] as char).is_ascii_digit() { idx += 1; }
+                nums[got] = std::str::from_utf8(&bytes[s..idx]).unwrap().parse().unwrap();
+                got += 1;
+            }
+            idx += 1;
+            bytes[idx..].to_vec()
+        }
+    });
 
     // Sorted golden list = frame order.
     let mut goldens: Vec<PathBuf> = fs::read_dir(golden_dir)
@@ -71,6 +124,11 @@ fn main() {
         let mut first_bad: Option<(u32, u32)> = None;
         let mut worst = 0u8;
         for p in 0..n.min(g.len() / 3).min(o.len() / 3) {
+            if let Some(m) = &mask {
+                if m.get(p).copied().unwrap_or(0) == 0 {
+                    continue; // outside the mask (progressive-only area) — ignore
+                }
+            }
             let d = o[p * 3].abs_diff(g[p * 3]).max(o[p * 3 + 1].abs_diff(g[p * 3 + 1])).max(o[p * 3 + 2].abs_diff(g[p * 3 + 2]));
             if d > threshold {
                 big += 1;
