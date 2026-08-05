@@ -462,6 +462,24 @@ fn nsc_rle_decode(input: &[u8], original_size: usize) -> Vec<u8> {
     out
 }
 
+/// Reconstruct one NSCodec plane to exactly `pixels` bytes, dispatching on the
+/// compressed `plane_size` exactly like FreeRDP `nsc_rle_decompress_data`:
+///   `plane_size == 0`            -> constant 0xFF plane (no bitstream present)
+///   `plane_size <  pixels`       -> RLE-compressed, decode it
+///   `plane_size >= pixels`       -> stored uncompressed, copy the first `pixels` bytes
+/// `raw` is the plane slice already sized to `plane_size`.
+fn nsc_decode_plane(raw: &[u8], plane_size: usize, pixels: usize) -> Vec<u8> {
+    if plane_size == 0 {
+        vec![0xFFu8; pixels]
+    } else if plane_size < pixels {
+        nsc_rle_decode(raw, pixels)
+    } else {
+        let mut v = raw.get(..pixels).unwrap_or(raw).to_vec();
+        v.resize(pixels, 0);
+        v
+    }
+}
+
 /// Decode an MS-RDPNSC (NSCodec) tile and composite it (BGRA, top-down) into the
 /// ClearCodec output buffer at `(x_start, y_start)`. Handles the case Windows
 /// servers actually emit inside ClearCodec: `ChromaSubsamplingLevel = 0`
@@ -508,14 +526,17 @@ fn decode_nscodec_into(
         return Err(invalid_field_err!("nscodec", "chroma subsampling unsupported"));
     }
 
-    let y = nsc_rle_decode(y_raw, pixels);
-    let co = nsc_rle_decode(co_raw, pixels);
-    let cg = nsc_rle_decode(cg_raw, pixels);
-    let a = if a_len > 0 {
-        nsc_rle_decode(a_raw, pixels)
-    } else {
-        vec![0xFFu8; pixels]
-    };
+    // FreeRDP `nsc_rle_decompress_data`: each plane is dispatched on its COMPRESSED
+    // byte count vs the uncompressed `originalSize` (pixels). Three cases, not one:
+    //   planeSize == 0            -> fill 0xFF (opaque/neutral), no bitstream
+    //   planeSize <  originalSize -> RLE-decode
+    //   planeSize >= originalSize -> raw copy (incompressible plane stored verbatim)
+    // Thin strips (4px wide, tall) routinely store planes RAW; unconditionally
+    // RLE-decoding them yields garbage — the source of the NSCodec streak.
+    let y = nsc_decode_plane(y_raw, y_len, pixels);
+    let co = nsc_decode_plane(co_raw, co_len, pixels);
+    let cg = nsc_decode_plane(cg_raw, cg_len, pixels);
+    let a = nsc_decode_plane(a_raw, a_len, pixels);
 
     let shift = cll.saturating_sub(1);
     // Match FreeRDP `nsc.c` exactly: `(INT16)(INT8)(((INT16)plane) << shift)` —
@@ -977,5 +998,34 @@ mod tests {
         for seg in &segments {
             assert_eq!(seg.run_length, 1);
         }
+    }
+
+    // NSCodec plane dispatch (FreeRDP `nsc_rle_decompress_data`): the compressed
+    // byte count decides how a plane is read. Getting this wrong (always RLE) was
+    // the cause of the NSCodec streak on thin ClearCodec strips.
+    #[test]
+    fn nsc_plane_zero_size_fills_opaque() {
+        // planeSize == 0 -> constant 0xFF plane, regardless of any bytes present.
+        assert_eq!(nsc_decode_plane(&[0x12, 0x34], 0, 4), vec![0xFF; 4]);
+    }
+
+    #[test]
+    fn nsc_plane_uncompressed_is_copied_verbatim() {
+        // planeSize >= pixels -> stored raw; the first `pixels` bytes are the plane,
+        // NOT an RLE stream. Decoding it as RLE would corrupt every thin strip.
+        let raw = [10u8, 20, 30, 40, 50, 60];
+        assert_eq!(nsc_decode_plane(&raw, raw.len(), 6), vec![10, 20, 30, 40, 50, 60]);
+        // Only `pixels` bytes are taken even if more are present.
+        assert_eq!(nsc_decode_plane(&raw, raw.len(), 4), vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn nsc_plane_compressed_takes_rle_path() {
+        // planeSize < pixels -> RLE. A run `value,value,len(=next+2)` then a 4-byte
+        // raw tail reproduces the FreeRDP decoder exactly.
+        // 8-pixel plane: run of four 0x07, then raw tail [1,2,3,4].
+        let rle = [0x07u8, 0x07, 0x02, 1, 2, 3, 4];
+        let out = nsc_decode_plane(&rle, rle.len(), 8);
+        assert_eq!(out, vec![7, 7, 7, 7, 1, 2, 3, 4]);
     }
 }
