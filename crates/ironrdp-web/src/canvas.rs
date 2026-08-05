@@ -61,6 +61,7 @@ impl Canvas {
             unimplemented!("web canvas is only available on wasm32")
         }
     }
+
 }
 
 /// Acquires the canvas 2D context (wasm only; panics on other targets).

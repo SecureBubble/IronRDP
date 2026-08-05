@@ -668,12 +668,14 @@ impl CodecCapabilities {
                 small_cache: flags.contains(CapabilitiesV104Flags::SMALL_CACHE),
                 thin_client: flags.contains(CapabilitiesV104Flags::AVC_THIN_CLIENT),
             },
-            CapabilitySet::V10_7 { flags } => Self {
-                avc420: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
-                avc444: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
-                small_cache: flags.contains(CapabilitiesV107Flags::SMALL_CACHE),
-                thin_client: flags.contains(CapabilitiesV107Flags::AVC_THIN_CLIENT),
-            },
+            CapabilitySet::V10_7 { flags } | CapabilitySet::V10_8 { flags } | CapabilitySet::V10_9 { flags } => {
+                Self {
+                    avc420: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+                    avc444: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+                    small_cache: flags.contains(CapabilitiesV107Flags::SMALL_CACHE),
+                    thin_client: flags.contains(CapabilitiesV107Flags::AVC_THIN_CLIENT),
+                }
+            }
         }
     }
 }
@@ -681,6 +683,8 @@ impl CodecCapabilities {
 /// Priority order for capability negotiation (highest to lowest)
 fn capability_priority(cap: &CapabilitySet) -> u32 {
     match cap {
+        CapabilitySet::V10_9 { .. } => 14,
+        CapabilitySet::V10_8 { .. } => 13,
         CapabilitySet::V10_7 { .. } => 12,
         CapabilitySet::V10_6Err { .. } => 11,
         CapabilitySet::V10_6 { .. } => 10,

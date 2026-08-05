@@ -409,16 +409,13 @@ fn dwt_col(
 // Helper
 // ---------------------------------------------------------------------------
 
-/// Truncate i32 to i16 (matches the `i32_to_i16_possible_truncation` pattern
-/// in the existing `dwt.rs`). DWT coefficients stay within i16 range for
-/// typical image data; truncation handles rare overflow gracefully.
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    reason = "intentional truncation matching existing DWT convention"
-)]
+/// Clamp i32 to i16. A large high-frequency coefficient can push a DWT
+/// intermediate just past i16 range; a raw `as i16` WRAPS (a big negative flips
+/// to a large positive), turning a dark pixel pure white — the scattered white
+/// "speckles" on textured/dark areas. Saturate instead so it stays near-correct.
+#[expect(clippy::as_conversions, reason = "value is clamped to i16 range before cast")]
 fn t(value: i32) -> i16 {
-    value as i16
+    value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
 // ---------------------------------------------------------------------------

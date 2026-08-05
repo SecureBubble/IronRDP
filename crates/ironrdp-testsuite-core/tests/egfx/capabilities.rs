@@ -12,7 +12,8 @@
 
 use ironrdp_core::{decode, encode_vec};
 use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, CapabilityVersion};
-use proptest::{prelude::*, sample::select};
+use proptest::prelude::*;
+use proptest::sample::select;
 
 /// Build a raw `RDPGFX_CAPS_ADVERTISE_PDU` carrying a single capset:
 /// `capsSetCount=1` then `version`, `dataLength`, `data`.

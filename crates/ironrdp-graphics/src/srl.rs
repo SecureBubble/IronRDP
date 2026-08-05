@@ -108,6 +108,168 @@ pub fn decode_srl(data: &[u8], num_values: usize, num_bits: u8) -> Vec<i16> {
     output
 }
 
+/// Continuous SRL decoder for a whole component's progressive upgrade pass.
+///
+/// [`decode_srl`] decodes a fixed count of values from the *start* of a stream,
+/// resetting the bit cursor and the adaptive `kp`/zero-run state on every call.
+/// That is only correct for a single DWT subband. In the MS-RDPEGFX wire format
+/// there is exactly **one** SRL blob per component that is consumed continuously
+/// across all 10 subbands, with the bit cursor **and** the adaptive state
+/// persisting across band boundaries (FreeRDP `progressive_rfx_srl_read`). Decoding
+/// each band from offset 0 re-reads the first band's bits for every later band,
+/// producing garbage magnitudes that overflow the coefficient — a live-only,
+/// upgrade-pass-only artifact (scattered chroma "speckles"). This reader keeps the
+/// state across `next()` calls so the whole component decodes from one continuous
+/// stream. `num_bits` is supplied per call because it varies per band; the
+/// zero-run machinery is independent of it.
+pub struct SrlDecoder<'a> {
+    reader: BitReader<'a>,
+    kp: u32,
+    nz: u32, // zeros remaining in the current run
+}
+
+impl<'a> SrlDecoder<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self {
+            reader: BitReader::new(data),
+            kp: 0,
+            nz: 0,
+        }
+    }
+
+    /// Decode the next coefficient value using `num_bits` for the magnitude
+    /// width. Returns 0 when the coefficient stays zero for this pass.
+    pub fn next(&mut self, num_bits: u8) -> i16 {
+        // Emit a pending zero from an in-progress run first.
+        if self.nz > 0 {
+            self.nz -= 1;
+            return 0;
+        }
+
+        let k = self.kp >> 3;
+
+        let bit = self.reader.read_bit();
+        if !bit {
+            // Full zero-run chunk of 1 << k.
+            let run = 1u32.checked_shl(k).unwrap_or(0);
+            self.kp = self.kp.saturating_add(4).min(80);
+            self.nz = run.saturating_sub(1);
+            return 0;
+        }
+
+        let zeros = self.reader.read_bits(k);
+        if zeros > 0 {
+            // Partial zero-run of `zeros`.
+            self.nz = zeros - 1;
+            return 0;
+        }
+
+        // Unary magnitude mode.
+        self.kp = self.kp.saturating_sub(6);
+
+        if num_bits == 0 {
+            let sign = self.reader.read_bit();
+            return if sign { -1 } else { 1 };
+        }
+
+        let sign = self.reader.read_bit();
+        if num_bits == 1 {
+            return if sign { -1 } else { 1 };
+        }
+
+        let mut quotient: u32 = 0;
+        loop {
+            let bit = self.reader.read_bit();
+            if bit || quotient >= 0x8000 {
+                break;
+            }
+            quotient += 1;
+        }
+
+        let extra_bits = u32::from(num_bits).saturating_sub(1);
+        let magnitude = if extra_bits > 0 && extra_bits < 16 {
+            let remainder = self.reader.read_bits(extra_bits);
+            (quotient << extra_bits) | remainder
+        } else {
+            quotient
+        };
+
+        let value = i16::try_from(magnitude.min(0x7FFF)).unwrap_or(i16::MAX);
+        if sign {
+            -value
+        } else {
+            value
+        }
+    }
+}
+
+/// Encode a whole component's SRL values as one continuous stream, mirroring
+/// [`SrlDecoder`]. `items` are `(value, num_bits)` for every zero-DAS coefficient
+/// across all subbands, in decode order; the adaptive `kp` persists across the
+/// whole list and there is no per-band sentinel. Inverse of a full sweep of
+/// [`SrlDecoder::next`].
+pub fn encode_srl_continuous(items: &[(i16, u8)]) -> Vec<u8> {
+    let mut writer = BitWriter::new();
+    let mut kp: u32 = 0;
+    let mut idx = 0;
+
+    while idx < items.len() {
+        // Emit the run of consecutive zero-valued items at `idx`.
+        while idx < items.len() && items[idx].0 == 0 {
+            let k = kp >> 3;
+            let chunk = 1u32.checked_shl(k).unwrap_or(u32::MAX);
+            // Count remaining consecutive zeros.
+            let mut run: u32 = 0;
+            while idx + usize::try_from(run).unwrap_or(usize::MAX) < items.len()
+                && items[idx + usize::try_from(run).unwrap_or(usize::MAX)].0 == 0
+            {
+                run += 1;
+            }
+            if run >= chunk {
+                writer.write_bit(false); // full chunk
+                kp = kp.saturating_add(4).min(80);
+                idx += usize::try_from(chunk).unwrap_or(usize::MAX);
+            } else {
+                writer.write_bit(true); // partial run
+                writer.write_bits(run, k);
+                idx += usize::try_from(run).unwrap_or(usize::MAX);
+            }
+        }
+
+        if idx >= items.len() {
+            break;
+        }
+
+        // Non-zero value: end-of-zeros escape (bit 1 + k zero-bits) then magnitude.
+        let k = kp >> 3;
+        writer.write_bit(true);
+        writer.write_bits(0, k);
+        kp = kp.saturating_sub(6);
+
+        let (value, num_bits) = items[idx];
+        let sign = value < 0;
+        let magnitude = u32::from(value.unsigned_abs());
+        writer.write_bit(sign);
+
+        if num_bits > 1 {
+            let extra_bits = u32::from(num_bits) - 1;
+            if extra_bits < 16 {
+                let quotient = magnitude >> extra_bits;
+                let remainder = magnitude & ((1u32 << extra_bits) - 1);
+                for _ in 0..quotient {
+                    writer.write_bit(false);
+                }
+                writer.write_bit(true);
+                writer.write_bits(remainder, extra_bits);
+            }
+        }
+
+        idx += 1;
+    }
+
+    writer.finish()
+}
+
 /// Encode coefficient magnitudes using the SRL algorithm.
 ///
 /// `values` contains signed coefficient values (non-zero = needs encoding,

@@ -22,6 +22,11 @@ use crate::srl;
 /// Number of DWT coefficients per component in a 64x64 tile.
 pub const COEFFICIENTS_PER_COMPONENT: usize = 4096;
 
+/// RFX_TILE_DIFFERENCE (MS-RDPEGFX tile `flags` bit 0): the tile's coefficients
+/// are a temporal delta to be added onto the tile's retained coefficients from
+/// the previous frame, rather than an absolute replacement.
+pub const RFX_TILE_DIFFERENCE: u8 = 0x01;
+
 /// Number of subbands in a 3-level DWT decomposition.
 pub const NUM_BANDS: usize = 10;
 
@@ -63,26 +68,52 @@ pub fn decode_first_pass(
     base_quant: &ComponentCodecQuant,
     prog_quant: &ComponentCodecQuant,
     use_reduce_extrapolate: bool,
+    is_difference: bool,
     coefficients: &mut [i16],
     sign: &mut [i8],
 ) -> Result<(), RlgrError> {
     assert!(coefficients.len() >= COEFFICIENTS_PER_COMPONENT);
     assert!(sign.len() >= COEFFICIENTS_PER_COMPONENT);
 
-    // Step 1: RLGR1 decode into coefficient buffer
-    crate::rlgr::decode(EntropyAlgorithm::Rlgr1, data, coefficients)?;
+    // RFX-Progressive TILE_FIRST/TILE_SIMPLE tiles may be *difference* tiles
+    // (RFX_TILE_DIFFERENCE, flags bit 0): their decoded coefficients are a
+    // temporal delta to be ADDED to the tile's retained coefficients from the
+    // previous frame, not an absolute replacement. FreeRDP
+    // (progressive_rfx_dwt_2d_decode): `coeffDiff ? add_16s(current, buffer)
+    // : memcpy(current, buffer)`. The tile keeps its coefficients across frames
+    // (`current`), so we decode this frame into a scratch buffer and then either
+    // add it onto `coefficients` or replace them.
+    //
+    // Missing this collapses a settled tile to neutral gray (Y=Cb=Cr=0 -> 128)
+    // the moment the server sends a near-empty differential refresh — which is
+    // exactly what a static desktop wallpaper receives once it has settled.
+    let mut buffer = [0i16; COEFFICIENTS_PER_COMPONENT];
 
-    // Step 2: LL3 differential decoding (reverse delta encoding on last subband)
-    crate::subband_reconstruction::decode(&mut coefficients[ll3_offset(use_reduce_extrapolate)..]);
+    // Step 1: RLGR1 decode into the scratch buffer.
+    crate::rlgr::decode(EntropyAlgorithm::Rlgr1, data, &mut buffer)?;
 
-    // Step 3: Base dequantization (shift left by quant - 1)
-    dequantize_component_ccq(coefficients, base_quant, use_reduce_extrapolate);
+    // Step 2: Capture sign state for DAS from the raw RLGR output. FreeRDP
+    // captures the sign before the LL3 differential decode and the quant shifts.
+    capture_sign(&buffer, sign);
 
-    // Step 4: Progressive dequantization (shift left by BitPos)
-    progressive_dequantize(coefficients, prog_quant, use_reduce_extrapolate);
+    // Step 3: LL3 differential decoding (reverse delta encoding on last subband)
+    crate::subband_reconstruction::decode(&mut buffer[ll3_offset(use_reduce_extrapolate)..]);
 
-    // Step 5: Capture sign state for DAS
-    capture_sign(coefficients, sign);
+    // Step 4: Base dequantization (shift left by quant - 1)
+    dequantize_component_ccq(&mut buffer, base_quant, use_reduce_extrapolate);
+
+    // Step 5: Progressive dequantization (shift left by BitPos)
+    progressive_dequantize(&mut buffer, prog_quant, use_reduce_extrapolate);
+
+    // Step 6: temporal difference (add) or absolute replace into the retained
+    // per-tile coefficients.
+    if is_difference {
+        for (dst, delta) in coefficients.iter_mut().zip(buffer.iter()) {
+            *dst = clamp_i16(i32::from(*dst) + i32::from(*delta));
+        }
+    } else {
+        coefficients[..COEFFICIENTS_PER_COMPONENT].copy_from_slice(&buffer);
+    }
 
     Ok(())
 }
@@ -119,6 +150,16 @@ pub fn decode_upgrade_pass(
 
     let bands = get_band_layout(use_reduce_extrapolate);
 
+    // MS-RDPEGFX sends ONE SRL blob and ONE raw blob per component, consumed
+    // continuously across all 10 subbands. Both the raw bit cursor and the SRL
+    // adaptive/zero-run state must persist across band boundaries (FreeRDP
+    // `progressive_rfx_upgrade_component`). Creating either reader per band
+    // re-reads the first band's bytes for every later band, yielding garbage
+    // magnitudes that overflow chroma coefficients — the live-only, lossless-
+    // upgrade-only "speckle". Hoist both readers out of the band loop.
+    let mut srl = srl::SrlDecoder::new(srl_data);
+    let mut raw_reader = RawBitReader::new(raw_data);
+
     for (band_idx, band) in bands.iter().enumerate() {
         let prev_bit_pos = prev_prog_quant.for_band(band_idx);
         let curr_bit_pos = curr_prog_quant.for_band(band_idx);
@@ -129,28 +170,13 @@ pub fn decode_upgrade_pass(
             continue;
         }
 
-        // Count zero-DAS positions in this band (for SRL decode)
-        let zero_count = band_zero_count(sign, band);
-
-        // SRL decode for zero-DAS positions
-        let srl_values = srl::decode_srl(srl_data, zero_count, num_bits);
-
-        // Apply upgrade values to this band
-        let mut srl_idx = 0;
-        let mut raw_reader = RawBitReader::new(raw_data);
-
         for i in 0..band.count() {
             let coeff_idx = band.offset + i;
             let is_ll3 = band_idx == 9;
 
             if sign[coeff_idx] == SIGN_ZERO {
-                // Zero-DAS: get value from SRL stream
-                let value = if srl_idx < srl_values.len() {
-                    srl_values[srl_idx]
-                } else {
-                    0
-                };
-                srl_idx += 1;
+                // Zero-DAS: pull the next value from the continuous SRL stream.
+                let value = srl.next(num_bits);
 
                 if value != 0 {
                     // Coefficient transitions from zero to non-zero
@@ -375,7 +401,10 @@ pub fn encode_upgrade_pass(
     use_reduce_extrapolate: bool,
 ) -> (Vec<u8>, Vec<u8>) {
     let bands = get_band_layout(use_reduce_extrapolate);
-    let mut all_srl_values = Vec::new();
+    // One continuous SRL value list and one continuous raw bit stream for the
+    // whole component, consumed across all subbands (see `decode_upgrade_pass`
+    // and the MS-RDPEGFX wire format). No per-band segmentation/sentinel.
+    let mut srl_items: Vec<(i16, u8)> = Vec::new();
     let mut raw_writer = RawBitWriter::new();
 
     for (band_idx, band) in bands.iter().enumerate() {
@@ -387,17 +416,15 @@ pub fn encode_upgrade_pass(
             continue;
         }
 
-        let mut band_srl_values = Vec::new();
-
         for i in 0..band.count() {
             let coeff_idx = band.offset + i;
 
             if sign[coeff_idx] == SIGN_ZERO {
-                // Zero-DAS: compute the refined value and encode via SRL
+                // Zero-DAS: compute the refined value and queue it for the SRL stream.
                 let curr_shifted = i32::from(coefficients[coeff_idx]) >> i32::from(curr_bit_pos);
                 let prev_shifted = i32::from(prev_coefficients[coeff_idx]) >> i32::from(curr_bit_pos);
                 let delta = clamp_i16(curr_shifted - prev_shifted);
-                band_srl_values.push(delta);
+                srl_items.push((delta, num_bits));
             } else {
                 // Non-zero DAS: compute raw magnitude bits
                 let curr_abs = i32::from(coefficients[coeff_idx]).unsigned_abs();
@@ -410,14 +437,11 @@ pub fn encode_upgrade_pass(
                 raw_writer.write_bits(raw_mag, u32::from(num_bits));
             }
         }
-
-        // Encode SRL values for this band
-        let srl_encoded = srl::encode_srl(&band_srl_values, num_bits);
-        all_srl_values.extend_from_slice(&srl_encoded);
     }
 
+    let srl_data = srl::encode_srl_continuous(&srl_items);
     let raw_data = raw_writer.finish();
-    (all_srl_values, raw_data)
+    (srl_data, raw_data)
 }
 
 /// Encode RGBA pixels to spatial-domain i16 coefficients (RGB to YCbCr).
@@ -469,7 +493,12 @@ fn dequantize_component_ccq(coefficients: &mut [i16], quant: &ComponentCodecQuan
             let start = band.offset;
             let end = start + band.count();
             for coeff in &mut coefficients[start..end] {
-                *coeff <<= factor;
+                // Clamp instead of a raw `i16 <<=`: a large coefficient shifted left
+                // overflows i16 and WRAPS (a big positive becomes negative and vice
+                // versa), which flips a dark pixel to pure white — scattered white
+                // "speckles" on the wallpaper. Saturate to i16 range instead (matches
+                // `progressive_dequantize`).
+                *coeff = clamp_i16(i32::from(*coeff) << factor);
             }
         }
     }
@@ -540,20 +569,23 @@ fn ll3_offset(use_reduce_extrapolate: bool) -> usize {
     }
 }
 
-/// Count zero-DAS positions within a band.
+/// Count zero-DAS positions within a band. Retained for the unit test only; the
+/// continuous SRL decoder no longer needs a per-band zero count.
+#[cfg(test)]
 fn band_zero_count(sign: &[i8], band: &BandInfo) -> usize {
     let start = band.offset;
     let end = start + band.count();
     sign[start..end].iter().filter(|&&s| s == SIGN_ZERO).count()
 }
 
-/// Clamp i32 to u8 range (0-255).
+/// Clamp an i64 to u8 range (0-255).
 #[expect(
     clippy::as_conversions,
     clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
     reason = "value is clamped to 0..255 before cast"
 )]
-fn clamp_u8(value: i32) -> u8 {
+fn clamp_u8(value: i64) -> u8 {
     value.clamp(0, 255) as u8
 }
 
@@ -741,12 +773,13 @@ impl TileState {
         quant_idx: [u8; 3],
         quality: u8,
         use_reduce_extrapolate: bool,
+        is_difference: bool,
     ) -> Result<(), RlgrError> {
         self.pass = 1;
         self.quality = quality;
         self.quant_idx = quant_idx;
         self.use_reduce_extrapolate = use_reduce_extrapolate;
-        self.is_difference = false;
+        self.is_difference = is_difference;
         self.prog_quant = prog_quants;
 
         for c in 0..3 {
@@ -755,6 +788,7 @@ impl TileState {
                 base_quants[c],
                 &prog_quants[c],
                 use_reduce_extrapolate,
+                is_difference,
                 &mut self.coefficients[c],
                 &mut self.sign[c],
             )?;
@@ -839,9 +873,14 @@ impl TileState {
         // BT.601 fixed-point >>16 together with the ÷32 descale (16 + 5 = 21).
         // Verified: YCbCr [1,2,3] -> RGB [128,127,128], matching the canonical path.
         for i in 0..64 * 64 {
-            let y = i32::from(y_buf[i]) << 16;
-            let cb = i32::from(cb_buf[i]);
-            let cr = i32::from(cr_buf[i]);
+            // i64 math: the chroma coefficient is an i16 (up to ±32767) and the BT.601
+            // fixed-point constants are ~10^5, so `cb * 116130` reaches ~3.8e9 which
+            // OVERFLOWS i32 (panics in debug, wraps to garbage -> a white/black pixel
+            // "speckle" in release) whenever a colourful/high-detail tile yields a
+            // large chroma coefficient. Widen to i64 so the multiply can't overflow.
+            let y = i64::from(y_buf[i]) << 16;
+            let cb = i64::from(cb_buf[i]);
+            let cr = i64::from(cr_buf[i]);
 
             // ITU-R BT.601 YCbCr to RGB conversion (descaled by 32).
             let r = 128 + ((y + cr * 91881) >> 21);
@@ -1043,6 +1082,7 @@ struct ProgressiveContext {
 ///
 /// // On receiving WireToSurface2Pdu:
 /// let tiles = decoder.decode_bitmap(
+///     pdu.surface_id,
 ///     pdu.codec_context_id,
 ///     surface_width, surface_height,
 ///     &pdu.bitmap_data,
@@ -1053,7 +1093,26 @@ struct ProgressiveContext {
 /// }
 /// ```
 pub struct ProgressiveDecoder {
-    contexts: BTreeMap<u32, ProgressiveContext>,
+    /// Per-*surface* tile state, keyed by `surface_id` alone — deliberately NOT by
+    /// `codec_context_id`.
+    ///
+    /// RFX-Progressive is a temporal codec: each tile keeps its DWT coefficients
+    /// (`current`) across frames, and *difference* tiles (RFX_TILE_DIFFERENCE) send
+    /// only a delta to add onto that retained state. The persistent state therefore
+    /// belongs to the surface, exactly as FreeRDP models it
+    /// (`progressive_create_surface_context(prog, surfaceId, ...)`,
+    /// `progressive_decompress(prog, ..., surfaceId, frameId)` — keyed by surface).
+    ///
+    /// Windows RDP opens a brand-new `codec_context_id` on almost every frame
+    /// (observed: ids incrementing 1,2,3,… every WireToSurface2). Keying tile state
+    /// by `codec_context_id` gave every frame a fresh, empty coefficient store, so a
+    /// differential refresh of a settled tile added its ~0 delta onto zero and the
+    /// tile collapsed to neutral gray (Y=Cb=Cr=0 -> 128). That is precisely why a
+    /// static desktop wallpaper turned gray while dynamic ClearCodec UI stayed
+    /// correct. `codec_context_id` is treated as an ephemeral per-frame marker; the
+    /// surface's coefficient state persists until the surface is deleted or the
+    /// graphics channel is reset.
+    contexts: BTreeMap<u16, ProgressiveContext>,
     /// The `reduce_extrapolate` (DWT band-layout) flag from the most recent
     /// CONTEXT block seen on ANY context. Real servers (Windows RDP) open a new
     /// `codec_context_id` for many frames but only ever send the SYNC + CONTEXT
@@ -1079,12 +1138,14 @@ impl ProgressiveDecoder {
     /// returns RGBA pixel data for each tile that was updated.
     ///
     /// # Arguments
+    /// - `surface_id`: surface ID from the WireToSurface2Pdu; `codec_context_id` is scoped to it
     /// - `codec_context_id`: context ID from the WireToSurface2Pdu
     /// - `surface_width`: surface width in pixels (for tile grid sizing)
     /// - `surface_height`: surface height in pixels
     /// - `bitmap_data`: raw progressive block stream from the PDU
     pub fn decode_bitmap(
         &mut self,
+        surface_id: u16,
         codec_context_id: u32,
         surface_width: u16,
         surface_height: u16,
@@ -1119,16 +1180,20 @@ impl ProgressiveDecoder {
             }
             None => self
                 .contexts
-                .get(&codec_context_id)
+                .get(&surface_id)
                 .map(|c| c.surface.use_reduce_extrapolate)
                 // Fall back to the last CONTEXT block seen on any context id
                 // before giving up (see `default_reduce_extrapolate`).
                 .or(self.default_reduce_extrapolate)
-                .ok_or(ProgressiveDecodeError::MissingBlock("CONTEXT"))?,
+                .unwrap_or(true),
         };
 
-        // Get or create the context for this codec_context_id
-        let context = match self.contexts.entry(codec_context_id) {
+        // Get or create the persistent per-surface context. `codec_context_id`
+        // intentionally does not participate in the key (see the `contexts` field
+        // doc): the surface's coefficient state must survive the server rotating
+        // through context ids so that difference tiles accumulate correctly.
+        let _ = codec_context_id;
+        let context = match self.contexts.entry(surface_id) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
                 let surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
@@ -1171,11 +1236,21 @@ impl ProgressiveDecoder {
         Ok(decoded_tiles)
     }
 
-    /// Delete a codec context, freeing its tile state.
+    /// Handle RDPGFX_DELETE_ENCODING_CONTEXT.
     ///
-    /// Called when the server sends RDPGFX_DELETE_ENCODING_CONTEXT.
-    pub fn delete_context(&mut self, codec_context_id: u32) {
-        self.contexts.remove(&codec_context_id);
+    /// Deliberately a no-op for the surface's decoded coefficient state. The PDU
+    /// releases an *encoding* context on the server; the decoded surface content
+    /// (the retained per-tile `current` coefficients used by difference tiles)
+    /// must persist, matching FreeRDP — which keeps progressive state per surface
+    /// and does not tie it to the rotating `codec_context_id`. Freeing state here
+    /// would collapse the wallpaper to gray, since Windows sends a
+    /// DeleteEncodingContext for nearly every frame's (old) context id.
+    pub fn delete_context(&mut self, _surface_id: u16, _codec_context_id: u32) {}
+
+    /// Free a surface's progressive tile state. Call when the surface itself is
+    /// deleted (RDPGFX_DELETE_SURFACE).
+    pub fn delete_surface(&mut self, surface_id: u16) {
+        self.contexts.remove(&surface_id);
     }
 
     /// Reset all contexts (e.g., on EGFX channel reset).
@@ -1250,6 +1325,7 @@ fn decode_tile_block(
                 [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
                 0xFF, // full quality
                 use_reduce_extrapolate,
+                tile.flags & RFX_TILE_DIFFERENCE != 0,
             )?;
 
             let mut pixels = vec![0u8; 64 * 64 * 4];
@@ -1286,6 +1362,7 @@ fn decode_tile_block(
                 [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
                 tile.quality,
                 use_reduce_extrapolate,
+                tile.flags & RFX_TILE_DIFFERENCE != 0,
             )?;
 
             let mut pixels = vec![0u8; 64 * 64 * 4];
@@ -1338,6 +1415,139 @@ impl Default for ProgressiveDecoder {
 #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_pass_color_roundtrip_preserves_hue() {
+        // Regression guard: a solid-colour tile encoded then decoded through the
+        // first-pass pipeline (incl. the ×32 spatial pre-scale the server applies)
+        // must reconstruct to the same colour at BOTH lossless and quality=0. This
+        // proves the progressive decoder is colour-correct at the coarse quality
+        // pass — i.e. gray/washed-out wallpaper tiles are NOT a decode bug.
+        let redux = true;
+        let mut pixels = vec![0u8; 64 * 64 * 4];
+        for px in pixels.chunks_mut(4) {
+            px[0] = 40;
+            px[1] = 80;
+            px[2] = 200;
+            px[3] = 255;
+        }
+        let q0_base = ComponentCodecQuant {
+            ll3: 6, hl3: 6, lh3: 6, hh3: 6, hl2: 6, lh2: 6, hh2: 6, hl1: 6, lh1: 6, hh1: 6,
+        };
+        let q0_prog = ComponentCodecQuant {
+            ll3: 1, hl3: 1, lh3: 1, hh3: 1, hl2: 2, lh2: 2, hh2: 2, hl1: 1, lh1: 1, hh1: 1,
+        };
+        for (label, base, prog) in [
+            ("lossless", ComponentCodecQuant::LOSSLESS, ComponentCodecQuant::LOSSLESS),
+            ("quality0", q0_base, q0_prog),
+        ] {
+            let mut y = vec![0i16; COEFFICIENTS_PER_COMPONENT];
+            let mut cb = vec![0i16; COEFFICIENTS_PER_COMPONENT];
+            let mut cr = vec![0i16; COEFFICIENTS_PER_COMPONENT];
+            rgba_to_ycbcr(&pixels, &mut y, &mut cb, &mut cr);
+            // Server left-shifts spatial YCbCr by 5 (×32) before the DWT to preserve
+            // precision; reconstruct_to_rgba descales by 32. Mirror that here.
+            for v in y.iter_mut().chain(cb.iter_mut()).chain(cr.iter_mut()) {
+                *v = (i32::from(*v) << 5).clamp(-32768, 32767) as i16;
+            }
+            let mut tile = TileState::new();
+            tile.use_reduce_extrapolate = redux;
+            for (c, spatial) in [y.clone(), cb.clone(), cr.clone()].into_iter().enumerate() {
+                let mut coeffs = spatial;
+                let mut wire = vec![0u8; 1 << 17];
+                let n = encode_first_pass(&mut coeffs, &mut wire, &base, &prog, redux).unwrap();
+                let mut dec = [0i16; COEFFICIENTS_PER_COMPONENT];
+                let mut sign = [0i8; COEFFICIENTS_PER_COMPONENT];
+                decode_first_pass(&wire[..n], &base, &prog, redux, false, &mut dec, &mut sign).unwrap();
+                tile.coefficients[c] = dec;
+            }
+            let mut out = vec![0u8; 64 * 64 * 4];
+            tile.reconstruct_to_rgba(&mut out);
+            let (mut r, mut g, mut b) = (0u64, 0u64, 0u64);
+            for p in out.chunks(4) {
+                r += u64::from(p[0]);
+                g += u64::from(p[1]);
+                b += u64::from(p[2]);
+            }
+            let n = 64 * 64;
+            let (ro, go, bo) = ((r / n) as i32, (g / n) as i32, (b / n) as i32);
+            // Quality=0 discards fine detail but must preserve the tile's average
+            // colour; allow a small tolerance for quantization + integer rounding.
+            let tol = if label == "lossless" { 3 } else { 8 };
+            assert!(
+                (ro - 40).abs() <= tol && (go - 80).abs() <= tol && (bo - 200).abs() <= tol,
+                "{label}: expected ~(40,80,200), got ({ro},{go},{bo})"
+            );
+        }
+    }
+
+    /// Regression: a settled colourful tile must survive a near-empty *difference*
+    /// refresh (RFX_TILE_DIFFERENCE). Windows sends such near-zero deltas constantly
+    /// for a static desktop; treating a difference TILE_FIRST as an absolute
+    /// replacement collapses the tile to neutral gray (Y=Cb=Cr=0 -> 128) — the
+    /// "wallpaper turns gray" bug this guards against.
+    #[test]
+    fn difference_tile_zero_delta_preserves_settled_content() {
+        let redux = true;
+        let base = ComponentCodecQuant::LOSSLESS;
+        let prog = ComponentCodecQuant::LOSSLESS;
+
+        // Frame 1 (absolute, flags bit clear): a solid (40,80,200) tile.
+        let mut pixels = vec![0u8; 64 * 64 * 4];
+        for px in pixels.chunks_mut(4) {
+            px[0] = 40;
+            px[1] = 80;
+            px[2] = 200;
+            px[3] = 255;
+        }
+        let mut y = vec![0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut cb = vec![0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut cr = vec![0i16; COEFFICIENTS_PER_COMPONENT];
+        rgba_to_ycbcr(&pixels, &mut y, &mut cb, &mut cr);
+        for v in y.iter_mut().chain(cb.iter_mut()).chain(cr.iter_mut()) {
+            *v = (i32::from(*v) << 5).clamp(-32768, 32767) as i16;
+        }
+
+        let mut tile = TileState::new();
+        tile.use_reduce_extrapolate = redux;
+
+        for (c, spatial) in [y, cb, cr].into_iter().enumerate() {
+            // Absolute first pass establishes the retained coefficients.
+            let mut coeffs = spatial;
+            let mut wire = vec![0u8; 1 << 17];
+            let n = encode_first_pass(&mut coeffs, &mut wire, &base, &prog, redux).unwrap();
+            let mut sign = [0i8; COEFFICIENTS_PER_COMPONENT];
+            decode_first_pass(&wire[..n], &base, &prog, redux, false, &mut tile.coefficients[c], &mut sign).unwrap();
+
+            // A difference pass carrying an all-zero delta must leave the tile's
+            // retained coefficients unchanged (add 0), not overwrite them.
+            let before = tile.coefficients[c];
+            let mut zero = [0i16; COEFFICIENTS_PER_COMPONENT];
+            let mut wire0 = vec![0u8; 1 << 17];
+            let n0 = encode_first_pass(&mut zero, &mut wire0, &base, &prog, redux).unwrap();
+            decode_first_pass(&wire0[..n0], &base, &prog, redux, true, &mut tile.coefficients[c], &mut sign).unwrap();
+            assert_eq!(
+                tile.coefficients[c], before,
+                "component {c}: zero-delta difference pass must preserve coefficients"
+            );
+        }
+
+        // The reconstructed colour is still the original, not neutral gray.
+        let mut out = vec![0u8; 64 * 64 * 4];
+        tile.reconstruct_to_rgba(&mut out);
+        let (mut r, mut g, mut b) = (0u64, 0u64, 0u64);
+        for p in out.chunks(4) {
+            r += u64::from(p[0]);
+            g += u64::from(p[1]);
+            b += u64::from(p[2]);
+        }
+        let n = 64 * 64;
+        let (ro, go, bo) = ((r / n) as i32, (g / n) as i32, (b / n) as i32);
+        assert!(
+            (ro - 40).abs() <= 3 && (go - 80).abs() <= 3 && (bo - 200).abs() <= 3,
+            "difference pass must preserve colour ~(40,80,200), got ({ro},{go},{bo})"
+        );
+    }
 
     #[test]
     fn surface_tiles_rejects_over_cap_dimensions() {
@@ -1570,6 +1780,93 @@ mod tests {
         // (exact values depend on SRL interpretation, but the function shouldn't panic)
     }
 
+    /// Regression: the SRL and raw streams of a component's upgrade pass are
+    /// consumed CONTINUOUSLY across all subbands. When more than one band has
+    /// refinement bits (as in a lossless upgrade), re-reading either stream from
+    /// offset 0 per band corrupts every band after the first — the live-only,
+    /// upgrade-pass-only chroma "speckle". This round-trips coefficients spread
+    /// across several bands, all zero-DAS, so both the multi-band SRL continuity
+    /// and the exact reconstruction are exercised. With the old per-band-reset
+    /// decoder the later bands decode garbage and this fails.
+    #[test]
+    fn upgrade_pass_round_trips_across_multiple_bands() {
+        // All 10 bands refine by num_bits = prev(5) - curr(3) = 2.
+        let prev_prog_quant = ComponentCodecQuant {
+            ll3: 5,
+            hl3: 5,
+            lh3: 5,
+            hh3: 5,
+            hl2: 5,
+            lh2: 5,
+            hh2: 5,
+            hl1: 5,
+            lh1: 5,
+            hh1: 5,
+        };
+        let curr_prog_quant = ComponentCodecQuant {
+            ll3: 3,
+            hl3: 3,
+            lh3: 3,
+            hh3: 3,
+            hl2: 3,
+            lh2: 3,
+            hh2: 3,
+            hl1: 3,
+            lh1: 3,
+            hh1: 3,
+        };
+
+        // Coefficients spread across low, mid and high indices (i.e. different
+        // bands). curr_bit_pos = 3, so multiples of 8 round-trip exactly.
+        let mut coefficients = vec![0i16; 4096];
+        let populated: [(usize, i16); 6] = [
+            (5, 8),
+            (700, -16),
+            (1500, 24),
+            (2600, -8),
+            (3500, 16),
+            (4040, 8), // LL3 region (offset 4032 in standard layout)
+        ];
+        for (idx, val) in populated {
+            coefficients[idx] = val;
+        }
+
+        let prev_coefficients = vec![0i16; 4096];
+        // Every populated position was previously zero -> zero-DAS -> SRL path.
+        let sign = vec![SIGN_ZERO; 4096];
+
+        let (srl_data, raw_data) = encode_upgrade_pass(
+            &coefficients,
+            &prev_coefficients,
+            &prev_prog_quant,
+            &curr_prog_quant,
+            &sign,
+            false,
+        );
+
+        // No non-zero-DAS positions -> the raw stream is empty; everything rides
+        // the single continuous SRL stream across all bands.
+        assert!(raw_data.is_empty(), "expected no raw bits for all-zero-DAS input");
+
+        let mut decoded = vec![0i16; 4096];
+        let mut decoded_sign = vec![SIGN_ZERO; 4096];
+        decode_upgrade_pass(
+            &srl_data,
+            &raw_data,
+            &prev_prog_quant,
+            &curr_prog_quant,
+            false,
+            &mut decoded,
+            &mut decoded_sign,
+        );
+
+        assert_eq!(
+            decoded, coefficients,
+            "multi-band upgrade must round-trip; a mismatch means the SRL/raw streams \
+             are not being consumed continuously across band boundaries"
+        );
+    }
+
     #[test]
     fn tile_state_default_is_zeroed() {
         let tile = TileState::new();
@@ -1634,7 +1931,7 @@ mod tests {
     fn decoder_delete_nonexistent_context() {
         let mut decoder = ProgressiveDecoder::new();
         // Should not panic on non-existent context
-        decoder.delete_context(42);
+        decoder.delete_context(1, 42);
     }
 
     #[test]
@@ -1678,7 +1975,7 @@ mod tests {
         ];
 
         let encoded = encode_progressive_stream(&blocks).unwrap();
-        let result = decoder.decode_bitmap(1, 640, 480, &encoded);
+        let result = decoder.decode_bitmap(1, 1, 640, 480, &encoded);
         assert!(result.is_ok());
         assert_eq!(decoder.contexts.len(), 1);
 

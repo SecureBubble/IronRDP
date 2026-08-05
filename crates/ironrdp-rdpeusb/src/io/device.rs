@@ -29,7 +29,9 @@
 //! [FreeRDP urbdrc_main.c]: https://github.com/FreeRDP/FreeRDP/blob/master/channels/urbdrc/client/urbdrc_main.c
 //! [FreeRDP libusb_udevice.c]: https://github.com/FreeRDP/FreeRDP/blob/master/channels/urbdrc/client/libusb/libusb_udevice.c
 
-use alloc::{format, string::String, vec, vec::Vec};
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::{format, vec};
 
 use ironrdp_pdu::{PduResult, pdu_other_err};
 use ironrdp_str::multi_sz::MultiSzString;

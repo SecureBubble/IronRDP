@@ -47,7 +47,7 @@ use crate::canvas::Canvas;
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::error::IronError;
-use crate::graphics::WasmGraphicsHandler;
+use crate::graphics::{WasmGraphicsHandler, WasmGraphicsMessageProxy};
 use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
 use crate::network_client::WasmNetworkClient;
@@ -569,14 +569,15 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let use_display_control = self.0.borrow().use_display_control;
 
-        // EGFX (MS-RDPEGFX) graphics pipeline is DISABLED (see `build_config`
-        // support_graphics_pipeline = false). We must ALSO NOT attach the graphics
-        // pipeline DVC handler: registering it makes the client answer a server
-        // `Microsoft::Windows::RDS::Graphics` DVC open and advertise eGFX caps even
-        // when the GCC early-capability flag is off. With no handler, the server
-        // uses the legacy bitmap/Surface-Bits path. To re-enable eGFX, restore the
-        // handler here AND set support_graphics_pipeline = true.
-        let graphics_handler: Option<WasmGraphicsHandler> = None;
+        // EGFX (MS-RDPEGFX) graphics pipeline is ENABLED (see `build_config`
+        // support_graphics_pipeline = true). Attaching the handler makes the client
+        // accept the server's `Microsoft::Windows::RDS::Graphics` DVC and decode the
+        // full multi-codec eGFX stream (ClearCodec text/UI + RFX Progressive photo +
+        // AVC/uncompressed) in the client core, compositing to the canvas. The pair
+        // (flag + handler) must move together; both off falls back to bitmap/Surface-Bits.
+        let graphics_handler = Some(WasmGraphicsHandler::new(WasmGraphicsMessageProxy::new(
+            input_events_tx.clone(),
+        )));
 
         let (connection_result, ws) = connect(ConnectParams {
             ws,
@@ -787,10 +788,29 @@ impl iron_remote_desktop::Session for Session {
         // Reused across frames so per-region extraction doesn't allocate on every draw.
         let mut draw_buffer = WriteBuf::new();
 
+        // Full-desktop rectangle used for the post-connect Refresh Rect (see below).
+        let desktop_refresh_rect = ironrdp::pdu::geometry::InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: connection_result.desktop_size.width.saturating_sub(1),
+            bottom: connection_result.desktop_size.height.saturating_sub(1),
+        };
+
         let mut active_stage = ActiveStage::new(connection_result);
 
         // Timer interval for driving clipboard lock timeouts (5 second interval)
         let mut cleanup_interval = IntervalStream::new(5_000).fuse();
+
+        // On (re)connect to a persistent RDP session, the server composes updates
+        // assuming client-side cached/persisted content for regions it does not
+        // explicitly repaint. A fresh web client lacks that state, so those regions
+        // render as stale/coarse "gray blocks" (e.g. wallpaper covered by a transient
+        // element and never restored, or a tile left at its coarse quality pass). We
+        // ask the server to redraw the whole screen a few times over the first seconds
+        // (TS_REFRESH_RECT_PDU); the server re-encodes the true current screen at full
+        // quality, clearing the stale regions. `areas_to_refresh` is the full desktop.
+        let mut refresh_interval = IntervalStream::new(2_500).fuse();
+        let mut refresh_rect_fired: u32 = 0;
 
         let disconnect_reason = 'outer: loop {
             let outputs = select! {
@@ -948,11 +968,12 @@ impl iron_remote_desktop::Session for Session {
                             // EGFX-decoded region → blit straight to the canvas. The
                             // handler already composited into its surface buffers, so
                             // this is a direct paint (no ActiveStage involvement).
-                            let right = region.x.saturating_add(region.width).saturating_sub(1);
-                            let bottom = region.y.saturating_add(region.height).saturating_sub(1);
+                            let (rx, ry, rw, rh) = (region.x, region.y, region.width, region.height);
+                            let right = rx.saturating_add(rw).saturating_sub(1);
+                            let bottom = ry.saturating_add(rh).saturating_sub(1);
                             let rect = ironrdp::pdu::geometry::InclusiveRectangle {
-                                left: region.x.min(u32::from(u16::MAX)) as u16,
-                                top: region.y.min(u32::from(u16::MAX)) as u16,
+                                left: rx.min(u32::from(u16::MAX)) as u16,
+                                top: ry.min(u32::from(u16::MAX)) as u16,
                                 right: right.min(u32::from(u16::MAX)) as u16,
                                 bottom: bottom.min(u32::from(u16::MAX)) as u16,
                             };
@@ -963,18 +984,15 @@ impl iron_remote_desktop::Session for Session {
                             Vec::new()
                         }
                         RdpInputEvent::Resize { width, height, scale_factor, physical_size } => {
-                            debug!(width, height, scale_factor, "Resize event received");
                             if width == 0 || height == 0 {
                                 warn!("Resize event ignored: width or height is zero");
                                 Vec::new()
                             } else if let Some(response_frame) = active_stage.encode_resize(width, height, scale_factor, physical_size) {
                                 let width = NonZeroU32::new(width).expect("width is guaranteed to be non-zero due to the prior check");
                                 let height = NonZeroU32::new(height).expect("height is guaranteed to be non-zero due to the prior check");
-
                                 requested_resize = Some((width, height));
                                 vec![ActiveStageOutput::ResponseFrame(response_frame?)]
                             } else {
-                                debug!("Resize event ignored");
                                 Vec::new()
                             }
                         },
@@ -1021,6 +1039,33 @@ impl iron_remote_desktop::Session for Session {
                             }
                             Err(e) => {
                                 warn!(error = %e, "Clipboard timeout cleanup failed");
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                }
+                _ = refresh_interval.next() => {
+                    // Force a full-screen repaint for the first few ticks after connect
+                    // to clear stale/coarse regions the server assumed were cached.
+                    if refresh_rect_fired < 3 {
+                        refresh_rect_fired += 1;
+                        let mut frame = WriteBuf::new();
+                        match active_stage.encode_static(
+                            &mut frame,
+                            ironrdp::pdu::rdp::headers::ShareDataPdu::RefreshRectangle(
+                                ironrdp::pdu::rdp::refresh_rectangle::RefreshRectanglePdu {
+                                    areas_to_refresh: vec![desktop_refresh_rect.clone()],
+                                },
+                            ),
+                        ) {
+                            Ok(_) => {
+                                debug!(fired = refresh_rect_fired, "Sent full-screen Refresh Rect");
+                                vec![ActiveStageOutput::ResponseFrame(frame.into_inner())]
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to encode Refresh Rect");
                                 Vec::new()
                             }
                         }
@@ -1706,10 +1751,10 @@ fn build_config(
         // dispatched from `fast_path.rs` on CODEC_ID_REMOTEFX). We advertise it via the
         // RemoteFX bitmap codec in `bitmap.codecs` below (client_codecs_capabilities);
         // turning eGFX off makes the (FreeRDP) proxy/server pick RemoteFX Surface Bits.
-        // NOTE: the Bubble rdp-proxy historically REQUIRED the client to announce eGFX
-        // (aborts otherwise) — this build depends on the matching proxy change that
-        // drops that mandate and enables RemoteFxCodec on both legs.
-        support_graphics_pipeline: false,
+        // eGFX is ON: the client core now decodes the full multi-codec eGFX stream
+        // (ClearCodec + RFX Progressive + AVC/uncompressed). The Bubble rdp-proxy
+        // REQUIRES the client to announce eGFX, so this is also what the proxy expects.
+        support_graphics_pipeline: true,
         // RAIL (Remote Programs) is populated after build (from the `remoteApp`
         // extension); None means a normal desktop/alternate-shell session.
         rail: None,
@@ -1883,9 +1928,15 @@ async fn connect(
             drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
         }
         if let Some(graphics_handler) = graphics_handler {
-            // Tier 1: no H.264 decoder → the pipeline client auto-filters AVC
-            // capability sets and advertises the V8 (progressive/bitmap) path.
-            drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(Box::new(graphics_handler), None));
+            // Do NOT advertise AVC420/AVC444: there is no H.264 decoder attached
+            // (the WebCodecs "Stage 1" decoder never landed), so any AVC frame the
+            // server sends is skipped and leaves a stale/blank region — the scattered
+            // "speckle" artifacts. With AVC unadvertised the server encodes those
+            // regions with ClearCodec / RFX-Progressive instead, which this client
+            // decodes correctly. Re-enable only once a real H.264 decoder is wired in.
+            drdynvc = drdynvc.with_dynamic_channel(
+                GraphicsPipelineClient::new(Box::new(graphics_handler), None).advertise_avc(false),
+            );
         }
         connector.attach_static_channel(drdynvc);
     }

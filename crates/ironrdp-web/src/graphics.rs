@@ -1,15 +1,17 @@
-//! Browser-side EGFX (MS-RDPEGFX) graphics pipeline handler.
+//! Browser-side EGFX (MS-RDPEGFX) graphics pipeline **compositor**.
 //!
-//! Tier 1: surface management + RFX **Progressive** and uncompressed/planar
-//! bitmap paths (all decoded in pure Rust). No H.264/AVC (that needs a browser
-//! WebCodecs decoder — Tier 2).
+//! Decoding lives in [`ironrdp_egfx::client::GraphicsPipelineClient`]: ClearCodec,
+//! RFX Progressive, and uncompressed all decode in the client core and arrive here
+//! pre-decoded as RGBA via [`GraphicsPipelineHandler::on_bitmap_updated`]. This handler
+//! only composites — surface management, solid fill, surface/cache copies, and blitting
+//! decoded regions. No H.264/AVC (that needs a browser WebCodecs decoder — Tier 2).
 //!
 //! # Rendering integration
 //!
 //! [`ironrdp_egfx::client::GraphicsPipelineHandler`] is `Send`, but the render
 //! canvas (`web_sys` types) is `!Send` and is owned by the session run loop.
 //! So the handler cannot draw directly. Instead it keeps every surface as an
-//! RGBA buffer, applies all server operations (progressive decode, solid fill,
+//! RGBA buffer, applies all server operations (decoded bitmap blits, solid fill,
 //! surface/cache copies) to those buffers, and — on frame completion — ships the
 //! dirty region of each *output-mapped* surface to the run loop through the same
 //! `input_events_tx` channel the clipboard uses. The run loop blits it to the
@@ -18,16 +20,13 @@
 use std::collections::HashMap;
 
 use futures_channel::mpsc;
-use ironrdp::graphics::progressive::ProgressiveDecoder;
 use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineHandler, Surface};
 use ironrdp_egfx::pdu::{
-    CacheToSurfacePdu, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
+    CacheToSurfacePdu, MapSurfaceToScaledOutputPdu, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu,
 };
 use tracing::warn;
 
 use crate::session::{GraphicsRegion, RdpInputEvent};
-
-const TILE: u32 = 64;
 
 /// A surface (or cached region) as a tightly packed RGBA8888 buffer.
 struct SurfaceBuf {
@@ -41,9 +40,7 @@ impl SurfaceBuf {
         Self {
             width,
             height,
-            // Initialize to opaque WHITE (0xFF), matching FreeRDP's gdi_CreateSurface
-            // (`memset(surface->data, 0xFF, ...)`). Regions the server hasn't painted
-            // yet then blend with the light desktop instead of showing as black holes.
+            // Opaque white init (matches FreeRDP gdi_CreateSurface memset 0xFF).
             data: vec![0xFF; (width.saturating_mul(height).saturating_mul(4)) as usize],
         }
     }
@@ -149,7 +146,6 @@ pub(crate) struct WasmGraphicsHandler {
     mapped: HashMap<u16, (u32, u32)>,
     /// surface_id -> accumulated dirty rect since the last frame flush.
     dirty: HashMap<u16, Dirty>,
-    progressive: ProgressiveDecoder,
     output_width: u32,
     output_height: u32,
 }
@@ -162,7 +158,6 @@ impl WasmGraphicsHandler {
             cache: HashMap::new(),
             mapped: HashMap::new(),
             dirty: HashMap::new(),
-            progressive: ProgressiveDecoder::new(),
             output_width: 0,
             output_height: 0,
         }
@@ -180,17 +175,19 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         self.output_height = height;
         // Match FreeRDP gdi_ResetGraphics: blank each existing surface to white and
         // clear its pending invalid region; keep the surfaces, output mappings and
-        // the persistent bitmap cache. Reset the progressive codec state.
+        // the persistent bitmap cache. The RFX Progressive codec state is reset in the
+        // client core's ResetGraphics handling, not here.
         for s in self.surfaces.values_mut() {
             s.data.iter_mut().for_each(|b| *b = 0xFF);
         }
         self.dirty.clear();
-        self.progressive.reset();
     }
 
     fn on_surface_created(&mut self, surface: &Surface) {
-        self.surfaces
-            .insert(surface.id, SurfaceBuf::new(u32::from(surface.width), u32::from(surface.height)));
+        self.surfaces.insert(
+            surface.id,
+            SurfaceBuf::new(u32::from(surface.width), u32::from(surface.height)),
+        );
     }
 
     fn on_surface_deleted(&mut self, surface_id: u16) {
@@ -210,6 +207,28 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         // (see on_frame_complete).
     }
 
+    fn on_map_surface_to_scaled_output(&mut self, pdu: &MapSurfaceToScaledOutputPdu) {
+        // Higher eGFX versions (V10.x) map surfaces to output via the *scaled*
+        // variant even at 1:1 (DPI 100%). Without handling it, the surface is never
+        // added to `mapped`, so `on_frame_complete` flushes nothing and the whole
+        // screen stays black. Treat it as a normal output map at the given origin.
+        // Non-1:1 scaling (target size != surface size) would need resampling at
+        // flush time and is not yet supported — we map 1:1, which covers DPI 100%.
+        if let Some(surface) = self.surfaces.get(&pdu.surface_id) {
+            if pdu.target_width != surface.width || pdu.target_height != surface.height {
+                warn!(
+                    surface_id = pdu.surface_id,
+                    target_w = pdu.target_width,
+                    target_h = pdu.target_height,
+                    surface_w = surface.width,
+                    surface_h = surface.height,
+                    "MapSurfaceToScaledOutput with non-1:1 scaling; mapping 1:1 (scaling unsupported)"
+                );
+            }
+        }
+        self.on_surface_mapped(pdu.surface_id, pdu.output_origin_x, pdu.output_origin_y);
+    }
+
     fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
         if update.data.is_empty() {
             return; // decode skipped (e.g. AVC with no decoder)
@@ -222,37 +241,6 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
             surface.blit(x, y, w, h, &update.data, w);
         }
         self.mark_dirty(update.surface_id, x, y, w, h);
-    }
-
-    fn on_wire_to_surface2(&mut self, pdu: &WireToSurface2Pdu) {
-        let Some((sw, sh)) = self.surfaces.get(&pdu.surface_id).map(|s| (s.width, s.height)) else {
-            return;
-        };
-        let tiles = match self.progressive.decode_bitmap(
-            pdu.codec_context_id,
-            sw.min(u32::from(u16::MAX)) as u16,
-            sh.min(u32::from(u16::MAX)) as u16,
-            &pdu.bitmap_data,
-        ) {
-            Ok(tiles) => tiles,
-            Err(e) => {
-                warn!(error = %e, "progressive decode failed");
-                return;
-            }
-        };
-        let Some(surface) = self.surfaces.get_mut(&pdu.surface_id) else {
-            return;
-        };
-        let mut dirty: Option<Dirty> = None;
-        for tile in &tiles {
-            let tx = u32::from(tile.x_idx) * TILE;
-            let ty = u32::from(tile.y_idx) * TILE;
-            surface.blit(tx, ty, TILE, TILE, &tile.pixels, TILE);
-            dirty = Some(Dirty::union(dirty, tx, ty, TILE, TILE));
-        }
-        if let Some(d) = dirty {
-            self.mark_dirty(pdu.surface_id, d.min_x, d.min_y, d.max_x - d.min_x, d.max_y - d.min_y);
-        }
     }
 
     fn on_solid_fill(&mut self, pdu: &SolidFillPdu) {
@@ -297,7 +285,11 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         let w = u32::from(r.right.saturating_sub(r.left));
         let h = u32::from(r.bottom.saturating_sub(r.top));
         // Extract source into an owned buffer first (releases the source borrow).
-        let Some(block) = self.surfaces.get(&pdu.source_surface_id).map(|s| s.extract(sx, sy, w, h)) else {
+        let Some(block) = self
+            .surfaces
+            .get(&pdu.source_surface_id)
+            .map(|s| s.extract(sx, sy, w, h))
+        else {
             return;
         };
         let points: Vec<_> = pdu.destination_points.clone();
@@ -329,6 +321,8 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
             .get(&pdu.cache_slot)
             .map(|c| (c.width, c.height, c.data.clone()))
         else {
+            // Cache miss: the server referenced a slot this (fresh) client never
+            // filled. Leave the destination region as-is rather than painting garbage.
             return;
         };
         let points: Vec<_> = pdu.destination_points.clone();

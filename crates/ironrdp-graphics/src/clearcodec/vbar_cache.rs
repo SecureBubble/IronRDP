@@ -60,11 +60,22 @@ impl VBarCache {
     }
 
     /// Reset both caches (when FLAG_CACHE_RESET is received).
+    ///
+    /// Resets the cursors to 0 AND empties every entry. Emptying matters: after a
+    /// reset the server rebuilds the cache from slot 0, and a VBAR_CACHE_HIT to a
+    /// not-yet-rebuilt slot must resolve to dummy background data (see
+    /// `ClearCodecDecoder::resolve_vbar`), exactly as the FreeRDP reference decoder
+    /// does. Keeping stale pre-reset entries would instead blit old garbage into
+    /// those columns.
     pub fn reset(&mut self) {
         self.vbar_cursor = 0;
         self.short_vbar_cursor = 0;
-        // Per spec, only cursors reset. Existing entries become stale
-        // but the cursor reset means new entries overwrite from index 0.
+        for slot in &mut self.vbar_storage {
+            *slot = None;
+        }
+        for slot in &mut self.short_vbar_storage {
+            *slot = None;
+        }
     }
 
     /// Get a full V-bar from cache by index.
@@ -111,19 +122,29 @@ impl VBarCache {
         let height = usize::from(band_height);
         let mut pixels = Vec::with_capacity(height * 3);
 
-        // Background above y_on
-        for _ in 0..usize::from(short_vbar.y_on) {
+        // Clamp every segment so the reconstructed column is EXACTLY band_height
+        // rows, matching FreeRDP's `if ((y + count) > vBarPixelCount) count = ...`
+        // clamp. Without this an oversized short entry (referenced from a band with
+        // a smaller height than when it was cached) would yield an over-tall column.
+        let y_on = usize::from(short_vbar.y_on).min(height);
+
+        // Background above y_on.
+        for _ in 0..y_on {
             pixels.push(bg_blue);
             pixels.push(bg_green);
             pixels.push(bg_red);
         }
 
-        // Pixel data from short V-bar
-        pixels.extend_from_slice(&short_vbar.pixels);
+        // Short V-bar pixel data, clamped to the band height and to the pixels
+        // actually present.
+        let avail_rows = short_vbar.pixels.len() / 3;
+        let data_rows = usize::from(short_vbar.pixel_count)
+            .min(avail_rows)
+            .min(height - y_on);
+        pixels.extend_from_slice(&short_vbar.pixels[..data_rows * 3]);
 
-        // Background below y_on + pixel_count
-        let bottom_start = usize::from(short_vbar.y_on) + usize::from(short_vbar.pixel_count);
-        for _ in bottom_start..height {
+        // Remaining rows: background.
+        while pixels.len() < height * 3 {
             pixels.push(bg_blue);
             pixels.push(bg_green);
             pixels.push(bg_red);

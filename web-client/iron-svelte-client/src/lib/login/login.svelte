@@ -2,7 +2,7 @@
     import { currentSession, setCurrentSessionActive, userInteractionService } from '../../services/session.service';
     import type { IronError, UserInteraction } from '../../../static/iron-remote-desktop';
     import type { Session } from '../../models/session';
-    import { preConnectionBlob, displayControl, kdcProxyUrl, init } from '../../../static/iron-remote-desktop-rdp';
+    import { preConnectionBlob, loadBalanceInfo, displayControl, kdcProxyUrl, init, enableCredssp } from '../../../static/iron-remote-desktop-rdp';
     import { toast } from '$lib/messages/message-store';
     import { showLogin } from '$lib/login/login-store';
     import { onMount } from 'svelte';
@@ -10,13 +10,35 @@
     let username = 'Administrator';
     let password = 'DevoLabs123!';
     let gatewayAddress = 'ws://localhost:7171/jet/rdp';
-    let hostname = '10.10.0.3:3389';
     let domain = '';
     let authtoken = '';
     let kdc_proxy_url = '';
     let desktopSize = { width: 1280, height: 720 };
     let pcb = '';
+    let lbi = '';
     let pop_up = false;
+
+    // The RDP target is embedded in the Load Balance Info routing token
+    // (`Cookie: msts=<IP>[:port]@<hash>`). The proxy re-derives the real target from
+    // the routing token and ignores RDCleanPath's destination field, but ironrdp-web
+    // still requires a destination, so parse it out of the LBI here.
+    function destinationFromLbi(lbiStr: string): string {
+        let s = (lbiStr ?? '').trim();
+        const prefix = 'Cookie: msts=';
+        if (s.startsWith(prefix)) {
+            s = s.slice(prefix.length);
+        }
+        const at = s.indexOf('@');
+        if (at !== -1) {
+            s = s.slice(0, at);
+        }
+        if (s === '') {
+            return '';
+        }
+        return s.includes(':') ? s : `${s}:3389`;
+    }
+
+    $: hostname = destinationFromLbi(lbi);
     let enable_clipboard = true;
 
     let userInteraction: UserInteraction;
@@ -113,10 +135,15 @@
             .withServerDomain(domain)
             .withAuthToken(authtoken)
             .withDesktopSize(desktopSize)
-            .withExtension(displayControl(true));
+            .withExtension(displayControl(true))
+            .withExtension(enableCredssp(false));
 
         if (pcb !== '') {
             configBuilder.withExtension(preConnectionBlob(pcb));
+        }
+
+        if (lbi !== '') {
+            configBuilder.withExtension(loadBalanceInfo(lbi));
         }
 
         if (kdc_proxy_url !== '') {
@@ -185,10 +212,6 @@
                     <div class="medium-space" />
                     <div>
                         <div class="field label border">
-                            <input id="hostname" type="text" bind:value={hostname} />
-                            <label for="hostname">Hostname</label>
-                        </div>
-                        <div class="field label border">
                             <input id="domain" type="text" bind:value={domain} />
                             <label for="domain">Domain</label>
                         </div>
@@ -211,6 +234,10 @@
                         <div class="field label border">
                             <input id="pcb" type="text" bind:value={pcb} />
                             <label for="pcb">Pre Connection Blob</label>
+                        </div>
+                        <div class="field label border">
+                            <input id="lbi" type="text" bind:value={lbi} />
+                            <label for="lbi">Load Balance Info</label>
                         </div>
                         <div class="field label border">
                             <input id="desktopSizeW" type="text" bind:value={desktopSize.width} />

@@ -213,5 +213,9 @@ fn inverse_vertical(mut buffer: &mut [i16], mut temp_buffer: &[i16], subband_wid
 #[expect(clippy::as_conversions)]
 #[expect(clippy::cast_possible_truncation)]
 fn i32_to_i16_possible_truncation(value: i32) -> i16 {
-    value as i16
+    // Saturate rather than truncate: a large high-frequency coefficient can push a
+    // DWT intermediate just past i16 range, and a raw `as i16` WRAPS (a big negative
+    // flips to a large positive), turning a dark pixel pure white — scattered white
+    // "speckles" on textured/dark image areas. Clamping keeps it near-correct.
+    value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }

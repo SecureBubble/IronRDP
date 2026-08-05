@@ -83,7 +83,14 @@ pub fn decode_rlex(data: &[u8]) -> DecodeResult<RlexData> {
         // Each byte is a run length factor for palette[0]
         decode_single_palette_segments(&mut src, &mut segments)?;
     } else {
-        decode_multi_palette_segments(remaining, &mut src, stop_index_bits, suite_depth_bits, &mut segments)?;
+        decode_multi_palette_segments(
+            remaining,
+            &mut src,
+            stop_index_bits,
+            suite_depth_bits,
+            palette_count,
+            &mut segments,
+        )?;
     }
 
     Ok(RlexData { palette, segments })
@@ -106,6 +113,7 @@ fn decode_multi_palette_segments(
     src: &mut ReadCursor<'_>,
     stop_index_bits: u8,
     suite_depth_bits: u8,
+    palette_count: u8,
     segments: &mut Vec<RlexSegment>,
 ) -> DecodeResult<()> {
     let stop_mask = (1u8 << stop_index_bits) - 1;
@@ -116,7 +124,17 @@ fn decode_multi_palette_segments(
         let stop_index = packed & stop_mask;
         let suite_depth = (packed >> stop_index_bits) & depth_mask;
 
-        let start_index = stop_index.saturating_sub(suite_depth);
+        if stop_index >= palette_count {
+            return Err(invalid_field_err!("rlexStopIndex", "stop_index exceeds palette count"));
+        }
+
+        // MS-RDPEGFX 2.2.4.1.1.3.1.1.2: startIndex is stopIndex - suiteDepth and is itself a
+        // palette entry, so a depth reaching below entry 0 describes no valid suite. Clamping
+        // it (saturating_sub) would silently render a shorter suite than the stream asked for
+        // instead of rejecting the malformed stream.
+        let start_index = stop_index
+            .checked_sub(suite_depth)
+            .ok_or_else(|| invalid_field_err!("rlexSuiteDepth", "suite depth exceeds stop index"))?;
 
         let run_length = decode_run_length(src)?;
 

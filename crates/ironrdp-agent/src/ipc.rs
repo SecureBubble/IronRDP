@@ -19,11 +19,10 @@ use ironrdp_input::MouseButton;
 use ironrdp_pdu::impl_pdu_pod;
 use ironrdp_propertyset::PropertySet;
 
-use crate::wire::propertyset;
 use crate::wire::{
-    bytes_size, opt_string_size, opt_u16_size, read_bool, read_bytes, read_char, read_mouse_button, read_opt_string,
-    read_opt_u16, read_string, string_size, write_bool, write_bytes, write_char, write_mouse_button, write_opt_string,
-    write_opt_u16, write_string,
+    bytes_size, opt_string_size, opt_u16_size, propertyset, read_bool, read_bytes, read_char, read_mouse_button,
+    read_opt_string, read_opt_u16, read_string, string_size, write_bool, write_bytes, write_char, write_mouse_button,
+    write_opt_string, write_opt_u16, write_string,
 };
 
 /// A request sent by the CLI to the daemon.

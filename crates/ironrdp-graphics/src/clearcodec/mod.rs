@@ -75,8 +75,16 @@ impl ClearCodecDecoder {
                 .glyph_cache
                 .get(glyph_index)
                 .ok_or_else(|| invalid_field_err!("glyphIndex", "glyph cache miss on hit"))?;
-            if entry.width != width || entry.height != height {
-                return Err(invalid_field_err!("glyphIndex", "cached glyph dimensions mismatch"));
+            // MS-RDPEGFX 4.1.1.5 stores a glyph as a dimensionless linear pixel stream, so the
+            // destination rectangle supplies the shape and any rectangle of the same area is
+            // valid (a glyph cached at 2x8 may be hit as 4x4). Only the pixel count has to agree.
+            // Real Windows servers routinely re-hit a cached glyph at a different shape, so an
+            // exact width/height check would reject legitimate frames.
+            if entry.pixels.len() / 4 != pixel_count {
+                return Err(invalid_field_err!(
+                    "glyphIndex",
+                    "cached glyph area does not match destination"
+                ));
             }
             return Ok(entry.pixels.clone());
         }
@@ -164,12 +172,20 @@ impl ClearCodecDecoder {
                 let band_height = band.y_end - band.y_start + 1;
                 for (col_offset, vbar) in band.vbars.iter().enumerate() {
                     let x = usize::from(band.x_start) + col_offset;
+
+                    // resolve_vbar MUST run for EVERY vbar in the band, even columns
+                    // clipped past the output width: each SHORT_VBAR_CACHE_MISS /
+                    // SHORT_VBAR_CACHE_HIT advances a persistent cache cursor, and the
+                    // server advances its cursors for every vbar regardless of clipping.
+                    // Skipping resolve_vbar on a clipped column desyncs our cursor from
+                    // the server's, so every later absolute-index VBAR_CACHE_HIT misses
+                    // (MS-RDPEGFX 3.1.9). Only the blit below is clipped.
+                    let full_vbar =
+                        self.resolve_vbar(vbar, band_height, band.blue_bkg, band.green_bkg, band.red_bkg)?;
+
                     if x >= w {
                         continue;
                     }
-
-                    let full_vbar =
-                        self.resolve_vbar(vbar, band_height, band.blue_bkg, band.green_bkg, band.red_bkg)?;
 
                     // Blit the full V-bar column into the output
                     let pixel_rows = full_vbar.pixels.len() / 3;
@@ -209,22 +225,38 @@ impl ClearCodecDecoder {
     ) -> DecodeResult<FullVBar> {
         match vbar {
             VBar::CacheHit { index } => {
-                let cached = self
-                    .vbar_cache
-                    .get_vbar(*index)
-                    .ok_or_else(|| invalid_field_err!("vbarIndex", "V-bar cache miss on hit"))?;
-                Ok(cached.clone())
+                // A VBAR_CACHE_HIT to a not-yet-populated slot is NOT a fatal error.
+                // The server legitimately references slots that are empty for this
+                // client (e.g. after a cache reset, or slots it expects to be dummy);
+                // the FreeRDP reference decoder (clear.c: "filling dummy data") fills a
+                // background column and keeps decoding, and the column is corrected by a
+                // later frame. Aborting the whole WireToSurface1 instead leaves the tile
+                // unrendered -> it stays gray/black and gets cached+stamped everywhere,
+                // which is exactly the chrome-artifact bug. VBAR_CACHE_HIT never advances
+                // the storage cursor (vBarUpdate=FALSE), so cursor sync is preserved.
+                match self.vbar_cache.get_vbar(*index) {
+                    Some(cached) => Ok(cached.clone()),
+                    None => Ok(dummy_full_vbar(band_height, bg_blue, bg_green, bg_red)),
+                }
             }
             VBar::ShortCacheHit { index, y_on } => {
-                let cached_short = self
-                    .vbar_cache
-                    .get_short_vbar(*index)
-                    .ok_or_else(|| invalid_field_err!("shortVbarIndex", "short V-bar cache miss on hit"))?;
-                // Create a modified short vbar with the y_on from this reference
-                let modified = ShortVBar {
-                    y_on: *y_on,
-                    pixel_count: cached_short.pixel_count,
-                    pixels: cached_short.pixels.clone(),
+                // SHORT_VBAR_CACHE_HIT is a vBarUpdate case: it ALWAYS stores a
+                // reconstructed full V-bar (advancing the full cursor), even when the
+                // referenced short slot is empty -- FreeRDP treats an empty short entry
+                // as count=0 (an all-background column) rather than erroring. The
+                // band-height overflow is clamped inside reconstruct_full_vbar, matching
+                // FreeRDP's `if ((y + count) > vBarPixelCount) count = ...` clamp.
+                let modified = match self.vbar_cache.get_short_vbar(*index) {
+                    Some(cached_short) => ShortVBar {
+                        y_on: *y_on,
+                        pixel_count: cached_short.pixel_count,
+                        pixels: cached_short.pixels.clone(),
+                    },
+                    None => ShortVBar {
+                        y_on: *y_on,
+                        pixel_count: 0,
+                        pixels: Vec::new(),
+                    },
                 };
                 let full = VBarCache::reconstruct_full_vbar(&modified, band_height, bg_blue, bg_green, bg_red);
                 // Store reconstructed full V-bar in cache
@@ -291,51 +323,64 @@ impl ClearCodecDecoder {
             SubcodecId::Rlex => {
                 let rlex = ironrdp_pdu::codecs::clearcodec::decode_rlex(sub.bitmap_data)?;
                 let w = usize::from(sub.width);
-                let region_pixels = usize::from(sub.width) * usize::from(sub.height);
-                let palette_len = rlex.palette.len();
+                let h = usize::from(sub.height);
+                let pixel_budget = w * h;
                 let mut px = 0usize;
 
+                // A segment that would write past the region is truncated (break) rather than
+                // rejected: real Windows RLEX streams pad the last segment beyond the exact
+                // region pixel count, and out-of-range palette indices are skipped via `.get()`
+                // instead of failing the whole tile.
                 for seg in &rlex.segments {
-                    if usize::from(seg.start_index) >= palette_len {
-                        return Err(invalid_field_err!("rlex", "start_index exceeds palette size"));
-                    }
-                    if usize::from(seg.stop_index) >= palette_len {
-                        return Err(invalid_field_err!("rlex", "stop_index exceeds palette size"));
-                    }
-
-                    let color = &rlex.palette[usize::from(seg.start_index)];
-                    for _ in 0..seg.run_length {
-                        if px >= region_pixels {
-                            return Err(invalid_field_err!("rlex", "run exceeds region pixel count"));
+                    // Run: repeat the start_index color for run_length pixels.
+                    if let Some(color) = rlex.palette.get(usize::from(seg.start_index)) {
+                        for _ in 0..seg.run_length {
+                            if px >= pixel_budget {
+                                break;
+                            }
+                            let x = usize::from(sub.x_start) + px % w;
+                            let y = usize::from(sub.y_start) + px / w;
+                            let dst_idx = (y * sw + x) * 4;
+                            if dst_idx + 3 < output.len() {
+                                output[dst_idx] = color[0];
+                                output[dst_idx + 1] = color[1];
+                                output[dst_idx + 2] = color[2];
+                                output[dst_idx + 3] = 0xFF;
+                            }
+                            px += 1;
                         }
-                        let x = usize::from(sub.x_start) + px % w;
-                        let y = usize::from(sub.y_start) + px / w;
-                        let dst_idx = (y * sw + x) * 4;
-                        output[dst_idx] = color[0];
-                        output[dst_idx + 1] = color[1];
-                        output[dst_idx + 2] = color[2];
-                        output[dst_idx + 3] = 0xFF;
-                        px += 1;
                     }
 
+                    // Suite: sequential palette walk from start_index to stop_index.
                     for palette_idx in seg.start_index..=seg.stop_index {
-                        if px >= region_pixels {
-                            return Err(invalid_field_err!("rlex", "suite exceeds region pixel count"));
+                        if px >= pixel_budget {
+                            break;
                         }
-                        let color = &rlex.palette[usize::from(palette_idx)];
-                        let x = usize::from(sub.x_start) + px % w;
-                        let y = usize::from(sub.y_start) + px / w;
-                        let dst_idx = (y * sw + x) * 4;
-                        output[dst_idx] = color[0];
-                        output[dst_idx + 1] = color[1];
-                        output[dst_idx + 2] = color[2];
-                        output[dst_idx + 3] = 0xFF;
-                        px += 1;
+                        if let Some(color) = rlex.palette.get(usize::from(palette_idx)) {
+                            let x = usize::from(sub.x_start) + px % w;
+                            let y = usize::from(sub.y_start) + px / w;
+                            let dst_idx = (y * sw + x) * 4;
+                            if dst_idx + 3 < output.len() {
+                                output[dst_idx] = color[0];
+                                output[dst_idx + 1] = color[1];
+                                output[dst_idx + 2] = color[2];
+                                output[dst_idx + 3] = 0xFF;
+                            }
+                            px += 1;
+                        }
                     }
                 }
             }
             SubcodecId::NsCodec => {
-                // Not yet implemented; encoder avoids generating NSCodec tiles.
+                decode_nscodec_into(
+                    sub.bitmap_data,
+                    usize::from(sub.width),
+                    usize::from(sub.height),
+                    usize::from(sub.x_start),
+                    usize::from(sub.y_start),
+                    output,
+                    sw,
+                )?;
             }
         }
 
@@ -343,10 +388,182 @@ impl ClearCodecDecoder {
     }
 }
 
+/// Decompress one MS-RDPNSC RLE plane into exactly `original_size` bytes.
+///
+/// Inverse of `ironrdp-nscodec`'s `rle_encode`: a run is a value byte appearing
+/// twice in succession followed by a length byte (`run - 2`, 0..=253) or `0xFF`
+/// then a u32 LE length; a lone value is a literal. The **last 4 bytes of the
+/// compressed plane are the raw uncompressed tail** (FreeRDP convention that
+/// Microsoft encoders follow), so only `compressed[..len-4]` is RLE-decoded and
+/// the final 4 bytes are copied verbatim.
+fn nsc_rle_decode(input: &[u8], original_size: usize) -> Vec<u8> {
+    // Faithful port of FreeRDP `nsc_rle_decode` (the Microsoft-interop reference):
+    // the loop is driven by the remaining OUTPUT count, and the final 4 raw bytes
+    // are read from the CURRENT input position once the body is decoded — NOT from
+    // the tail of the compressed buffer. A run is `value, value, len` where len is
+    // `next + 2` (next < 0xFF) or a 0xFF escape followed by a u32 LE length. When
+    // exactly one body byte remains (FreeRDP's `left == 5`) a literal is forced so
+    // the trailing 4 bytes stay raw. Reading the raw tail positionally tolerates
+    // any trailing padding Windows leaves after the RLE body.
+    let mut out = Vec::with_capacity(original_size);
+    if original_size <= 4 {
+        let n = input.len().min(original_size);
+        out.extend_from_slice(&input[..n]);
+        out.resize(original_size, 0);
+        return out;
+    }
+    let target = original_size - 4; // body (RLE-decoded) byte count
+    let mut pos = 0usize;
+    while out.len() < target {
+        let Some(&value) = input.get(pos) else { break };
+        pos += 1;
+        let remaining = target - out.len();
+        if remaining == 1 {
+            // FreeRDP `left == 5`: force a literal, leaving the 4 raw bytes intact.
+            out.push(value);
+        } else if input.get(pos) == Some(&value) {
+            // Run.
+            pos += 1;
+            let len = match input.get(pos) {
+                Some(&n) if n < 0xFF => {
+                    pos += 1;
+                    usize::from(n) + 2
+                }
+                _ => {
+                    pos += 1; // skip 0xFF escape
+                    let l = input
+                        .get(pos..pos + 4)
+                        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
+                        .unwrap_or(0);
+                    pos += 4;
+                    l
+                }
+            };
+            for _ in 0..len {
+                if out.len() >= target {
+                    break;
+                }
+                out.push(value);
+            }
+        } else {
+            out.push(value);
+        }
+    }
+    out.resize(target, 0);
+    // The 4 raw tail bytes at the current input position.
+    match input.get(pos..pos + 4) {
+        Some(tail) => out.extend_from_slice(tail),
+        None => {
+            out.extend_from_slice(input.get(pos..).unwrap_or(&[]));
+            out.resize(original_size, 0);
+        }
+    }
+    out.truncate(original_size);
+    out
+}
+
+/// Decode an MS-RDPNSC (NSCodec) tile and composite it (BGRA, top-down) into the
+/// ClearCodec output buffer at `(x_start, y_start)`. Handles the case Windows
+/// servers actually emit inside ClearCodec: `ChromaSubsamplingLevel = 0`
+/// (full-resolution Co/Cg) and an optional alpha plane. Format:
+/// `[Y len u32][Co len u32][Cg len u32][A len u32][CLL u8][ChromaSub u8][2 rsvd]`
+/// then the four RLE planes. YCoCg->RGB: `co,cg` are signed, left-shifted by
+/// `CLL-1`; `r=y+co-cg, g=y+cg, b=y-co-cg` clamped to 0..255 (FreeRDP `nsc.c`).
+fn decode_nscodec_into(
+    data: &[u8],
+    w: usize,
+    h: usize,
+    x_start: usize,
+    y_start: usize,
+    output: &mut [u8],
+    surface_width: usize,
+) -> DecodeResult<()> {
+    if data.len() < 20 {
+        return Err(invalid_field_err!("nscodec", "NSC header too short"));
+    }
+    let rd_u32 = |o: usize| u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as usize;
+    let y_len = rd_u32(0);
+    let co_len = rd_u32(4);
+    let cg_len = rd_u32(8);
+    let a_len = rd_u32(12);
+    let cll = data[16];
+    let chroma_sub = data[17];
+
+    let pixels = w.checked_mul(h).ok_or_else(|| invalid_field_err!("nscodec", "dim overflow"))?;
+    let mut off = 20;
+    let take = |off: &mut usize, len: usize| -> DecodeResult<&[u8]> {
+        let end = off.checked_add(len).ok_or_else(|| invalid_field_err!("nscodec", "plane overflow"))?;
+        let s = data.get(*off..end).ok_or_else(|| invalid_field_err!("nscodec", "plane truncated"))?;
+        *off = end;
+        Ok(s)
+    };
+    let y_raw = take(&mut off, y_len)?;
+    let co_raw = take(&mut off, co_len)?;
+    let cg_raw = take(&mut off, cg_len)?;
+    let a_raw = take(&mut off, a_len)?;
+
+    // ChromaSubsamplingLevel != 0 (4:2:0) is not emitted by Windows inside
+    // ClearCodec in practice; reject rather than render wrong chroma.
+    if chroma_sub != 0 {
+        return Err(invalid_field_err!("nscodec", "chroma subsampling unsupported"));
+    }
+
+    let y = nsc_rle_decode(y_raw, pixels);
+    let co = nsc_rle_decode(co_raw, pixels);
+    let cg = nsc_rle_decode(cg_raw, pixels);
+    let a = if a_len > 0 {
+        nsc_rle_decode(a_raw, pixels)
+    } else {
+        vec![0xFFu8; pixels]
+    };
+
+    let shift = cll.saturating_sub(1);
+    // Match FreeRDP `nsc.c` exactly: `(INT16)(INT8)(((INT16)plane) << shift)` —
+    // widen the *unsigned* byte, shift left, then TRUNCATE to i8 (keep the low 8
+    // bits, sign-interpret). Sign-extending before the shift instead would turn
+    // chroma bytes in 0x20..0x3F into large positive values (garish green); the
+    // truncation makes them the correct negative chroma.
+    let unshift = |b: u8| -> i16 { i16::from((((i16::from(b)) << shift) as u8) as i8) };
+    for row in 0..h {
+        for col in 0..w {
+            let p = row * w + col;
+            let yv = i16::from(y[p]);
+            let cov = unshift(co[p]);
+            let cgv = unshift(cg[p]);
+            let r = (yv + cov - cgv).clamp(0, 255) as u8;
+            let g = (yv + cgv).clamp(0, 255) as u8;
+            let b = (yv - cov - cgv).clamp(0, 255) as u8;
+            let dx = x_start + col;
+            let dy = y_start + row;
+            let dst = (dy * surface_width + dx) * 4;
+            if dst + 3 < output.len() {
+                output[dst] = b;
+                output[dst + 1] = g;
+                output[dst + 2] = r;
+                output[dst + 3] = a[p];
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Default for ClearCodecDecoder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Build a background-filled full V-bar of `band_height` rows (BGR), used as the
+/// "dummy data" fallback for a VBAR_CACHE_HIT that references an empty cache slot
+/// (mirrors FreeRDP clear.c). Never errors, keeping the surrounding tile decodable.
+fn dummy_full_vbar(band_height: u16, bg_blue: u8, bg_green: u8, bg_red: u8) -> FullVBar {
+    let mut pixels = Vec::with_capacity(usize::from(band_height) * 3);
+    for _ in 0..band_height {
+        pixels.push(bg_blue);
+        pixels.push(bg_green);
+        pixels.push(bg_red);
+    }
+    FullVBar { pixels }
 }
 
 /// ClearCodec encoder for server-side bitmap compression.

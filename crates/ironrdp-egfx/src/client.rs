@@ -57,16 +57,18 @@ use std::collections::BTreeMap;
 
 use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
+use ironrdp_graphics::clearcodec::ClearCodecDecoder;
+use ironrdp_graphics::progressive::ProgressiveDecoder;
 use ironrdp_graphics::zgfx;
 use ironrdp_pdu::geometry::{ExclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::CHANNEL_NAME;
 use crate::decode::H264Decoder;
 use crate::pdu::{
     Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
-    CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
+    CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, CapabilityVersion, Codec1Type, DeleteEncodingContextPdu,
     EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
     MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu, SurfaceToCachePdu,
     SurfaceToSurfacePdu, WireToSurface2Pdu,
@@ -74,7 +76,6 @@ use crate::pdu::{
 
 /// Max capacity to keep for decompressed buffer when cleared.
 const MAX_DECOMPRESSED_BUFFER_CAPACITY: usize = 16384; // 16 KiB
-
 
 // ============================================================================
 // Surface Management
@@ -166,12 +167,14 @@ impl CodecCapabilities {
                 small_cache: flags.contains(crate::pdu::CapabilitiesV104Flags::SMALL_CACHE),
                 thin_client: flags.contains(crate::pdu::CapabilitiesV104Flags::AVC_THIN_CLIENT),
             },
-            CapabilitySet::V10_7 { flags } => Self {
-                avc420: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
-                avc444: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
-                small_cache: flags.contains(CapabilitiesV107Flags::SMALL_CACHE),
-                thin_client: flags.contains(CapabilitiesV107Flags::AVC_THIN_CLIENT),
-            },
+            CapabilitySet::V10_7 { flags } | CapabilitySet::V10_8 { flags } | CapabilitySet::V10_9 { flags } => {
+                Self {
+                    avc420: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+                    avc444: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+                    small_cache: flags.contains(CapabilitiesV107Flags::SMALL_CACHE),
+                    thin_client: flags.contains(CapabilitiesV107Flags::AVC_THIN_CLIENT),
+                }
+            }
         }
     }
 }
@@ -384,6 +387,17 @@ enum ClientState {
 pub struct GraphicsPipelineClient {
     handler: Box<dyn GraphicsPipelineHandler>,
     h264_decoder: Option<Box<dyn H264Decoder>>,
+    /// ClearCodec decoder. Always available (pure Rust, no external decoder).
+    clearcodec_decoder: ClearCodecDecoder,
+    /// RFX Progressive (WireToSurface2) decoder. Pure Rust; keeps per-context
+    /// tile state across frames.
+    progressive_decoder: ProgressiveDecoder,
+    /// When true, advertise AVC420/AVC444 capabilities (V10.x) even without a
+    /// Rust `h264_decoder`. Used when H.264 is decoded out-of-band (WebCodecs in
+    /// the browser). Without a Rust decoder attached, AVC frames are logged and
+    /// skipped by `decode_avc420` — so this alone (Stage 0) yields blank AVC
+    /// regions; it exists to confirm the server sends AVC once we advertise it.
+    avc_available: bool,
 
     decompressor: zgfx::Decompressor,
     decompressed_buffer: Vec<u8>,
@@ -406,6 +420,9 @@ impl GraphicsPipelineClient {
         Self {
             handler,
             h264_decoder,
+            clearcodec_decoder: ClearCodecDecoder::new(),
+            progressive_decoder: ProgressiveDecoder::new(),
+            avc_available: false,
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
             state: ClientState::WaitingForConfirm,
@@ -416,6 +433,14 @@ impl GraphicsPipelineClient {
             frames_queued: 0,
             total_frames_decoded: 0,
         }
+    }
+
+    /// Advertise AVC420/AVC444 capabilities even without a Rust H.264 decoder, so
+    /// H.264 can be decoded out-of-band (e.g. WebCodecs). Chainable at construction.
+    #[must_use]
+    pub fn advertise_avc(mut self, enable: bool) -> Self {
+        self.avc_available = enable;
+        self
     }
 
     // ========================================================================
@@ -456,6 +481,25 @@ impl GraphicsPipelineClient {
     // PDU Handlers
     // ========================================================================
 
+    /// Offline harness entry point: decode + composite a stream of RDPGFX PDUs that are
+    /// ALREADY decompressed (no zgfx), i.e. concatenated `[cmdId(2)][flags(2)][pduLength(4)][body]`.
+    /// Used by the `reconstruct` example to replay a flat capture and diff against a golden.
+    #[doc(hidden)]
+    pub fn process_pdu_bytes_for_test(&mut self, data: &[u8]) -> PduResult<()> {
+        let mut cursor = ReadCursor::new(data);
+        while !cursor.is_empty() {
+            let pdu = match decode_cursor::<GfxPdu>(&mut cursor) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error = %e, "process_pdu_bytes_for_test: decode stopped");
+                    break;
+                }
+            };
+            let _ = self.handle_pdu(pdu)?;
+        }
+        Ok(())
+    }
+
     fn handle_pdu(&mut self, pdu: GfxPdu) -> PduResult<Vec<DvcMessage>> {
         match pdu {
             GfxPdu::CapabilitiesConfirm(confirm) => {
@@ -491,6 +535,7 @@ impl GraphicsPipelineClient {
             GfxPdu::WireToSurface2(pdu) => {
                 trace!("WireToSurface2 (progressive codec)");
                 self.handler.on_wire_to_surface2(&pdu);
+                self.handle_wire_to_surface2(pdu)?;
                 Ok(vec![])
             }
             GfxPdu::EndFrame(end) => self.handle_end_frame(end.frame_id),
@@ -569,6 +614,8 @@ impl GraphicsPipelineClient {
                     codec_context_id = pdu.codec_context_id,
                     "DeleteEncodingContext"
                 );
+                self.progressive_decoder
+                    .delete_context(pdu.surface_id, pdu.codec_context_id);
                 self.handler.on_delete_encoding_context(&pdu);
                 Ok(vec![])
             }
@@ -633,6 +680,15 @@ impl GraphicsPipelineClient {
         if let Some(ref mut decoder) = self.h264_decoder {
             decoder.reset();
         }
+        // RFX Progressive state is scoped per stream: a new codec_context_id may reuse
+        // a prior id, and its tiles must not decode against stale state.
+        self.progressive_decoder.reset();
+        // The ClearCodec decoder is deliberately NOT reset here. MS-RDPEGFX 3.3.5.14 only
+        // resizes the Graphics Output Buffer; cache lifetime is driven by the stream instead,
+        // through CLEARCODEC_FLAG_CACHE_RESET (2.2.4.1), which ClearCodecDecoder::decode
+        // already honors by resetting the V-bar cursors. Dropping the decoder here would also
+        // drop the glyph cache, so a legitimate post-reset GLYPH_HIT would fail unless the
+        // server redundantly re-sent every glyph.
 
         debug!(width, height, "Graphics reset");
         self.handler.on_reset_graphics(width, height);
@@ -660,6 +716,11 @@ impl GraphicsPipelineClient {
     }
 
     fn handle_delete_surface(&mut self, surface_id: u16) {
+        // Free any retained RFX-Progressive tile state for this surface. Progressive
+        // state is keyed per surface (it persists across codec-context rotations),
+        // so it is released here on surface deletion rather than on
+        // DeleteEncodingContext.
+        self.progressive_decoder.delete_surface(surface_id);
         if self.surfaces.remove(&surface_id).is_some() {
             debug!(surface_id, "Surface deleted");
             self.handler.on_surface_deleted(surface_id);
@@ -718,8 +779,15 @@ impl GraphicsPipelineClient {
                 self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
             }
             Codec1Type::Avc444 | Codec1Type::Avc444v2 => {
-                debug!("AVC444 codec not yet implemented, forwarding to handler");
-                self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
+                info!(
+                    surface_id = pdu.surface_id,
+                    codec = ?pdu.codec_id,
+                    len = pdu.bitmap_data.len(),
+                    "AVC444 frame received (Stage 0 stub: decode pending out-of-band)"
+                );
+            }
+            Codec1Type::ClearCodec => {
+                self.decode_clearcodec(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
             }
             Codec1Type::Uncompressed => {
                 self.handle_uncompressed(pdu);
@@ -738,7 +806,14 @@ impl GraphicsPipelineClient {
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
 
         let Some(ref mut decoder) = self.h264_decoder else {
-            debug!("No H.264 decoder configured, skipping AVC420 frame");
+            info!(
+                surface_id,
+                width = dest_rect.width(),
+                height = dest_rect.height(),
+                len = bitmap_data.len(),
+                regions = stream.rectangles.len(),
+                "AVC420 frame received (Stage 0 stub: decode pending out-of-band)"
+            );
             return Ok(());
         };
 
@@ -775,6 +850,98 @@ impl GraphicsPipelineClient {
         };
 
         self.handler.on_bitmap_updated(&update);
+        Ok(())
+    }
+
+    /// Decode a ClearCodec (`WireToSurface1`) bitmap and emit it through `on_bitmap_updated`.
+    ///
+    /// ClearCodec is the mandatory lossless EGFX codec (text/UI/icons). It decodes in pure
+    /// Rust with a persistent V-bar + glyph cache, so it is always available.
+    fn decode_clearcodec(
+        &mut self,
+        surface_id: u16,
+        dest_rect: &ExclusiveRectangle,
+        bitmap_data: &[u8],
+    ) -> PduResult<()> {
+        // `ExclusiveRectangle::width()/height()` return the exclusive extent (right - left).
+        let dest_width = dest_rect.width();
+        let dest_height = dest_rect.height();
+
+        let bgra = self
+            .clearcodec_decoder
+            .decode(bitmap_data, dest_width, dest_height)
+            .map_err(|e| {
+                warn!(error = ?e, dest_width, dest_height, "ClearCodec decode failed");
+                pdu_other_err!("ClearCodec decode", source: e)
+            })?;
+
+        // ClearCodec outputs BGRA; convert to RGBA for the uniform BitmapUpdate format.
+        let rgba = convert_bgra_to_rgba(&bgra);
+
+        let update = BitmapUpdate {
+            surface_id,
+            destination_rectangle: dest_rect.clone(),
+            codec_id: Codec1Type::ClearCodec,
+            data: rgba,
+            width: dest_width,
+            height: dest_height,
+        };
+
+        self.handler.on_bitmap_updated(&update);
+        Ok(())
+    }
+
+    /// Decode a RemoteFX Progressive (`WireToSurface2`) bitmap stream and emit each updated
+    /// 64x64 tile through `on_bitmap_updated`. Edge tiles are clipped/cropped to the surface.
+    fn handle_wire_to_surface2(&mut self, pdu: WireToSurface2Pdu) -> PduResult<()> {
+        let surface = self
+            .surfaces
+            .get(&pdu.surface_id)
+            .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface2"))?;
+        let (surface_width, surface_height) = (surface.width, surface.height);
+
+        let tiles = match self.progressive_decoder.decode_bitmap(
+            pdu.surface_id,
+            pdu.codec_context_id,
+            surface_width,
+            surface_height,
+            &pdu.bitmap_data,
+        ) {
+            Ok(tiles) => tiles,
+            Err(e) => {
+                warn!(error = ?e, "rfx progressive decode failed");
+                return Err(pdu_other_err!("rfx progressive decode failed"));
+            }
+        };
+
+        for tile in tiles {
+            let left = tile.x_idx.saturating_mul(64);
+            let top = tile.y_idx.saturating_mul(64);
+            let width = surface_width.saturating_sub(left).min(64);
+            let height = surface_height.saturating_sub(top).min(64);
+            if width == 0 || height == 0 {
+                continue;
+            }
+            let data = if width == 64 && height == 64 {
+                tile.pixels
+            } else {
+                crop_decoded_frame(&tile.pixels, 64, 64, width, height)
+            };
+            let update = BitmapUpdate {
+                surface_id: pdu.surface_id,
+                destination_rectangle: ExclusiveRectangle {
+                    left,
+                    top,
+                    right: left + width,
+                    bottom: top + height,
+                },
+                codec_id: Codec1Type::Uncompressed,
+                data,
+                width,
+                height,
+            };
+            self.handler.on_bitmap_updated(&update);
+        }
         Ok(())
     }
 
@@ -828,30 +995,35 @@ impl DvcProcessor for GraphicsPipelineClient {
     }
 
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        let caps = if self.h264_decoder.is_some() {
-            self.handler.capabilities()
+        let advertise = if self.h264_decoder.is_some() || self.avc_available {
+            // Replicate a modern Windows client's CAPSADVERTISE so the target enables
+            // AVC (H.264). IronRDP's typed capsets stop at V10.7, but the target only
+            // switches to AVC444 when the client advertises the V11.x capsets carrying
+            // the AVC flags — so we build the exact raw set an up-to-date mstsc sends
+            // (V8..V11.5). The V11.4 slot in a real mstsc carries an 8 KB signed client
+            // license we can't reproduce; we advertise the version with zero flags.
+            CapabilitiesAdvertisePdu(avc_capable_capsets())
         } else {
-            // No H.264 decoder: filter out capability sets that imply AVC support.
-            // Only keep sets that work without a decoder (V8 without AVC flags).
+            // No H.264 decoder wanted: filter out AVC-implying sets so the server uses
+            // the progressive/bitmap path.
             let filtered: Vec<CapabilitySet> = self
                 .handler
                 .capabilities()
                 .into_iter()
                 .filter(|cap| !CodecCapabilities::from_capability_set(cap).avc420)
                 .collect();
-
-            if filtered.is_empty() {
-                // All handler caps required AVC; fall back to V8-only
+            let caps = if filtered.is_empty() {
                 debug!("No H.264 decoder and all capabilities require AVC; falling back to V8");
                 vec![CapabilitySet::V8 {
                     flags: CapabilitiesV8Flags::SMALL_CACHE,
                 }]
             } else {
                 filtered
-            }
+            };
+            CapabilitiesAdvertisePdu::from_typed(&caps)
         };
 
-        let pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&caps));
+        let pdu = GfxPdu::CapabilitiesAdvertise(advertise);
 
         #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
         Ok(vec![Box::new(pdu) as DvcMessage])
@@ -907,6 +1079,49 @@ impl DvcClientProcessor for GraphicsPipelineClient {}
 // ============================================================================
 // Frame Cropping
 // ============================================================================
+
+/// The CAPSADVERTISE capset list a current Windows client (mstsc) sends, built as raw
+/// capsets so we can advertise the V11.x versions IronRDP has no typed variant for.
+///
+/// The target only enables AVC (H.264) when the client advertises these V11.x capsets
+/// with their AVC flags (`0x400`/`0xc00`/`0x2c00`); advertising up to V10.7 alone yields
+/// a progressive fallback. `(version, flags)` pairs are captured verbatim from a real
+/// mstsc CAPSADVERTISE. The V11.4 slot in a real client carries an ~8 KB signed
+/// per-machine license we can't reproduce, so we advertise that version with zero flags.
+fn avc_capable_capsets() -> Vec<RawCapabilitySet> {
+    const CAPS: &[(u32, u32)] = &[
+        (0x0008_0004, 0),           // V8
+        (0x0008_0105, 0),           // V8.1
+        (0x000a_0002, 0),           // V10
+        (0x000a_0200, 0),           // V10.2
+        (0x000a_0301, 0),           // V10.3
+        (0x000a_0400, 0),           // V10.4
+        (0x000a_0502, 0),           // V10.5
+        (0x000a_0600, 0),           // V10.6
+        (0x000a_0701, 0),           // V10.7
+        (0x000b_0101, 0),           // V11.1
+        (0x000b_0200, 0x0000_0400), // V11.2
+        (0x000b_0300, 0x0000_0c00), // V11.3
+        (0x000b_0400, 0),           // V11.4 (real mstsc carries an 8 KB client license here)
+        (0x000b_0500, 0x0000_2c00), // V11.5
+    ];
+    CAPS.iter()
+        .map(|&(ver, flags)| RawCapabilitySet::new(CapabilityVersion(ver), flags.to_le_bytes().to_vec()))
+        .collect()
+}
+
+/// Convert BGRA pixel data to RGBA8888.
+///
+/// ClearCodec produces BGRA output per [MS-RDPEGFX 2.2.4.1]. Reorder to
+/// `[R, G, B, A]` for the uniform `BitmapUpdate` pixel format.
+fn convert_bgra_to_rgba(src: &[u8]) -> Vec<u8> {
+    debug_assert!(src.len() % 4 == 0, "BGRA input length not aligned to 4 bytes");
+    let mut dst = Vec::with_capacity(src.len());
+    for pixel in src.chunks_exact(4) {
+        dst.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+    dst
+}
 
 /// Convert uncompressed 32bpp little-endian pixels to RGBA8888
 ///

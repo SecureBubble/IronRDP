@@ -9,7 +9,7 @@ use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use ironrdp_pdu::x224::X224;
 use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages, client_encode_svc_messages};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::{SessionError, SessionErrorExt as _, SessionResult, reason_err};
 
@@ -141,8 +141,10 @@ impl Processor {
         } else {
             // Be liberal like mstsc: a PDU addressed to an unknown/unjoined channel
             // (e.g. a stray channel-0 Send Data Indication emitted by a proxy) is
-            // ignored rather than tearing down the whole session.
-            warn!(channel_id, "Ignoring data for an unexpected/unjoined channel");
+            // ignored rather than tearing down the whole session. The Bubble proxy
+            // emits channel-0 Send Data Indications very frequently, so this is logged
+            // at debug! (not warn!) to avoid flooding/freezing the browser console.
+            debug!(channel_id, "Ignoring data for an unexpected/unjoined channel");
             Ok(Vec::new())
         }
     }

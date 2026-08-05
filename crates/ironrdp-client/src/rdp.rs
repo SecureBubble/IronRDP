@@ -3,6 +3,8 @@ use core::num::NonZeroU16;
 use core::time::Duration;
 use std::sync::Arc;
 
+#[cfg(feature = "clipboard")]
+use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackendFactory};
 use ironrdp_connector::connection_activation::ConnectionActivationState;
 use ironrdp_connector::{ConnectionResult, ConnectorResult};
 use ironrdp_core::WriteBuf;
@@ -10,6 +12,10 @@ use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
 #[cfg(all(windows, feature = "dvc-com-plugin"))]
 use ironrdp_dvc::DvcProcessor as _;
+#[cfg(all(windows, feature = "dvc-com-plugin"))]
+use ironrdp_dvc_com_plugin::load_dvc_plugin;
+#[cfg(feature = "dvc-pipe-proxy")]
+use ironrdp_dvc_pipe_proxy::DvcNamedPipeProxy;
 use ironrdp_echo::client::EchoClient;
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::pointer::DecodedPointer;
@@ -18,6 +24,8 @@ use ironrdp_pdu::input::fast_path::FastPathInputEvent;
 use ironrdp_pdu::input::mouse::PointerFlags;
 #[cfg(any(feature = "dvc-pipe-proxy", all(windows, feature = "dvc-com-plugin")))]
 use ironrdp_pdu::pdu_other_err;
+#[cfg(feature = "sound")]
+use ironrdp_rdpsnd_native::cpal;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult, fast_path};
 use ironrdp_svc::SvcMessage;
@@ -35,15 +43,6 @@ use tracing::{debug, info, trace};
 
 #[cfg(feature = "clipboard")]
 use crate::config::ClipboardType;
-#[cfg(feature = "clipboard")]
-use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackendFactory};
-#[cfg(all(windows, feature = "dvc-com-plugin"))]
-use ironrdp_dvc_com_plugin::load_dvc_plugin;
-#[cfg(feature = "dvc-pipe-proxy")]
-use ironrdp_dvc_pipe_proxy::DvcNamedPipeProxy;
-#[cfg(feature = "sound")]
-use ironrdp_rdpsnd_native::cpal;
-
 use crate::config::{Config, RDCleanPathConfig, Transport};
 
 // ── Public event types ────────────────────────────────────────────────────────
@@ -149,8 +148,9 @@ impl RdpClient {
                 ClipboardType::Enable => {
                     #[cfg(windows)]
                     {
-                        use crate::clipboard::ClientClipboardMessageProxy;
                         use ironrdp_cliprdr_native::WinClipboard;
+
+                        use crate::clipboard::ClientClipboardMessageProxy;
                         match WinClipboard::new(ClientClipboardMessageProxy::new(self.input_event_sender.clone())) {
                             Ok(win_cb) => {
                                 cliprdr_factory = Some(win_cb.backend_factory());

@@ -1,9 +1,8 @@
 mod target_addr;
 use std::path::PathBuf;
 
-pub use target_addr::{ParseTargetAddrError, TargetAddr, TargetHost};
-
 use ironrdp_propertyset::PropertySet;
+pub use target_addr::{ParseTargetAddrError, TargetAddr, TargetHost};
 
 /// Property keys whose values are secrets and must never be surfaced verbatim.
 ///

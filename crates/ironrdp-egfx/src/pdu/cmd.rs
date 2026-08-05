@@ -1646,6 +1646,18 @@ impl RawCapabilitySet {
                     flags: CapabilitiesV107Flags::from_bits_retain(cur.read_u32()),
                 }
             }
+            CapabilityVersion::V10_8 => {
+                ensure_size!(in: cur, size: 4);
+                CapabilitySet::V10_8 {
+                    flags: CapabilitiesV107Flags::from_bits_retain(cur.read_u32()),
+                }
+            }
+            CapabilityVersion::V10_9 => {
+                ensure_size!(in: cur, size: 4);
+                CapabilitySet::V10_9 {
+                    flags: CapabilitiesV107Flags::from_bits_retain(cur.read_u32()),
+                }
+            }
             _ => return Ok(None),
         };
 
@@ -1714,6 +1726,10 @@ pub enum CapabilitySet {
     V10_6 { flags: CapabilitiesV104Flags },
     V10_6Err { flags: CapabilitiesV104Flags },
     V10_7 { flags: CapabilitiesV107Flags },
+    /// V10.8 / V10.9 reuse the V10.7 flag layout (SMALL_CACHE / AVC_DISABLED / …).
+    /// Advertised to satisfy gateways that gate AVC forwarding behind >= 108.
+    V10_8 { flags: CapabilitiesV107Flags },
+    V10_9 { flags: CapabilitiesV107Flags },
 }
 
 impl CapabilitySet {
@@ -1731,6 +1747,8 @@ impl CapabilitySet {
             CapabilitySet::V10_6 { .. } => CapabilityVersion::V10_6,
             CapabilitySet::V10_6Err { .. } => CapabilityVersion::V10_6_ERR,
             CapabilitySet::V10_7 { .. } => CapabilityVersion::V10_7,
+            CapabilitySet::V10_8 { .. } => CapabilityVersion::V10_8,
+            CapabilitySet::V10_9 { .. } => CapabilityVersion::V10_9,
         }
     }
 
@@ -1747,7 +1765,9 @@ impl CapabilitySet {
             | CapabilitySet::V10_5 { .. }
             | CapabilitySet::V10_6 { .. }
             | CapabilitySet::V10_6Err { .. }
-            | CapabilitySet::V10_7 { .. } => 4,
+            | CapabilitySet::V10_7 { .. }
+            | CapabilitySet::V10_8 { .. }
+            | CapabilitySet::V10_9 { .. } => 4,
         }
     }
 
@@ -1766,6 +1786,8 @@ impl CapabilitySet {
             CapabilitySet::V10_6 { flags } => dst.write_u32(flags.bits()),
             CapabilitySet::V10_6Err { flags } => dst.write_u32(flags.bits()),
             CapabilitySet::V10_7 { flags } => dst.write_u32(flags.bits()),
+            CapabilitySet::V10_8 { flags } => dst.write_u32(flags.bits()),
+            CapabilitySet::V10_9 { flags } => dst.write_u32(flags.bits()),
         }
         Ok(())
     }
@@ -1801,6 +1823,8 @@ impl CapabilityVersion {
     pub const V10_6: Self = Self(0xa_0600); // [MS-RDPEGFX-errata]
     pub const V10_6_ERR: Self = Self(0xa_0601); // defined similar to FreeRDP to maintain best compatibility
     pub const V10_7: Self = Self(0xa_0701);
+    pub const V10_8: Self = Self(0xa_0801);
+    pub const V10_9: Self = Self(0xa_0901);
 
     /// Returns `true` if this version matches one of the constants defined on
     /// `CapabilityVersion`, i.e. one this build knows how to decode into a
@@ -1820,6 +1844,8 @@ impl CapabilityVersion {
                 | Self::V10_6
                 | Self::V10_6_ERR
                 | Self::V10_7
+                | Self::V10_8
+                | Self::V10_9
         )
     }
 }
