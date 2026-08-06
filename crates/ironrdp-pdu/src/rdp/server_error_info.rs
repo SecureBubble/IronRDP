@@ -1,5 +1,5 @@
 use ironrdp_core::{
-    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size, invalid_field_err,
+    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size,
 };
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
@@ -37,8 +37,11 @@ impl<'de> Decode<'de> for ServerSetErrorInfoPdu {
         ensure_fixed_part_size!(in: src);
 
         let error_info = src.read_u32();
-        let error_info =
-            ErrorInfo::from_u32(error_info).ok_or_else(|| invalid_field_err!("errorInfo", "unexpected info code"))?;
+        // Unknown codes fall back to `Other` rather than failing: this PDU is
+        // informational and often part of a graceful server disconnect (e.g. the
+        // server rebooting), so a code this build doesn't know must not abort the
+        // whole session.
+        let error_info = ErrorInfo::from_u32(error_info).unwrap_or(ErrorInfo::Other(error_info));
 
         Ok(Self(error_info))
     }
@@ -51,6 +54,11 @@ pub enum ErrorInfo {
     ProtocolIndependentLicensingCode(ProtocolIndependentLicensingCode),
     ProtocolIndependentConnectionBrokerCode(ProtocolIndependentConnectionBrokerCode),
     RdpSpecificCode(RdpSpecificCode),
+    /// An error info code not recognized by this build. The Set Error Info PDU is
+    /// informational (part of the server's graceful-disconnect procedure), so an
+    /// unknown code must NOT fail decoding — that would kill the whole session on a
+    /// benign message. Surface it verbatim instead.
+    Other(u32),
 }
 
 impl ErrorInfo {
@@ -66,6 +74,7 @@ impl ErrorInfo {
                 format!("[Protocol independent connection broker error] {}", c.description())
             }
             Self::RdpSpecificCode(c) => format!("[RDP specific code]: {}", c.description()),
+            Self::Other(code) => format!("[Unknown error info code] 0x{code:08X}"),
         }
     }
 
@@ -75,6 +84,7 @@ impl ErrorInfo {
             Self::ProtocolIndependentLicensingCode(c) => c.as_u32(),
             Self::ProtocolIndependentConnectionBrokerCode(c) => c.as_u32(),
             Self::RdpSpecificCode(c) => c.as_u32(),
+            Self::Other(code) => code,
         }
     }
 }
@@ -127,6 +137,8 @@ pub enum ProtocolIndependentCode {
     CloseStackOnDriverIfaceFailure = 0x0000_0012,
     ServerWinlogonCrash = 0x0000_0017,
     ServerCsrssCrash = 0x0000_0018,
+    ServerShuttingDown = 0x0000_0019,
+    ServerRebooting = 0x0000_001A,
 }
 
 impl ProtocolIndependentCode {
@@ -170,6 +182,8 @@ impl ProtocolIndependentCode {
             }
             Self::ServerWinlogonCrash => "The Winlogon process running in the remote session terminated unexpectedly",
             Self::ServerCsrssCrash => "The CSRSS process running in the remote session terminated unexpectedly",
+            Self::ServerShuttingDown => "The remote server is busy shutting down",
+            Self::ServerRebooting => "The remote server is busy rebooting",
         }
     }
 
@@ -618,5 +632,29 @@ mod tests {
     #[test]
     fn buffer_length_is_correct_for_server_set_error_info() {
         assert_eq!(SERVER_SET_ERROR_INFO_BUFFER.len(), SERVER_SET_ERROR_INFO.size());
+    }
+
+    #[test]
+    fn parses_server_shutting_down_and_rebooting_codes() {
+        // 0x19 shutting down, 0x1A rebooting (were previously "unexpected info code").
+        let shutdown: ServerSetErrorInfoPdu = decode([0x19, 0x00, 0x00, 0x00].as_ref()).unwrap();
+        assert_eq!(
+            shutdown.0,
+            ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::ServerShuttingDown)
+        );
+        let reboot: ServerSetErrorInfoPdu = decode([0x1A, 0x00, 0x00, 0x00].as_ref()).unwrap();
+        assert_eq!(
+            reboot.0,
+            ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::ServerRebooting)
+        );
+    }
+
+    #[test]
+    fn unknown_error_info_code_decodes_as_other_not_error() {
+        // An unrecognized code must not abort decoding (would kill the session).
+        let pdu: ServerSetErrorInfoPdu = decode([0xEF, 0xBE, 0x00, 0x00].as_ref()).unwrap();
+        assert_eq!(pdu.0, ErrorInfo::Other(0x0000_BEEF));
+        // Round-trips back to the same 4 bytes.
+        assert_eq!(encode_vec(&pdu).unwrap(), vec![0xEF, 0xBE, 0x00, 0x00]);
     }
 }
