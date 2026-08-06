@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use ironrdp_core::{Decode, Encode, WriteBuf, decode, encode_vec};
 use ironrdp_pdu::rdp;
 use ironrdp_pdu::rdp::headers::{BASIC_SECURITY_HEADER_SIZE, BasicSecurityHeaderFlags, ServerDeactivateAll};
+use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
 use ironrdp_pdu::x224::X224;
 
@@ -172,6 +173,13 @@ pub enum IoChannelPdu {
     ///
     /// Received when the server wants the client to establish a sideband UDP transport.
     MultitransportRequest(MultitransportRequestPdu),
+    /// Server Redirection PDU (MS-RDPBCGR 2.2.13.1).
+    ///
+    /// The server (or a proxy) asks the client to reconnect to a target with the
+    /// supplied routing/credential info. The SecureBubble proxy also uses it to
+    /// convey a failed-sign-in message via a `QTERR` sentinel in its load-balance
+    /// info field.
+    ServerRedirect(ServerRedirectionPdu),
 }
 
 pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<IoChannelPdu> {
@@ -212,6 +220,7 @@ pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<IoCh
 
             Ok(IoChannelPdu::Data(share_data_ctx))
         }
+        rdp::headers::ShareControlPdu::ServerRedirect(redirection) => Ok(IoChannelPdu::ServerRedirect(redirection)),
         other => Err(reason_err!(
             "decode_io_channel",
             "received unexpected Share Control PDU: got {} (expected Data PDU or Server Deactivate All PDU)",

@@ -7,6 +7,7 @@ use ironrdp_pdu::rdp::autodetect::{AutoDetectRequest, AutoDetectResponse};
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
+use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
 use ironrdp_pdu::x224::X224;
 use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages, client_encode_svc_messages};
 use tracing::debug;
@@ -59,6 +60,12 @@ pub enum DisconnectDescription {
     /// Includes the error information sent by the RDP server when there
     /// is a connection or disconnection failure.
     ErrorInfo(ErrorInfo),
+
+    /// The server (or proxy) sent a Server Redirection PDU. The web client does
+    /// not follow redirects; it surfaces the redirect so the shell can present a
+    /// message (e.g. the SecureBubble proxy's failed-sign-in `QTERR` sentinel) or,
+    /// in future, reconnect to the target.
+    ServerRedirection(ServerRedirectionPdu),
 }
 
 pub struct Processor {
@@ -255,6 +262,12 @@ impl Processor {
             ironrdp_connector::legacy::IoChannelPdu::DeactivateAll(_) => Ok(vec![ProcessorOutput::DeactivateAll(
                 Box::new(self.connection_activation.reset_clone()),
             )]),
+            ironrdp_connector::legacy::IoChannelPdu::ServerRedirect(redirection) => {
+                debug!(?redirection, "Received Server Redirection PDU");
+                Ok(vec![ProcessorOutput::Disconnect(
+                    DisconnectDescription::ServerRedirection(redirection),
+                )])
+            }
         }
     }
 

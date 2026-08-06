@@ -359,6 +359,17 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
                         other => GracefulDisconnectReason::Other(other.description().to_owned()),
                     },
                     x224::DisconnectDescription::ErrorInfo(info) => GracefulDisconnectReason::Other(info.description()),
+                    x224::DisconnectDescription::ServerRedirection(redirection) => {
+                        // The proxy conveys a failed sign-in as a `QTERR` sentinel in
+                        // the redirect's load-balance info; surface that message
+                        // directly. Other redirects (routing) aren't followed yet.
+                        let message = match redirection.qterr_message() {
+                            Some((title, body)) if !body.is_empty() => format!("{title}: {body}"),
+                            Some((title, _)) => title,
+                            None => "The server redirected the connection.".to_owned(),
+                        };
+                        GracefulDisconnectReason::Other(message)
+                    }
                 };
 
                 Ok(Self::Terminate(desc))

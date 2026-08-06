@@ -165,6 +165,7 @@ pub enum ShareControlPdu {
     ClientConfirmActive(ClientConfirmActive),
     Data(ShareDataHeader),
     ServerDeactivateAll(ServerDeactivateAll),
+    ServerRedirect(crate::rdp::server_redirection::ServerRedirectionPdu),
 }
 
 impl ShareControlPdu {
@@ -176,6 +177,7 @@ impl ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(_) => "Client Confirm Active PDU",
             ShareControlPdu::Data(_) => "Data PDU",
             ShareControlPdu::ServerDeactivateAll(_) => "Server Deactivate All PDU",
+            ShareControlPdu::ServerRedirect(_) => "Server Redirection PDU",
         }
     }
 
@@ -185,6 +187,7 @@ impl ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(_) => ShareControlPduType::ConfirmActivePdu,
             ShareControlPdu::Data(_) => ShareControlPduType::DataPdu,
             ShareControlPdu::ServerDeactivateAll(_) => ShareControlPduType::DeactivateAllPdu,
+            ShareControlPdu::ServerRedirect(_) => ShareControlPduType::ServerRedirect,
         }
     }
 
@@ -197,10 +200,12 @@ impl ShareControlPdu {
                 Ok(ShareControlPdu::ClientConfirmActive(ClientConfirmActive::decode(src)?))
             }
             ShareControlPduType::DataPdu => Ok(ShareControlPdu::Data(ShareDataHeader::decode(src)?)),
+            ShareControlPduType::ServerRedirect => Ok(ShareControlPdu::ServerRedirect(
+                crate::rdp::server_redirection::ServerRedirectionPdu::decode(src)?,
+            )),
             ShareControlPduType::DeactivateAllPdu => {
                 Ok(ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll::decode(src)?))
             }
-            _ => Err(invalid_field_err!("share_type", "unexpected share control PDU type")),
         }
     }
 }
@@ -212,6 +217,7 @@ impl Encode for ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(pdu) => pdu.encode(dst),
             ShareControlPdu::Data(share_data_header) => share_data_header.encode(dst),
             ShareControlPdu::ServerDeactivateAll(deactivate_all) => deactivate_all.encode(dst),
+            ShareControlPdu::ServerRedirect(pdu) => pdu.encode(dst),
         }
     }
 
@@ -225,6 +231,7 @@ impl Encode for ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(pdu) => pdu.size(),
             ShareControlPdu::Data(share_data_header) => share_data_header.size(),
             ShareControlPdu::ServerDeactivateAll(deactivate_all) => deactivate_all.size(),
+            ShareControlPdu::ServerRedirect(pdu) => pdu.size(),
         }
     }
 }
