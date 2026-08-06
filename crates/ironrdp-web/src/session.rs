@@ -650,7 +650,17 @@ pub(crate) enum RdpInputEvent {
         physical_size: Option<(u32, u32)>,
     },
     TerminateSession,
+    /// The server marked a surface capture-protected (proxy `PROTECT_SURFACE`).
+    /// A browser cannot enforce capture protection, so the session is refused
+    /// fail-closed rather than shown unprotected. See [`PROTECTED_SESSION_REFUSAL`].
+    ProtectedSessionRefused,
 }
+
+/// User-facing reason shown when a capture-protected session is refused in the
+/// browser. Fail-closed: we never display protected content in a client that
+/// cannot honor `SetWindowDisplayAffinity`-style screen-capture exclusion.
+const PROTECTED_SESSION_REFUSAL: &str =
+    "This session requires screen-capture protection, which isn't available in the browser — please use the native client.";
 
 /// A decoded RGBA region positioned in output (desktop) coordinates.
 #[derive(Debug)]
@@ -1022,6 +1032,12 @@ impl iron_remote_desktop::Session for Session {
                         RdpInputEvent::TerminateSession => {
                             active_stage.graceful_shutdown()
                                 .context("graceful shutdown")?
+                        }
+                        RdpInputEvent::ProtectedSessionRefused => {
+                            info!("Refusing capture-protected session (not enforceable in browser)");
+                            vec![ActiveStageOutput::Terminate(GracefulDisconnectReason::Other(
+                                PROTECTED_SESSION_REFUSAL.to_owned(),
+                            ))]
                         }
                     }
                 }

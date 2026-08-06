@@ -161,6 +161,17 @@ impl WasmGraphicsMessageProxy {
             warn!("Failed to send graphics region, receiver is closed");
         }
     }
+
+    /// Ask the run loop to fail-close a capture-protected session.
+    fn refuse_protected_session(&self) {
+        if self
+            .tx
+            .unbounded_send(RdpInputEvent::ProtectedSessionRefused)
+            .is_err()
+        {
+            warn!("Failed to send protected-session refusal, receiver is closed");
+        }
+    }
 }
 
 /// EGFX pipeline handler. One per session, lives inside the DVC processor.
@@ -176,10 +187,9 @@ pub(crate) struct WasmGraphicsHandler {
     output_height: u32,
     /// Active session watermark overlay (proxy extension), re-blended each flush.
     watermark: Option<Watermark>,
-    /// Set once the proxy flags any surface capture-protected. Advisory only: a
-    /// browser canvas cannot be truly excluded from OS/browser screen capture.
-    /// Recorded as a hook for future cosmetic deterrents (e.g. blank-on-blur).
-    #[allow(dead_code, reason = "advisory flag; browser cannot enforce capture protection yet")]
+    /// Latches once the proxy flags any surface capture-protected, so the
+    /// fail-closed refusal is signalled exactly once (the proxy re-sends the
+    /// PROTECT_SURFACE PDU after every surface map).
     capture_protected: bool,
 }
 
@@ -474,11 +484,15 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
     }
 
     fn on_protect_surface(&mut self, pdu: &ProtectSurfacePdu) {
-        // Advisory only: a browser cannot exclude its canvas from OS/browser screen
-        // capture (unlike a native client's SetWindowDisplayAffinity). We record the
-        // request but cannot enforce it.
-        if pdu.enable != 0 {
+        // Fail closed. A browser canvas cannot be excluded from OS/browser screen
+        // capture (unlike a native client's SetWindowDisplayAffinity), so instead
+        // of showing protected content unprotected we refuse the session and tell
+        // the user to use the native client. Signal once; the proxy re-sends this
+        // after every surface map.
+        if pdu.enable != 0 && !self.capture_protected {
             self.capture_protected = true;
+            warn!("Session is capture-protected; refusing (browser cannot enforce screen-capture protection)");
+            self.proxy.refuse_protected_session();
         }
     }
 
