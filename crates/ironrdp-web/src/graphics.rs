@@ -22,7 +22,8 @@ use std::collections::HashMap;
 use futures_channel::mpsc;
 use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineHandler, Surface};
 use ironrdp_egfx::pdu::{
-    CacheToSurfacePdu, MapSurfaceToScaledOutputPdu, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu,
+    CacheToSurfacePdu, MapSurfaceToScaledOutputPdu, ProtectSurfacePdu, SolidFillPdu, SurfaceToCachePdu,
+    SurfaceToSurfacePdu, WatermarkPdu,
 };
 use tracing::warn;
 
@@ -90,6 +91,31 @@ impl SurfaceBuf {
     }
 }
 
+/// A persistent, tiled watermark overlay pushed by the proxy
+/// (`RDPGFX_CMDID_WATERMARK`). It is re-blended over every output region so it
+/// survives frame repaints (which overwrite the canvas via `put_image_data`).
+///
+/// Placement is a reasoned hypothesis pending a live capture: the QR bitmap is
+/// drawn at offset `(off_x, off_y)` inside a repeating `cell_w`x`cell_h` grid
+/// aligned to the output origin (AVD-style tiling). `off_*` come from the PDU's
+/// h/v padding, `cell_*` from its two constant words (0x017E/0x00CD). Only the
+/// [`WasmGraphicsHandler::blend_watermark`] math depends on this reading, so it
+/// is cheap to correct once verified.
+struct Watermark {
+    /// QR tile, RGBA8888 (converted from the PDU's ARGB8888).
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    /// Repeat pitch of the tiling grid.
+    cell_w: u32,
+    cell_h: u32,
+    /// QR offset within each cell.
+    off_x: u32,
+    off_y: u32,
+    /// 8-bit blend strength (0..=255), derived from the PDU's 0..=10000 opacity.
+    opacity: u32,
+}
+
 /// Accumulated dirty rectangle in surface-local coordinates (exclusive max).
 #[derive(Clone, Copy)]
 struct Dirty {
@@ -148,6 +174,13 @@ pub(crate) struct WasmGraphicsHandler {
     dirty: HashMap<u16, Dirty>,
     output_width: u32,
     output_height: u32,
+    /// Active session watermark overlay (proxy extension), re-blended each flush.
+    watermark: Option<Watermark>,
+    /// Set once the proxy flags any surface capture-protected. Advisory only: a
+    /// browser canvas cannot be truly excluded from OS/browser screen capture.
+    /// Recorded as a hook for future cosmetic deterrents (e.g. blank-on-blur).
+    #[allow(dead_code, reason = "advisory flag; browser cannot enforce capture protection yet")]
+    capture_protected: bool,
 }
 
 impl WasmGraphicsHandler {
@@ -160,12 +193,58 @@ impl WasmGraphicsHandler {
             dirty: HashMap::new(),
             output_width: 0,
             output_height: 0,
+            watermark: None,
+            capture_protected: false,
         }
     }
 
     fn mark_dirty(&mut self, surface_id: u16, x: u32, y: u32, w: u32, h: u32) {
         let d = Dirty::union(self.dirty.get(&surface_id).copied(), x, y, w, h);
         self.dirty.insert(surface_id, d);
+    }
+
+    /// Alpha-blend the tiled watermark onto a freshly extracted output region.
+    /// `data` is tight RGBA for the `w`x`h` block whose top-left sits at output
+    /// coordinate `(out_x, out_y)`. No-op when no watermark is set.
+    fn blend_watermark(&self, data: &mut [u8], out_x: u32, out_y: u32, w: u32, h: u32) {
+        let Some(wm) = &self.watermark else { return };
+        if wm.cell_w == 0 || wm.cell_h == 0 || wm.opacity == 0 {
+            return;
+        }
+        for row in 0..h {
+            let oy = out_y + row;
+            let cy = oy % wm.cell_h;
+            if cy < wm.off_y || cy >= wm.off_y + wm.height {
+                continue; // this output row falls between watermark tiles
+            }
+            let wy = cy - wm.off_y;
+            for col in 0..w {
+                let ox = out_x + col;
+                let cx = ox % wm.cell_w;
+                if cx < wm.off_x || cx >= wm.off_x + wm.width {
+                    continue;
+                }
+                let wx = cx - wm.off_x;
+                let wsrc = ((wy * wm.width + wx) * 4) as usize;
+                let Some(wpix) = wm.rgba.get(wsrc..wsrc + 4) else {
+                    continue;
+                };
+                // Effective alpha = tile alpha scaled by the requested opacity.
+                let a = (u32::from(wpix[3]) * wm.opacity) / 255;
+                if a == 0 {
+                    continue;
+                }
+                let didx = ((row * w + col) * 4) as usize;
+                let Some(dpix) = data.get_mut(didx..didx + 4) else {
+                    continue;
+                };
+                let inv = 255 - a;
+                for c in 0..3 {
+                    dpix[c] = ((u32::from(dpix[c]) * inv + u32::from(wpix[c]) * a) / 255) as u8;
+                }
+                // Leave alpha channel; the canvas forces opaque on present.
+            }
+        }
     }
 }
 
@@ -336,6 +415,73 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         }
     }
 
+    fn on_watermark(&mut self, pdu: &WatermarkPdu) {
+        let width = u32::from(pdu.width);
+        let height = u32::from(pdu.height);
+        let expected = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        if width == 0 || height == 0 || pdu.image.len() < expected {
+            warn!(
+                width,
+                height,
+                image_len = pdu.image.len(),
+                "ignoring malformed watermark PDU"
+            );
+            return;
+        }
+        // Convert the tile from ARGB8888 (wire byte order B,G,R,A) to RGBA8888.
+        let mut rgba = vec![0u8; expected];
+        for (dst, src) in rgba.chunks_exact_mut(4).zip(pdu.image.chunks_exact(4)) {
+            dst[0] = src[2]; // R
+            dst[1] = src[1]; // G
+            dst[2] = src[0]; // B
+            dst[3] = src[3]; // A
+        }
+        // Placement hypothesis (see `Watermark`): cell pitch from the two constant
+        // words, QR offset from h/v padding. Fall back to a single tile if a cell
+        // dimension is degenerate.
+        let cell_w = if u32::from(pdu.reserved_a) > width {
+            u32::from(pdu.reserved_a)
+        } else {
+            self.output_width.max(width)
+        };
+        let cell_h = if u32::from(pdu.reserved_b) > height {
+            u32::from(pdu.reserved_b)
+        } else {
+            self.output_height.max(height)
+        };
+        self.watermark = Some(Watermark {
+            rgba,
+            width,
+            height,
+            cell_w,
+            cell_h,
+            off_x: u32::from(pdu.h_padding),
+            off_y: u32::from(pdu.v_padding),
+            // The proxy/AVD opacity is on a 0..=10000 "parts" scale (≈100 faint ..
+            // ≈10000 opaque), NOT a 0..=255 alpha. Map it to an 8-bit blend factor
+            // so a given value matches mstsc (e.g. 1000 -> ~10%, not fully opaque).
+            opacity: u32::from(pdu.opacity).min(10_000) * 255 / 10_000,
+        });
+        // Repaint mapped surfaces fully so the watermark shows without waiting for
+        // the server to touch every region.
+        let mapped_ids: Vec<u16> = self.mapped.keys().copied().collect();
+        for id in mapped_ids {
+            if let Some(s) = self.surfaces.get(&id) {
+                let (w, h) = (s.width, s.height);
+                self.mark_dirty(id, 0, 0, w, h);
+            }
+        }
+    }
+
+    fn on_protect_surface(&mut self, pdu: &ProtectSurfacePdu) {
+        // Advisory only: a browser cannot exclude its canvas from OS/browser screen
+        // capture (unlike a native client's SetWindowDisplayAffinity). We record the
+        // request but cannot enforce it.
+        if pdu.enable != 0 {
+            self.capture_protected = true;
+        }
+    }
+
     fn on_frame_complete(&mut self, _frame_id: u32) {
         // Flush the dirty region of every output-MAPPED surface to the run loop.
         // Unmapped surfaces keep their accumulated dirty region so it is painted
@@ -356,7 +502,10 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
             if w == 0 || h == 0 {
                 continue;
             }
-            let data = surface.extract(x, y, w, h);
+            let mut data = surface.extract(x, y, w, h);
+            // Re-blend the persistent watermark on top so it survives this region's
+            // overwrite of the canvas.
+            self.blend_watermark(&mut data, ox + x, oy + y, w, h);
             self.proxy.send(GraphicsRegion {
                 x: ox + x,
                 y: oy + y,
@@ -372,5 +521,6 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         self.cache.clear();
         self.mapped.clear();
         self.dirty.clear();
+        self.watermark = None;
     }
 }

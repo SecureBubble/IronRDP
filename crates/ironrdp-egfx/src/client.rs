@@ -70,8 +70,8 @@ use crate::pdu::{
     Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
     CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, CapabilityVersion, Codec1Type, DeleteEncodingContextPdu,
     EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
-    MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu, SurfaceToCachePdu,
-    SurfaceToSurfacePdu, WireToSurface2Pdu,
+    MapSurfaceToWindowPdu, PixelFormat, ProtectSurfacePdu, QueueDepth, RawCapabilitySet, SolidFillPdu,
+    SurfaceToCachePdu, SurfaceToSurfacePdu, WatermarkPdu, WireToSurface2Pdu,
 };
 
 /// Max capacity to keep for decompressed buffer when cleared.
@@ -353,6 +353,20 @@ pub trait GraphicsPipelineHandler: Send {
     /// [MS-RDPEGFX 2.2.2.17]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/7c7a0a5d-50c1-44b9-a2e7-44b47ce1e49d
     fn on_cache_import_reply(&mut self, _pdu: &CacheImportReplyPdu) {}
 
+    /// Called when the proxy pushes a session watermark overlay
+    ///
+    /// Non-standard SecureBubble extension (`RDPGFX_CMDID_WATERMARK`, 0x001A). The
+    /// handler should keep the ARGB8888 bitmap drawn over the mapped output at the
+    /// requested opacity until a new watermark arrives.
+    fn on_watermark(&mut self, _pdu: &WatermarkPdu) {}
+
+    /// Called when the proxy flags a surface as capture-protected
+    ///
+    /// Non-standard SecureBubble extension (`RDPGFX_CMDID_PROTECT_SURFACE`, 0x0019).
+    /// A browser client cannot truly enforce capture protection, so this is
+    /// best-effort/advisory.
+    fn on_protect_surface(&mut self, _pdu: &ProtectSurfacePdu) {}
+
     /// Called for PDUs that have no specific handler
     ///
     /// This is a catch-all for any GfxPdu variant not matched above.
@@ -617,6 +631,24 @@ impl GraphicsPipelineClient {
                 self.progressive_decoder
                     .delete_context(pdu.surface_id, pdu.codec_context_id);
                 self.handler.on_delete_encoding_context(&pdu);
+                Ok(vec![])
+            }
+
+            // Non-standard SecureBubble proxy extensions
+            GfxPdu::Watermark(pdu) => {
+                trace!(
+                    surface_id = pdu.surface_id,
+                    width = pdu.width,
+                    height = pdu.height,
+                    opacity = pdu.opacity,
+                    "Watermark"
+                );
+                self.handler.on_watermark(&pdu);
+                Ok(vec![])
+            }
+            GfxPdu::ProtectSurface(pdu) => {
+                trace!(surface_id = pdu.surface_id, enable = pdu.enable, "ProtectSurface");
+                self.handler.on_protect_surface(&pdu);
                 Ok(vec![])
             }
 
@@ -1020,7 +1052,17 @@ impl DvcProcessor for GraphicsPipelineClient {
             } else {
                 filtered
             };
-            CapabilitiesAdvertisePdu::from_typed(&caps)
+            let mut advertise = CapabilitiesAdvertisePdu::from_typed(&caps);
+            // Advertise the private V11.1 (0x000b0101) capset the SecureBubble proxy
+            // keys on to enable per-session watermark / screen-capture-protect
+            // injection (rdp-proxy egfx.cpp). Flags are 0: AVC is opt-in via
+            // AVC420_ENABLED (0x10), which we never set, so the target stays on the
+            // progressive/bitmap path this client decodes. Without this capset a
+            // watermark-enabled session is refused by the proxy.
+            advertise
+                .0
+                .push(RawCapabilitySet::new(CapabilityVersion(0x000b_0101), 0u32.to_le_bytes().to_vec()));
+            advertise
         };
 
         let pdu = GfxPdu::CapabilitiesAdvertise(advertise);
