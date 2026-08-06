@@ -213,9 +213,10 @@ impl WasmGraphicsHandler {
         self.dirty.insert(surface_id, d);
     }
 
-    /// Alpha-blend the tiled watermark onto a freshly extracted output region.
-    /// `data` is tight RGBA for the `w`x`h` block whose top-left sits at output
-    /// coordinate `(out_x, out_y)`. No-op when no watermark is set.
+    /// Blend the tiled watermark onto a freshly extracted output region using a
+    /// neutral, background-opposing contrast so it stays legible on light *and*
+    /// dark content. `data` is tight RGBA for the `w`x`h` block whose top-left
+    /// sits at output coordinate `(out_x, out_y)`. No-op when no watermark is set.
     fn blend_watermark(&self, data: &mut [u8], out_x: u32, out_y: u32, w: u32, h: u32) {
         let Some(wm) = &self.watermark else { return };
         if wm.cell_w == 0 || wm.cell_h == 0 || wm.opacity == 0 {
@@ -248,9 +249,18 @@ impl WasmGraphicsHandler {
                 let Some(dpix) = data.get_mut(didx..didx + 4) else {
                     continue;
                 };
-                let inv = 255 - a;
+                // The QR is a white module mask. A plain white blend vanishes on a
+                // white background (e.g. a File Explorer window) — unlike the native
+                // client. Apply a NEUTRAL luminance delta whose sign opposes the
+                // background instead: darken light pixels, lighten dark ones, by `a`.
+                // On black this equals the old white-add (0 -> a); on white it now
+                // darkens (255 -> 255-a). The mark stays gray and legible on any
+                // background. `wpix[3]` (module presence) already gated `a` above.
+                let lum = (u32::from(dpix[0]) * 77 + u32::from(dpix[1]) * 150 + u32::from(dpix[2]) * 29) >> 8;
+                let d = a as i32;
                 for c in 0..3 {
-                    dpix[c] = ((u32::from(dpix[c]) * inv + u32::from(wpix[c]) * a) / 255) as u8;
+                    let v = i32::from(dpix[c]);
+                    dpix[c] = if lum >= 128 { (v - d).max(0) } else { (v + d).min(255) } as u8;
                 }
                 // Leave alpha channel; the canvas forces opaque on present.
             }
