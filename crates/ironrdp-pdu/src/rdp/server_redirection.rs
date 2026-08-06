@@ -1,10 +1,13 @@
 //! RDP Server Redirection Packet (MS-RDPBCGR 2.2.13.1).
 //!
-//! Carried inside a Share Control PDU of type `PDUTYPE_SERVER_REDIR_PKT` (0xA).
-//! Note on framing: [`crate::rdp::headers::ShareControlHeader`] consumes a 4-byte
-//! `shareId` for every PDU type, which for a redirect overlaps the packet's
-//! `Flags` (2) + `Length` (2). Consequently this type is decoded/encoded starting
-//! at `SessionID` — the `Flags`/`Length` live in the enclosing header's `shareId`.
+//! Carried inside an Enhanced Security Server Redirection PDU (share-control PDU
+//! type `PDUTYPE_SERVER_REDIR_PKT`, 0xA), whose body is:
+//! `pad2Octets(2) | Flags(2) | Length(2) | SessionID(4) | RedirFlags(4) | fields`.
+//!
+//! Framing note: [`crate::rdp::headers::ShareControlHeader`] reads a 4-byte
+//! `shareId` for every PDU type, which here overlaps `pad2Octets(2)` + `Flags(2)`.
+//! So this type is decoded/encoded starting at the packet `Length` field — the
+//! `pad2Octets`/`Flags` live in the enclosing header's `shareId`.
 
 use ironrdp_core::{
     Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_size,
@@ -27,6 +30,9 @@ const LB_TARGET_CERTIFICATE: u32 = 0x0001_0000;
 #[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ServerRedirectionPdu {
+    /// The packet `Length` field (bytes from `Flags` onward). Retained so the PDU
+    /// round-trips; not otherwise interpreted.
+    pub redir_packet_length: u16,
     pub session_id: u32,
     pub redir_flags: u32,
     pub target_net_address: Option<String>,
@@ -56,13 +62,18 @@ impl core::fmt::Debug for ServerRedirectionPdu {
 
 impl ServerRedirectionPdu {
     const NAME: &'static str = "ServerRedirectionPdu";
-    const FIXED_PART_SIZE: usize = 4 /* SessionID */ + 4 /* RedirFlags */;
+    const FIXED_PART_SIZE: usize = 2 /* Length */ + 4 /* SessionID */ + 4 /* RedirFlags */;
 
     /// If [`Self::load_balance_info`] holds the SecureBubble proxy's error
     /// sentinel `QTERR\t<code>\t<title>\t<body>`, returns `(title, body)`.
+    ///
+    /// FreeRDP wraps `LB_LOAD_BALANCE_INFO` on the wire as
+    /// `Cookie: msts=<value>\r\n`, so the prefix/suffix are stripped first.
     pub fn qterr_message(&self) -> Option<(String, String)> {
         let lbi = self.load_balance_info.as_ref()?;
         let text = core::str::from_utf8(lbi).ok()?;
+        let text = text.strip_prefix("Cookie: msts=").unwrap_or(text);
+        let text = text.trim_end_matches(['\r', '\n']);
         let mut parts = text.split('\t');
         if parts.next()? != "QTERR" {
             return None;
@@ -110,6 +121,7 @@ fn unicode_size(s: &str) -> usize {
 impl<'de> Decode<'de> for ServerRedirectionPdu {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         ensure_size!(in: src, size: Self::FIXED_PART_SIZE);
+        let redir_packet_length = src.read_u16();
         let session_id = src.read_u32();
         let redir_flags = src.read_u32();
 
@@ -150,6 +162,7 @@ impl<'de> Decode<'de> for ServerRedirectionPdu {
         }
 
         Ok(Self {
+            redir_packet_length,
             session_id,
             redir_flags,
             target_net_address,
@@ -166,6 +179,7 @@ impl<'de> Decode<'de> for ServerRedirectionPdu {
 impl Encode for ServerRedirectionPdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
+        dst.write_u16(self.redir_packet_length);
         dst.write_u32(self.session_id);
         dst.write_u32(self.redir_flags);
         if let Some(s) = &self.target_net_address {
@@ -214,20 +228,27 @@ mod tests {
 
     use super::*;
 
-    /// The proxy's failed-sign-in redirect: LB_TARGET_FQDN + LB_LOAD_BALANCE_INFO,
-    /// the latter carrying the `QTERR` sentinel with the user-facing message.
+    /// The proxy's failed-sign-in redirect exactly as it appears on the wire after
+    /// `ShareControlHeader` has consumed pad2Octets+Flags as `shareId`: the packet
+    /// `Length`, then SessionID, RedirFlags, and the `LB_*` fields. FreeRDP wraps
+    /// `LB_LOAD_BALANCE_INFO` as `Cookie: msts=<value>\r\n`.
     fn proxy_qterr_bytes() -> Vec<u8> {
         let sentinel = b"QTERR\t00020014\tSign-in failed\tUsername or password is incorrect.";
+        let mut lbi = Vec::new();
+        lbi.extend_from_slice(b"Cookie: msts=");
+        lbi.extend_from_slice(sentinel);
+        lbi.extend_from_slice(b"\r\n");
         let fqdn: Vec<u8> = "proxy.host"
             .encode_utf16()
             .chain(core::iter::once(0))
             .flat_map(u16::to_le_bytes)
             .collect();
         let mut b = Vec::new();
+        b.extend_from_slice(&0x00cdu16.to_le_bytes()); // redir packet Length
         b.extend_from_slice(&0x1234u32.to_le_bytes()); // session_id
         b.extend_from_slice(&(LB_LOAD_BALANCE_INFO | LB_TARGET_FQDN).to_le_bytes());
-        b.extend_from_slice(&(sentinel.len() as u32).to_le_bytes());
-        b.extend_from_slice(sentinel);
+        b.extend_from_slice(&(lbi.len() as u32).to_le_bytes());
+        b.extend_from_slice(&lbi);
         b.extend_from_slice(&(fqdn.len() as u32).to_le_bytes());
         b.extend_from_slice(&fqdn);
         b
@@ -253,10 +274,11 @@ mod tests {
 
     #[test]
     fn non_qterr_lbi_is_not_a_message() {
-        let mut b = Vec::new();
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&LB_LOAD_BALANCE_INFO.to_le_bytes());
         let token = b"Cookie: msts=1.2.3\r\n";
+        let mut b = Vec::new();
+        b.extend_from_slice(&0u16.to_le_bytes()); // Length
+        b.extend_from_slice(&0u32.to_le_bytes()); // session_id
+        b.extend_from_slice(&LB_LOAD_BALANCE_INFO.to_le_bytes());
         b.extend_from_slice(&(token.len() as u32).to_le_bytes());
         b.extend_from_slice(token);
         let pdu: ServerRedirectionPdu = decode(&b).expect("decode");
