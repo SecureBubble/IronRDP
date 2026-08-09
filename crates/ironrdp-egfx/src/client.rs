@@ -59,6 +59,7 @@ use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::ProgressiveDecoder;
+use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_graphics::zgfx;
 use ironrdp_pdu::geometry::{ExclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
@@ -406,6 +407,8 @@ pub struct GraphicsPipelineClient {
     /// RFX Progressive (WireToSurface2) decoder. Pure Rust; keeps per-context
     /// tile state across frames.
     progressive_decoder: ProgressiveDecoder,
+    /// RDP 6.0 Planar (`RDPGFX_CODECID_PLANAR`) decoder. Pure Rust.
+    planar_decoder: BitmapStreamDecoder,
     /// When true, advertise AVC420/AVC444 capabilities (V10.x) even without a
     /// Rust `h264_decoder`. Used when H.264 is decoded out-of-band (WebCodecs in
     /// the browser). Without a Rust decoder attached, AVC frames are logged and
@@ -436,6 +439,7 @@ impl GraphicsPipelineClient {
             h264_decoder,
             clearcodec_decoder: ClearCodecDecoder::new(),
             progressive_decoder: ProgressiveDecoder::new(),
+            planar_decoder: BitmapStreamDecoder::default(),
             avc_available: false,
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
@@ -821,6 +825,9 @@ impl GraphicsPipelineClient {
             Codec1Type::ClearCodec => {
                 self.decode_clearcodec(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
             }
+            Codec1Type::Planar => {
+                self.decode_planar(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
+            }
             Codec1Type::Uncompressed => {
                 self.handle_uncompressed(pdu);
             }
@@ -914,6 +921,41 @@ impl GraphicsPipelineClient {
             surface_id,
             destination_rectangle: dest_rect.clone(),
             codec_id: Codec1Type::ClearCodec,
+            data: rgba,
+            width: dest_width,
+            height: dest_height,
+        };
+
+        self.handler.on_bitmap_updated(&update);
+        Ok(())
+    }
+
+    /// Decode an RDP 6.0 Planar bitmap ([MS-RDPEGFX] `RDPGFX_CODECID_PLANAR`, 0x000A).
+    ///
+    /// The payload is an `RDP6_BITMAP_STREAM` ([MS-RDPEGDI] 2.2.2.5.1), the same
+    /// structure the fast-path bitmap route decodes, so this reuses `ironrdp-graphics`'
+    /// decoder. Adopted from upstream; emits `on_bitmap_updated` for the web compositor
+    /// (upstream feeds its in-crate compositor, which we don't use).
+    fn decode_planar(&mut self, surface_id: u16, dest_rect: &ExclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
+        // MS-RDPEGFX 2.2.2.1: destRect gives both the target point and the exact
+        // width/height of the bitmap data (it is only a bounding rect for AVC).
+        let dest_width = dest_rect.width();
+        let dest_height = dest_rect.height();
+
+        let mut rgb24 = Vec::new();
+        self.planar_decoder
+            .decode_bitmap_stream_to_rgb24(bitmap_data, &mut rgb24, usize::from(dest_width), usize::from(dest_height))
+            .map_err(|e| pdu_other_err!("Planar decode", source: e))?;
+
+        // The decoder emits RGB24 top-down row-major (surface order); no flip needed.
+        // Planar carries color only — per-pixel opacity is a separate
+        // RDPGFX_CODECID_ALPHA command — so the pixels are opaque.
+        let rgba = convert_rgb24_to_rgba(&rgb24);
+
+        let update = BitmapUpdate {
+            surface_id,
+            destination_rectangle: dest_rect.clone(),
+            codec_id: Codec1Type::Planar,
             data: rgba,
             width: dest_width,
             height: dest_height,
@@ -1161,6 +1203,16 @@ fn convert_bgra_to_rgba(src: &[u8]) -> Vec<u8> {
     let mut dst = Vec::with_capacity(src.len());
     for pixel in src.chunks_exact(4) {
         dst.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+    dst
+}
+
+/// Widen RGB24 (from the Planar decoder) to opaque RGBA8888.
+fn convert_rgb24_to_rgba(src: &[u8]) -> Vec<u8> {
+    debug_assert!(src.len() % 3 == 0, "RGB24 input length not aligned to 3 bytes");
+    let mut dst = Vec::with_capacity(src.len() / 3 * 4);
+    for pixel in src.chunks_exact(3) {
+        dst.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xFF]);
     }
     dst
 }
