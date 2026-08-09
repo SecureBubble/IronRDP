@@ -124,7 +124,14 @@ pub fn decode_srl(data: &[u8], num_values: usize, num_bits: u8) -> Vec<i16> {
 /// zero-run machinery is independent of it.
 pub struct SrlDecoder<'a> {
     reader: BitReader<'a>,
+    /// Adaptive K-parameter state. `k = kp / 8`. FreeRDP initializes this to 8
+    /// (so the first zero-run chunk is `1 << 1`), NOT 0.
     kp: u32,
+    /// Persistent zero/unary phase flag. 0 = zero-encoding, 1 = unary is next.
+    /// After a partial-run escape (`'1'` bit + k-bit count), FreeRDP proceeds
+    /// straight to the unary magnitude on the next non-zero value WITHOUT
+    /// reading another zero-mode bit — `mode` carries that across calls.
+    mode: u32,
     nz: u32, // zeros remaining in the current run
 }
 
@@ -132,13 +139,20 @@ impl<'a> SrlDecoder<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self {
             reader: BitReader::new(data),
-            kp: 0,
+            kp: 8,
+            mode: 0,
             nz: 0,
         }
     }
 
     /// Decode the next coefficient value using `num_bits` for the magnitude
     /// width. Returns 0 when the coefficient stays zero for this pass.
+    ///
+    /// Faithful port of FreeRDP `progressive_rfx_srl_read`
+    /// (`libfreerdp/codec/progressive.c`). The magnitude is a **capped unary**
+    /// count (`mag = 1; while mag < (1<<numBits)-1 { if 1-bit break; mag++ }`),
+    /// NOT a Golomb-Rice quotient+remainder, and the zero/unary phase persists
+    /// across calls via `mode`.
     pub fn next(&mut self, num_bits: u8) -> i16 {
         // Emit a pending zero from an in-progress run first.
         if self.nz > 0 {
@@ -146,55 +160,49 @@ impl<'a> SrlDecoder<'a> {
             return 0;
         }
 
-        let k = self.kp >> 3;
+        let k = self.kp / 8;
 
-        let bit = self.reader.read_bit();
-        if !bit {
-            // Full zero-run chunk of 1 << k.
-            let run = 1u32.checked_shl(k).unwrap_or(0);
-            self.kp = self.kp.saturating_add(4).min(80);
-            self.nz = run.saturating_sub(1);
-            return 0;
-        }
-
-        let zeros = self.reader.read_bits(k);
-        if zeros > 0 {
-            // Partial zero-run of `zeros`.
-            self.nz = zeros - 1;
-            return 0;
-        }
-
-        // Unary magnitude mode.
-        self.kp = self.kp.saturating_sub(6);
-
-        if num_bits == 0 {
-            let sign = self.reader.read_bit();
-            return if sign { -1 } else { 1 };
-        }
-
-        let sign = self.reader.read_bit();
-        if num_bits == 1 {
-            return if sign { -1 } else { 1 };
-        }
-
-        let mut quotient: u32 = 0;
-        loop {
+        if self.mode == 0 {
+            // Zero-encoding phase.
             let bit = self.reader.read_bit();
-            if bit || quotient >= 0x8000 {
+            if !bit {
+                // '0' bit: full zero-run chunk of (1 << k).
+                self.nz = 1u32.checked_shl(k).unwrap_or(0);
+                self.kp = (self.kp + 4).min(80);
+                self.nz = self.nz.saturating_sub(1);
+                return 0;
+            }
+            // '1' bit: partial run (k-bit count), then unary is next.
+            self.nz = 0;
+            self.mode = 1;
+            if k > 0 {
+                self.nz = self.reader.read_bits(k);
+            }
+            if self.nz > 0 {
+                self.nz -= 1;
+                return 0;
+            }
+        }
+
+        // Unary magnitude phase.
+        self.mode = 0;
+        let sign = self.reader.read_bit();
+        self.kp = if self.kp < 6 { 0 } else { self.kp - 6 };
+
+        if num_bits <= 1 {
+            return if sign { -1 } else { 1 };
+        }
+
+        let mut mag: u32 = 1;
+        let max = (1u32 << u32::from(num_bits)).saturating_sub(1);
+        while mag < max {
+            if self.reader.read_bit() {
                 break;
             }
-            quotient += 1;
+            mag += 1;
         }
 
-        let extra_bits = u32::from(num_bits).saturating_sub(1);
-        let magnitude = if extra_bits > 0 && extra_bits < 16 {
-            let remainder = self.reader.read_bits(extra_bits);
-            (quotient << extra_bits) | remainder
-        } else {
-            quotient
-        };
-
-        let value = i16::try_from(magnitude.min(0x7FFF)).unwrap_or(i16::MAX);
+        let value = i16::try_from(mag.min(0x7FFF)).unwrap_or(i16::MAX);
         if sign {
             -value
         } else {

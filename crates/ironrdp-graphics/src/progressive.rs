@@ -139,6 +139,7 @@ pub fn decode_first_pass(
 pub fn decode_upgrade_pass(
     srl_data: &[u8],
     raw_data: &[u8],
+    base_quant: &ComponentCodecQuant,
     prev_prog_quant: &ComponentCodecQuant,
     curr_prog_quant: &ComponentCodecQuant,
     use_reduce_extrapolate: bool,
@@ -160,46 +161,66 @@ pub fn decode_upgrade_pass(
     let mut srl = srl::SrlDecoder::new(srl_data);
     let mut raw_reader = RawBitReader::new(raw_data);
 
+    // Faithful port of FreeRDP `progressive_rfx_upgrade_block`
+    // (`libfreerdp/codec/progressive.c`). Two things our earlier implementation
+    // got wrong — both invisible to our own encoder↔decoder round-trip (the
+    // errors cancel) and only exposed by real Windows progressive streams
+    // (prog-set): (1) the reconstruction left-shift is the **base-quant** value
+    // `quantY + quantProg - 1` (`quant_add` then `lsub(1)`, the `-6+5=-1`), NOT
+    // the progressive BitPos; FreeRDP marks its `bitPos` param UNUSED. (2) The
+    // LL3 subband (`!state->nonLL`) is decoded purely from the RAW stream — no
+    // SRL, no sign array, always additive — while all other bands are
+    // sign-driven (sign>0 raw add, sign<0 raw subtract, sign==0 SRL read).
     for (band_idx, band) in bands.iter().enumerate() {
         let prev_bit_pos = prev_prog_quant.for_band(band_idx);
         let curr_bit_pos = curr_prog_quant.for_band(band_idx);
 
-        // Number of raw bits per coefficient in this band
+        // Number of new bits transmitted for this band at this quality level.
         let num_bits = prev_bit_pos.saturating_sub(curr_bit_pos);
         if num_bits == 0 {
             continue;
         }
 
+        // Reconstruction shift = base_quant + curr_prog - 1 (per band). This is
+        // the same net scale the first pass applies (base dequant `<< quant-1`
+        // then progressive dequant `<< BitPos`), so upgrade contributions land
+        // at the correct magnitude relative to the retained coefficients.
+        let shift = (i32::from(base_quant.for_band(band_idx)) + i32::from(curr_bit_pos) - 1).max(0);
+
+        let is_ll3 = band_idx == 9;
+
         for i in 0..band.count() {
             let coeff_idx = band.offset + i;
-            let is_ll3 = band_idx == 9;
 
-            if sign[coeff_idx] == SIGN_ZERO {
-                // Zero-DAS: pull the next value from the continuous SRL stream.
-                let value = srl.next(num_bits);
-
-                if value != 0 {
-                    // Coefficient transitions from zero to non-zero
-                    let shifted = i32::from(value) << i32::from(curr_bit_pos);
-                    coefficients[coeff_idx] = clamp_i16(shifted);
-                    sign[coeff_idx] = if value > 0 { SIGN_POSITIVE } else { SIGN_NEGATIVE };
-                }
+            // The signed magnitude added to this coefficient this pass.
+            let input: i32 = if is_ll3 {
+                // LL3: pure raw, no SRL, no sign — always additive.
+                i32::try_from(raw_reader.read_bits(u32::from(num_bits))).unwrap_or(i32::MAX)
             } else {
-                // Non-zero DAS: read raw magnitude bits
-                let raw_mag = raw_reader.read_bits(u32::from(num_bits));
-
-                if raw_mag != 0 {
-                    // raw_mag fits in i32 (at most 2^15 from bit stream)
-                    let mag_i32 = i32::try_from(raw_mag).unwrap_or(i32::MAX);
-                    let shifted = mag_i32 << i32::from(curr_bit_pos);
-                    if is_ll3 || sign[coeff_idx] == SIGN_POSITIVE {
-                        // LL3 is always positive; positive DAS adds
-                        coefficients[coeff_idx] = clamp_i16(i32::from(coefficients[coeff_idx]) + shifted);
-                    } else {
-                        // Negative DAS subtracts
-                        coefficients[coeff_idx] = clamp_i16(i32::from(coefficients[coeff_idx]) - shifted);
+                match sign[coeff_idx] {
+                    SIGN_POSITIVE => {
+                        i32::try_from(raw_reader.read_bits(u32::from(num_bits))).unwrap_or(i32::MAX)
+                    }
+                    SIGN_NEGATIVE => {
+                        -i32::try_from(raw_reader.read_bits(u32::from(num_bits))).unwrap_or(i32::MAX)
+                    }
+                    _ => {
+                        // Zero-DAS: pull the next value from the continuous SRL
+                        // stream; a non-zero result fixes the coefficient's sign.
+                        let value = srl.next(num_bits);
+                        if value > 0 {
+                            sign[coeff_idx] = SIGN_POSITIVE;
+                        } else if value < 0 {
+                            sign[coeff_idx] = SIGN_NEGATIVE;
+                        }
+                        i32::from(value)
                     }
                 }
+            };
+
+            if input != 0 {
+                let shifted = input << shift;
+                coefficients[coeff_idx] = clamp_i16(i32::from(coefficients[coeff_idx]) + shifted);
             }
         }
     }
@@ -723,6 +744,11 @@ pub struct TileState {
     pub sign: [[i8; COEFFICIENTS_PER_COMPONENT]; 3],
     /// Progressive quantization BitPos from the last applied pass.
     pub prog_quant: [ComponentCodecQuant; 3],
+    /// Resolved base quantization tables (Y, Cb, Cr) captured at the first pass.
+    /// Upgrade tiles do not re-send quant indices, so the upgrade pass reuses
+    /// these to compute its `base + prog - 1` reconstruction shift (FreeRDP
+    /// keeps the equivalent `tile->yQuant`/`cbQuant`/`crQuant`).
+    pub base_quant: [ComponentCodecQuant; 3],
     /// Base quantization indices (Y, Cb, Cr) into the region's quant table.
     pub quant_idx: [u8; 3],
     /// Progressive pass counter (0 = no data, 1 = first pass complete, 2+ = upgrade).
@@ -742,6 +768,7 @@ impl TileState {
             coefficients: [[0; COEFFICIENTS_PER_COMPONENT]; 3],
             sign: [[0; COEFFICIENTS_PER_COMPONENT]; 3],
             prog_quant: [ComponentCodecQuant::LOSSLESS; 3],
+            base_quant: [ComponentCodecQuant::LOSSLESS; 3],
             quant_idx: [0; 3],
             pass: 0,
             is_difference: false,
@@ -781,6 +808,7 @@ impl TileState {
         self.use_reduce_extrapolate = use_reduce_extrapolate;
         self.is_difference = is_difference;
         self.prog_quant = prog_quants;
+        self.base_quant = [*base_quants[0], *base_quants[1], *base_quants[2]];
 
         for c in 0..3 {
             decode_first_pass(
@@ -819,6 +847,7 @@ impl TileState {
             decode_upgrade_pass(
                 srl_data[c],
                 raw_data[c],
+                &self.base_quant[c],
                 &prev_prog_quant[c],
                 &prog_quants[c],
                 self.use_reduce_extrapolate,
@@ -1000,6 +1029,32 @@ pub struct DecodedTile {
     pub y_idx: u16,
     /// RGBA pixel data (64x64 = 16384 bytes).
     pub pixels: Vec<u8>,
+    /// Sub-rectangles of this tile that the caller must actually commit to the
+    /// surface, in **surface pixel coordinates** — the tile's 64x64 footprint
+    /// intersected with the region's dirty rectangles.
+    ///
+    /// The tile is always fully *decoded* (its retained DWT coefficients are
+    /// updated regardless), but only these clipped spans should be blitted. A
+    /// full-quality single-pass tile covers all 64x64 yet the server may mark
+    /// only a small strip dirty; committing the whole tile splats stale/uniform
+    /// pixels over untouched wallpaper (the "quality-0xFF white-saturation"
+    /// artifact). FreeRDP clips identically: `progressive_process_tiles`
+    /// intersects each tile rect with the region rect union and blits only the
+    /// intersection. Empty = decode-only, commit nothing.
+    pub clips: Vec<TileClip>,
+}
+
+/// A surface-pixel-coordinate rectangle to commit from a [`DecodedTile`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileClip {
+    /// Left edge in surface pixels.
+    pub x: u16,
+    /// Top edge in surface pixels.
+    pub y: u16,
+    /// Width in pixels.
+    pub w: u16,
+    /// Height in pixels.
+    pub h: u16,
 }
 
 /// Per-axis cap on surface dimensions, in pixels.
@@ -1222,13 +1277,21 @@ impl ProgressiveDecoder {
             let prog_quant_vals = &region.quant_prog_vals;
 
             for tile_block in &region.tiles {
-                let tiles = decode_tile_block(
+                let mut tiles = decode_tile_block(
                     &mut context.surface,
                     tile_block,
                     quant_vals,
                     prog_quant_vals,
                     use_reduce_extrapolate,
                 )?;
+                // Clip each decoded 64x64 tile to the region's dirty rectangles.
+                // The tile is fully decoded above (coefficient state updated);
+                // only the intersection with the region rects may be committed.
+                // Matches FreeRDP `progressive_process_tiles` (intersect tile
+                // rect with the region rect union, blit only the overlap).
+                for t in &mut tiles {
+                    t.clips = clip_tile_to_rects(t.x_idx, t.y_idx, &region.rects, surface_width, surface_height);
+                }
                 decoded_tiles.extend(tiles);
             }
         }
@@ -1286,6 +1349,56 @@ fn progressive_quant_for(
     Ok([pq.y_quant, pq.cb_quant, pq.cr_quant])
 }
 
+/// Intersect a tile's 64x64 surface footprint with a region's dirty rectangles.
+///
+/// Returns the overlap spans in **surface pixel coordinates**, each already
+/// clamped to the surface bounds. `rects` are the `RFX_PROGRESSIVE_REGION`
+/// rects (surface pixels, `x/y/width/height`). An empty result means the tile
+/// is decoded but nothing is committed (it lies entirely outside the region).
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "intersection coordinates are bounded by surface dims (<= 32768), so u16 casts cannot truncate"
+)]
+fn clip_tile_to_rects(
+    x_idx: u16,
+    y_idx: u16,
+    rects: &[ironrdp_pdu::codecs::rfx::RfxRectangle],
+    surface_width: u16,
+    surface_height: u16,
+) -> Vec<TileClip> {
+    let tx0 = u32::from(x_idx) * 64;
+    let ty0 = u32::from(y_idx) * 64;
+    let tx1 = (tx0 + 64).min(u32::from(surface_width));
+    let ty1 = (ty0 + 64).min(u32::from(surface_height));
+    if tx1 <= tx0 || ty1 <= ty0 {
+        return Vec::new();
+    }
+
+    let mut clips = Vec::new();
+    for r in rects {
+        let rx0 = u32::from(r.x);
+        let ry0 = u32::from(r.y);
+        let rx1 = rx0 + u32::from(r.width);
+        let ry1 = ry0 + u32::from(r.height);
+
+        let ix0 = tx0.max(rx0);
+        let iy0 = ty0.max(ry0);
+        let ix1 = tx1.min(rx1);
+        let iy1 = ty1.min(ry1);
+        if ix1 > ix0 && iy1 > iy0 {
+            // All values are < surface dims (<= 32768) so u16 casts are safe.
+            clips.push(TileClip {
+                x: ix0 as u16,
+                y: iy0 as u16,
+                w: (ix1 - ix0) as u16,
+                h: (iy1 - iy0) as u16,
+            });
+        }
+    }
+    clips
+}
+
 fn decode_tile_block(
     surface: &mut SurfaceTiles,
     tile_block: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>,
@@ -1331,7 +1444,7 @@ fn decode_tile_block(
             let mut pixels = vec![0u8; 64 * 64 * 4];
             tile_state.reconstruct_to_rgba(&mut pixels);
 
-            Ok(vec![DecodedTile { x_idx, y_idx, pixels }])
+            Ok(vec![DecodedTile { x_idx, y_idx, pixels, clips: Vec::new() }])
         }
 
         ProgressiveTile::First(tile) => {
@@ -1368,7 +1481,7 @@ fn decode_tile_block(
             let mut pixels = vec![0u8; 64 * 64 * 4];
             tile_state.reconstruct_to_rgba(&mut pixels);
 
-            Ok(vec![DecodedTile { x_idx, y_idx, pixels }])
+            Ok(vec![DecodedTile { x_idx, y_idx, pixels, clips: Vec::new() }])
         }
 
         ProgressiveTile::Upgrade(tile) => {
@@ -1396,7 +1509,7 @@ fn decode_tile_block(
             let mut pixels = vec![0u8; 64 * 64 * 4];
             tile_state.reconstruct_to_rgba(&mut pixels);
 
-            Ok(vec![DecodedTile { x_idx, y_idx, pixels }])
+            Ok(vec![DecodedTile { x_idx, y_idx, pixels, clips: Vec::new() }])
         }
     }
 }
@@ -1766,9 +1879,25 @@ mod tests {
         let srl_data = vec![0b01000000, 0x00]; // sign=0(+), magnitude bits follow
         let raw_data = vec![];
 
+        // Base quant (arbitrary, non-zero) — decode_upgrade_pass now shifts by
+        // base + curr_prog - 1 (FreeRDP-faithful), so it needs the base table.
+        let base_quant = ComponentCodecQuant {
+            ll3: 6,
+            hl3: 6,
+            lh3: 6,
+            hh3: 6,
+            hl2: 6,
+            lh2: 6,
+            hh2: 6,
+            hl1: 6,
+            lh1: 6,
+            hh1: 6,
+        };
+
         decode_upgrade_pass(
             &srl_data,
             &raw_data,
+            &base_quant,
             &prev_prog_quant,
             &curr_prog_quant,
             false,
@@ -1781,14 +1910,18 @@ mod tests {
     }
 
     /// Regression: the SRL and raw streams of a component's upgrade pass are
-    /// consumed CONTINUOUSLY across all subbands. When more than one band has
-    /// refinement bits (as in a lossless upgrade), re-reading either stream from
-    /// offset 0 per band corrupts every band after the first — the live-only,
-    /// upgrade-pass-only chroma "speckle". This round-trips coefficients spread
-    /// across several bands, all zero-DAS, so both the multi-band SRL continuity
-    /// and the exact reconstruction are exercised. With the old per-band-reset
-    /// decoder the later bands decode garbage and this fails.
+    /// consumed CONTINUOUSLY across all subbands.
+    ///
+    /// IGNORED: `decode_upgrade_pass` was rewritten to faithfully match FreeRDP
+    /// `progressive_rfx_upgrade_block`/`progressive_rfx_srl_read` (shift =
+    /// base+prog-1, LL3 all-raw, capped-unary SRL), which the synthetic,
+    /// client-side-only `encode_upgrade_pass`/`encode_srl_continuous` no longer
+    /// mirror (they still implement the previous non-spec scheme). The decoder is
+    /// now verified against real Windows progressive frames by the `prog_check`
+    /// example (prog-set golden set), which supersedes this self-consistent
+    /// round-trip. Re-enable only after rewriting the encoder to match FreeRDP.
     #[test]
+    #[ignore = "encoder not yet rewritten to match the FreeRDP-faithful decoder; see prog_check"]
     fn upgrade_pass_round_trips_across_multiple_bands() {
         // All 10 bands refine by num_bits = prev(5) - curr(3) = 2.
         let prev_prog_quant = ComponentCodecQuant {
@@ -1850,9 +1983,11 @@ mod tests {
 
         let mut decoded = vec![0i16; 4096];
         let mut decoded_sign = vec![SIGN_ZERO; 4096];
+        let base_quant = ComponentCodecQuant::LOSSLESS;
         decode_upgrade_pass(
             &srl_data,
             &raw_data,
+            &base_quant,
             &prev_prog_quant,
             &curr_prog_quant,
             false,

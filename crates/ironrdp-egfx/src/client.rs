@@ -989,32 +989,39 @@ impl GraphicsPipelineClient {
         };
 
         for tile in tiles {
-            let left = tile.x_idx.saturating_mul(64);
-            let top = tile.y_idx.saturating_mul(64);
-            let width = surface_width.saturating_sub(left).min(64);
-            let height = surface_height.saturating_sub(top).min(64);
-            if width == 0 || height == 0 {
-                continue;
+            // Commit ONLY the region-clipped spans. A full-quality single-pass
+            // tile covers all 64x64, but the server marks only a small rect
+            // dirty; committing the whole tile would splat uniform/stale pixels
+            // over untouched wallpaper (the quality-0xFF "white splat"). The tile
+            // is already fully decoded (coefficient state updated) inside
+            // `decode_bitmap`; `tile.clips` are the tile ∩ region-rect overlaps in
+            // surface coordinates. FreeRDP clips identically in
+            // `progressive_process_tiles`.
+            let tile_left = tile.x_idx.saturating_mul(64);
+            let tile_top = tile.y_idx.saturating_mul(64);
+            for clip in &tile.clips {
+                if clip.w == 0 || clip.h == 0 {
+                    continue;
+                }
+                // Offset of this clip within the tile's own 64x64 pixel buffer.
+                let lx = clip.x.saturating_sub(tile_left);
+                let ly = clip.y.saturating_sub(tile_top);
+                let data = subrect_rgba(&tile.pixels, 64, lx, ly, clip.w, clip.h);
+                let update = BitmapUpdate {
+                    surface_id: pdu.surface_id,
+                    destination_rectangle: ExclusiveRectangle {
+                        left: clip.x,
+                        top: clip.y,
+                        right: clip.x.saturating_add(clip.w),
+                        bottom: clip.y.saturating_add(clip.h),
+                    },
+                    codec_id: Codec1Type::Uncompressed,
+                    data,
+                    width: clip.w,
+                    height: clip.h,
+                };
+                self.handler.on_bitmap_updated(&update);
             }
-            let data = if width == 64 && height == 64 {
-                tile.pixels
-            } else {
-                crop_decoded_frame(&tile.pixels, 64, 64, width, height)
-            };
-            let update = BitmapUpdate {
-                surface_id: pdu.surface_id,
-                destination_rectangle: ExclusiveRectangle {
-                    left,
-                    top,
-                    right: left + width,
-                    bottom: top + height,
-                },
-                codec_id: Codec1Type::Uncompressed,
-                data,
-                width,
-                height,
-            };
-            self.handler.on_bitmap_updated(&update);
         }
         Ok(())
     }
@@ -1238,6 +1245,23 @@ fn convert_uncompressed_to_rgba(src: &[u8]) -> Vec<u8> {
 /// H.264 frames are macroblock-aligned (16x16), so decoded frames
 /// may be larger than the destination rectangle. This function
 /// extracts the top-left region matching the target size.
+/// Extract a `w`x`h` RGBA sub-rectangle at (`x`, `y`) from a `src_w`-pixel-wide
+/// RGBA buffer (4 bytes/pixel). Used to commit only the region-clipped span of a
+/// decoded 64x64 progressive tile. Rows past the end of `src` are skipped.
+fn subrect_rgba(src: &[u8], src_w: u16, x: u16, y: u16, w: u16, h: u16) -> Vec<u8> {
+    let src_w = usize::from(src_w);
+    let (x, y, w, h) = (usize::from(x), usize::from(y), usize::from(w), usize::from(h));
+    let mut out = Vec::with_capacity(w.saturating_mul(h).saturating_mul(4));
+    for row in 0..h {
+        let start = ((y + row) * src_w + x) * 4;
+        let end = start + w * 4;
+        if end <= src.len() {
+            out.extend_from_slice(&src[start..end]);
+        }
+    }
+    out
+}
+
 fn crop_decoded_frame(
     data: &[u8],
     decoded_width: u32,
