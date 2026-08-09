@@ -14,10 +14,12 @@
 
 mod cfg;
 mod clipboard;
+mod connector;
 mod displaycontrol;
 mod dvc;
 mod echo;
 mod egfx;
+mod error;
 mod fuzz_regression;
 mod graphics;
 mod input;
@@ -32,3 +34,4 @@ mod server;
 mod server_name;
 mod session;
 mod str_types;
+mod svc;

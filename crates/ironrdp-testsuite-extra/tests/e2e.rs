@@ -1,5 +1,6 @@
 // FIXME: tests in this module can probably be rewritten to be much shorter using the ironrdp-client crate.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::path::Path;
 use std::sync::Arc;
@@ -7,21 +8,29 @@ use std::time::Instant;
 
 use anyhow::Result;
 use ironrdp::connector;
+use ironrdp::core::Encode as _;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::echo::client::EchoClient;
+use ironrdp::pdu::bitmap::{BitmapData, BitmapUpdateData, Compression};
+use ironrdp::pdu::fast_path::{EncryptionFlags, FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode};
+use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
+use ironrdp::pdu::rdp::client_info::CompressionType as PduCompressionType;
+use ironrdp::pdu::rdp::headers::CompressionFlags;
 use ironrdp::pdu::{self, gcc};
 use ironrdp::server::{
     self, DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, PixelFormat, RdpServer, RdpServerDisplay,
     RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, TlsIdentityCtx,
 };
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{self, ActiveStage, ActiveStageOutput};
+use ironrdp::session::{self, ActiveStage, ActiveStageBuilder, ActiveStageOutput};
+use ironrdp::svc::StaticChannelSet;
 use ironrdp_async::{Framed, FramedWrite as _};
+use ironrdp_bulk::{BulkCompressor, CompressionType as BulkCompressionType, flags as bulk_flags};
 use ironrdp_testsuite_extra as _;
 use ironrdp_tls::TlsStream;
 use ironrdp_tokio::TokioStream;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, oneshot};
 use tracing::debug;
@@ -33,9 +42,10 @@ const PASSWORD: &str = "";
 
 #[tokio::test]
 async fn test_client_server() {
-    client_server(default_client_config(), |stage, framed, _display_tx| async {
-        (stage, framed)
-    })
+    client_server(
+        default_client_config(),
+        |stage, _activation_factory, framed, _display_tx| async { (stage, framed) },
+    )
     .await
 }
 
@@ -47,78 +57,159 @@ async fn test_deactivation_reactivation() {
         client_config.desktop_size.width,
         client_config.desktop_size.height,
     );
-    client_server(client_config, |mut stage, mut framed, display_tx| async move {
-        display_tx
-            .send(DisplayUpdate::Resize(DesktopSize {
-                width: 2048,
-                height: 2048,
-            }))
-            .unwrap();
-        {
-            let (action, payload) = framed.read_pdu().await.expect("valid PDU");
-            let outputs = stage.process(&mut image, action, &payload).expect("stage process");
-            let out = outputs.into_iter().next().unwrap();
-            match out {
-                ActiveStageOutput::DeactivateAll(mut connection_activation) => {
-                    // TODO: factor this out in common client code
-                    // Execute the Deactivation-Reactivation Sequence:
-                    // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
-                    debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
-                    let mut buf = pdu::WriteBuf::new();
-                    'activation_seq: loop {
-                        let written = ironrdp_async::single_sequence_step_read(
-                            &mut framed,
-                            &mut *connection_activation,
-                            &mut buf,
-                        )
-                        .await
-                        .map_err(|e| session::custom_err!("read deactivation-reactivation sequence step", e))
-                        .unwrap();
+    client_server(
+        client_config,
+        |mut stage, activation_factory, mut framed, display_tx| async move {
+            display_tx
+                .send(DisplayUpdate::Resize(DesktopSize {
+                    width: 2048,
+                    height: 2048,
+                }))
+                .unwrap();
+            {
+                let (action, payload) = framed.read_pdu().await.expect("valid PDU");
+                let outputs = stage.process(&mut image, action, &payload).expect("stage process");
+                let out = outputs.into_iter().next().unwrap();
+                match out {
+                    ActiveStageOutput::DeactivateAll => {
+                        // TODO: factor this out in common client code
+                        // Execute the Deactivation-Reactivation Sequence:
+                        // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
+                        debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
+                        let mut connection_activation = activation_factory.create();
+                        let mut buf = pdu::WriteBuf::new();
+                        'activation_seq: loop {
+                            let written = ironrdp_async::single_sequence_step_read(
+                                &mut framed,
+                                &mut connection_activation,
+                                &mut buf,
+                            )
+                            .await
+                            .map_err(|e| session::custom_err!("read deactivation-reactivation sequence step", e))
+                            .unwrap();
 
-                        if written.size().is_some() {
-                            framed
-                                .write_all(buf.filled())
-                                .await
-                                .map_err(|e| session::custom_err!("write deactivation-reactivation sequence step", e))
-                                .unwrap();
-                        }
+                            if written.size().is_some() {
+                                framed
+                                    .write_all(buf.filled())
+                                    .await
+                                    .map_err(|e| {
+                                        session::custom_err!("write deactivation-reactivation sequence step", e)
+                                    })
+                                    .unwrap();
+                            }
 
-                        if let connector::connection_activation::ConnectionActivationState::Finalized {
-                            io_channel_id,
-                            user_channel_id,
-                            desktop_size,
-                            share_id,
-                            enable_server_pointer,
-                            pointer_software_rendering,
-                        } = connection_activation.connection_activation_state()
-                        {
-                            debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
-                            // Update image size with the new desktop size.
-                            // image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
-                            // Update the active stage with the new channel IDs and pointer settings.
-                            stage.set_fastpath_processor(
-                                session::fast_path::ProcessorBuilder {
-                                    io_channel_id,
-                                    user_channel_id,
+                            if let connector::connection_activation::ConnectionActivationState::Finalized {
+                                desktop_size,
+                                share_id,
+                                input_flags: _,
+                                enable_server_pointer,
+                                pointer_software_rendering,
+                                ..
+                            } = connection_activation.connection_activation_state()
+                            {
+                                debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
+                                // Update image size with the new desktop size.
+                                // image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+                                // Update the active stage with the new channel IDs and pointer settings.
+                                stage.reactivate(
+                                    connection_activation.io_channel_id(),
+                                    connection_activation.user_channel_id(),
                                     share_id,
                                     enable_server_pointer,
                                     pointer_software_rendering,
-                                    bulk_decompressor: None,
-                                }
-                                .build(),
-                            );
-                            stage.set_share_id(share_id);
-                            stage.set_enable_server_pointer(enable_server_pointer);
-                            break 'activation_seq;
+                                );
+                                break 'activation_seq;
+                            }
                         }
                     }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
             }
-        }
-        (stage, framed)
-    })
+            (stage, framed)
+        },
+    )
     .await
+}
+
+#[test]
+fn test_reactivation_preserves_bulk_decompression_history() {
+    let mut stage = ActiveStageBuilder {
+        static_channels: StaticChannelSet::new(),
+        user_channel_id: 1001,
+        io_channel_id: 1003,
+        message_channel_id: None,
+        share_id: 1,
+        compression_type: Some(PduCompressionType::K64),
+        enable_server_pointer: false,
+        pointer_software_rendering: false,
+    }
+    .build();
+
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 4, 4);
+    let mut compressor = BulkCompressor::new(BulkCompressionType::Rdp5);
+    let (first_frame, first_flags) = compressed_bitmap_fastpath_frame(&mut compressor);
+    assert_ne!(first_flags & bulk_flags::PACKET_COMPRESSED, 0);
+
+    stage
+        .process(&mut image, pdu::Action::FastPath, &first_frame)
+        .expect("compressed FastPath update before reactivation");
+
+    stage.reactivate(1003, 1001, 2, false, false);
+
+    let (second_frame, second_flags) = compressed_bitmap_fastpath_frame(&mut compressor);
+    assert_ne!(second_flags & bulk_flags::PACKET_COMPRESSED, 0);
+    assert_eq!(
+        second_flags & (bulk_flags::PACKET_FLUSHED | bulk_flags::PACKET_AT_FRONT),
+        0
+    );
+
+    let outputs = stage
+        .process(&mut image, pdu::Action::FastPath, &second_frame)
+        .expect("compressed FastPath update referencing pre-reactivation history");
+
+    assert!(
+        outputs
+            .iter()
+            .any(|output| matches!(output, ActiveStageOutput::GraphicsUpdate(_)))
+    );
+}
+
+fn compressed_bitmap_fastpath_frame(compressor: &mut BulkCompressor) -> (Vec<u8>, u32) {
+    let bitmap = BitmapUpdateData {
+        rectangles: vec![BitmapData {
+            rectangle: InclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 3,
+                bottom: 3,
+            },
+            width: 4,
+            height: 4,
+            bits_per_pixel: 32,
+            compression_flags: Compression::empty(),
+            compressed_data_header: None,
+            bitmap_data: &[0x40; 64],
+        }],
+    };
+    let bitmap_data = ironrdp::core::encode_vec(&bitmap).expect("encode bitmap update");
+
+    let (compressed_size, flags) = compressor.compress(&bitmap_data).expect("compress bitmap update");
+
+    let compressed_data = compressor.compressed_data(compressed_size);
+    let update = FastPathUpdatePdu {
+        fragmentation: Fragmentation::Single,
+        update_code: UpdateCode::Bitmap,
+        compression_flags: Some(CompressionFlags::from_bits_retain(
+            u8::try_from(flags & !bulk_flags::COMPRESSION_TYPE_MASK).expect("compression flags fit in u8"),
+        )),
+        compression_type: Some(PduCompressionType::K64),
+        data: compressed_data,
+    };
+    let header = FastPathHeader::new(EncryptionFlags::empty(), update.size());
+
+    let mut frame = ironrdp::core::encode_vec(&header).expect("encode FastPath header");
+    frame.extend(ironrdp::core::encode_vec(&update).expect("encode FastPath update"));
+    (frame, flags)
 }
 
 #[tokio::test]
@@ -129,7 +220,7 @@ async fn test_echo_virtual_channel_end_to_end() {
     client_server_with_connector(
         default_client_config(),
         |connector| connector.with_static_channel(DrdynvcClient::new().with_dynamic_channel(EchoClient::new())),
-        move |mut stage, mut framed, display_tx, echo_handle| async move {
+        move |mut stage, _activation_factory, mut framed, display_tx, echo_handle| async move {
             let _display_tx = display_tx;
             let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
 
@@ -175,6 +266,63 @@ async fn test_echo_virtual_channel_end_to_end() {
     .await
 }
 
+#[tokio::test]
+async fn tls_validation_preserves_the_default_and_strict_is_explicit() {
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind TLS test listener");
+    let address = listener.local_addr().expect("TLS test listener address");
+
+    let server = tokio::spawn(async move {
+        for expected_success in [true, false, true] {
+            let (stream, _) = listener.accept().await.expect("accept TLS test connection");
+            let result = acceptor.accept(stream).await;
+            assert_eq!(result.is_ok(), expected_success);
+        }
+    });
+
+    let (tls_stream, _) = ironrdp_tls::upgrade(
+        TcpStream::connect(address).await.expect("connect default TLS client"),
+        "localhost",
+    )
+    .await
+    .expect("default validation accepts the self-signed test certificate");
+    drop(tls_stream);
+
+    let strict_result = ironrdp_tls::upgrade_with_certificate_validation(
+        TcpStream::connect(address).await.expect("connect strict TLS client"),
+        "localhost",
+        ironrdp_tls::CertificateValidation::Strict,
+    )
+    .await;
+    assert!(
+        strict_result.is_err(),
+        "strict validation must reject the self-signed test certificate"
+    );
+
+    let callback_called = Arc::new(AtomicBool::new(false));
+    let callback_called_for_callback = Arc::clone(&callback_called);
+    let callback: ironrdp_tls::CertificateValidationCallback = Arc::new(move |certificate, reason| {
+        callback_called_for_callback.store(true, Ordering::Relaxed);
+        !certificate.is_empty() && !reason.is_empty()
+    });
+    let (tls_stream, _) = ironrdp_tls::upgrade_with_certificate_validation_callback(
+        TcpStream::connect(address).await.expect("connect callback TLS client"),
+        "localhost",
+        callback,
+    )
+    .await
+    .expect("TLS callback accepts the self-signed test certificate");
+    drop(tls_stream);
+
+    assert!(callback_called.load(Ordering::Relaxed));
+    server.await.expect("TLS test server task");
+}
+
 type DisplayUpdatesRx = Arc<Mutex<UnboundedReceiver<DisplayUpdate>>>;
 
 struct TestDisplayUpdates {
@@ -218,13 +366,21 @@ impl RdpServerInputHandler for TestInputHandler {
 
 async fn client_server<F, Fut>(client_config: connector::Config, clientfn: F)
 where
-    F: FnOnce(ActiveStage, Framed<TokioStream<TlsStream<TcpStream>>>, UnboundedSender<DisplayUpdate>) -> Fut + 'static,
+    F: FnOnce(
+            ActiveStage,
+            connector::connection_activation::ConnectionActivationFactory,
+            Framed<TokioStream<TlsStream<TcpStream>>>,
+            UnboundedSender<DisplayUpdate>,
+        ) -> Fut
+        + 'static,
     Fut: Future<Output = (ActiveStage, Framed<TokioStream<TlsStream<TcpStream>>>)>,
 {
     client_server_with_connector(
         client_config,
         |connector| connector,
-        move |stage, framed, display_tx, _echo_handle| clientfn(stage, framed, display_tx),
+        move |stage, connection_activation, framed, display_tx, _echo_handle| {
+            clientfn(stage, connection_activation, framed, display_tx)
+        },
     )
     .await;
 }
@@ -233,6 +389,7 @@ async fn client_server_with_connector<F, Fut, C>(client_config: connector::Confi
 where
     F: FnOnce(
             ActiveStage,
+            connector::connection_activation::ConnectionActivationFactory,
             Framed<TokioStream<TlsStream<TcpStream>>>,
             UnboundedSender<DisplayUpdate>,
             server::EchoServerHandle,
@@ -241,6 +398,7 @@ where
     Fut: Future<Output = (ActiveStage, Framed<TokioStream<TlsStream<TcpStream>>>)>,
     C: FnOnce(connector::ClientConnector) -> connector::ClientConnector + 'static,
 {
+    // FIXME(@CBenoit): If this is really necessary, we may consider a non-global way of registering the subscriber; otherwise it’s unnecessary to register that.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
@@ -287,9 +445,13 @@ where
                     .await
                     .expect("begin connection");
                 let initial_stream = framed.into_inner_no_leftover();
-                let (upgraded_stream, tls_cert) = ironrdp_tls::upgrade(initial_stream, "localhost")
-                    .await
-                    .expect("TLS upgrade");
+                let (upgraded_stream, tls_cert) = ironrdp_tls::upgrade_with_certificate_validation(
+                    initial_stream,
+                    "localhost",
+                    ironrdp_tls::CertificateValidation::DangerouslyAcceptInvalidCertificate,
+                )
+                .await
+                .expect("TLS upgrade");
                 let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
                 let mut upgraded_framed = ironrdp_tokio::TokioFramed::new(upgraded_stream);
                 let server_public_key =
@@ -306,9 +468,28 @@ where
                 .await
                 .expect("finalize connection");
 
-                let active_stage = ActiveStage::new(connection_result);
-                let (active_stage, mut upgraded_framed) =
-                    clientfn(active_stage, upgraded_framed, display_tx, echo_handle).await;
+                // Retain the connection activation factory so the client closure can drive its own
+                // Deactivation-Reactivation Sequence.
+                let activation_factory = connection_result.activation_factory;
+                let active_stage = ActiveStageBuilder {
+                    static_channels: connection_result.static_channels,
+                    user_channel_id: connection_result.user_channel_id,
+                    io_channel_id: connection_result.io_channel_id,
+                    message_channel_id: connection_result.message_channel_id,
+                    share_id: connection_result.share_id,
+                    compression_type: connection_result.compression_type,
+                    enable_server_pointer: connection_result.enable_server_pointer,
+                    pointer_software_rendering: connection_result.pointer_software_rendering,
+                }
+                .build();
+                let (active_stage, mut upgraded_framed) = clientfn(
+                    active_stage,
+                    activation_factory,
+                    upgraded_framed,
+                    display_tx,
+                    echo_handle,
+                )
+                .await;
                 let outputs = active_stage.graceful_shutdown().expect("shutdown");
                 for out in outputs {
                     match out {
@@ -340,6 +521,7 @@ fn default_client_config() -> connector::Config {
         desktop_scale_factor: 0, // Default to 0 per FreeRDP
         enable_tls: true,
         enable_credssp: true,
+        enable_standard_rdp_security: false,
         credentials: connector::Credentials::UsernamePassword {
             username: USERNAME.into(),
             password: PASSWORD.into(),
@@ -355,6 +537,7 @@ fn default_client_config() -> connector::Config {
         keyboard_subtype: 0,
         keyboard_layout: 0,
         keyboard_functional_keys_count: 12,
+        connection_type: gcc::ConnectionType::Lan,
         ime_file_name: "".into(),
         bitmap: None,
         dig_product_id: "".into(),

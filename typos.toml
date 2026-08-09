@@ -27,6 +27,14 @@ alikes = "alikes"
 Imagesetter = "Imagesetter"
 # Windows Plug and Play field names use this abbreviation.
 Pn = "Pn"
+# "writeable" is an accepted alternate spelling of "writable".
+writeable = "writeable"
+
+[default.extend-identifiers]
+# COM FORMATETC target-device field.
+ptd = "ptd"
+# Windows TRACKMOUSEEVENT flag.
+TME_LEAVE = "TME_LEAVE"
 
 [default]
 extend-ignore-re = [

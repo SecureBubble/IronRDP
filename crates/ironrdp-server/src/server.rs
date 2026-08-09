@@ -4,6 +4,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::time::Duration;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
 use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
@@ -26,6 +28,7 @@ use ironrdp_pdu::{Action, PduResult, decode_err, mcs, nego, rdp};
 use ironrdp_rdpsnd as rdpsnd;
 use ironrdp_svc::{ChannelFlags, StaticChannelId, StaticChannelSet, SvcProcessor, server_encode_svc_messages};
 use ironrdp_tokio::{FramedRead, FramedWrite, TokioFramed, split_tokio_framed, unsplit_tokio_framed};
+use rand::RngCore as _;
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpSocket;
@@ -46,6 +49,17 @@ use crate::{SoundServerFactory, builder, capabilities};
 
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
+const AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Monotonic milliseconds since first use, for feeding the auto-detect state machine.
+///
+/// The clock lives here, in the I/O driver, rather than inside [`AutoDetectManager`]:
+/// the state machine takes timestamps as arguments so it stays free of ambient time.
+/// Only differences are meaningful, so the epoch is arbitrary.
+fn monotonic_now_ms() -> u64 {
+    static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+    u64::try_from(EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Action to take after a client disconnects.
 ///
@@ -224,12 +238,15 @@ pub struct RdpServerOptions {
     pub security: RdpServerSecurity,
     pub codecs: BitmapCodecs,
     pub max_request_size: u32,
-    /// When `true`, each connection's acceptor adopts the desktop size the
-    /// client requests in its Client Core Data (instead of the size reported
-    /// by the display handler), negotiating that size from the start without a
-    /// Deactivation-Reactivation resize. Defaults to `false`. Set via
+    /// When `Some(max)`, each connection's acceptor adopts the desktop size the
+    /// client requests in its Client Core Data (instead of the size reported by
+    /// the display handler), negotiating that size from the start without a
+    /// Deactivation-Reactivation resize. The request is clamped per dimension to
+    /// `max` so an untrusted client can't drive the framebuffer/encoder
+    /// allocation past that ceiling. `None` (the default) always enforces the
+    /// server-provided size. Set via
     /// [`RdpServerBuilder::with_honor_client_desktop_size`](crate::RdpServerBuilder::with_honor_client_desktop_size).
-    pub honor_client_desktop_size: bool,
+    pub honor_client_desktop_size: Option<DesktopSize>,
 }
 
 impl RdpServerOptions {
@@ -470,20 +487,80 @@ pub struct RdpServer {
     /// so display backends can read a fresh, frame-traffic-independent network
     /// RTT for flow control.
     autodetect_rtt: Arc<AtomicU32>,
+
+    /// Optional Server Auto-Reconnect Cookie (MS-RDPBCGR 2.2.4.2
+    /// `ARC_SC_PRIVATE_PACKET`). When `Some`, the server validates a returning
+    /// `ARC_CS_PRIVATE_PACKET`, replaces its random after every connection, and
+    /// sends hourly updates to the active client. This requires TLS or Hybrid
+    /// security, which provides the all-zero client random required for Enhanced
+    /// RDP Security. `None` (the default) disables automatic reconnection.
+    /// Configure it on the builder
+    /// ([`RdpServer::builder`]) via `with_auto_reconnect_cookie`, or after
+    /// construction via [`Self::set_auto_reconnect_cookie`].
+    auto_reconnect_cookie: Option<rdp::session_info::ServerAutoReconnect>,
+    /// The cookie replaced by the current one, accepted until the next rotation.
+    ///
+    /// A successful socket write does not prove the client received the
+    /// replacement. Retaining one previous value lets a client that disconnects
+    /// during that window reconnect with the last cookie it knows.
+    previous_auto_reconnect_cookie: Option<rdp::session_info::ServerAutoReconnect>,
+    /// Tracks whether the current cookie has reached a client. Subsequent
+    /// connections and hourly updates replace it with a new random.
+    auto_reconnect_sent: bool,
 }
 
-#[derive(Debug)]
+/// Cloneable handle for updating the Server Auto-Reconnect Cookie while
+/// [`RdpServer::run`] owns the server.
+#[derive(Clone)]
+pub struct AutoReconnectCookieHandle {
+    sender: mpsc::UnboundedSender<ServerEvent>,
+}
+
+impl AutoReconnectCookieHandle {
+    /// Queue a replacement cookie for the active client or the next connection.
+    ///
+    /// The change takes effect only after the server handles this event. `None`
+    /// then disables auto-reconnect and invalidates every cookie currently held
+    /// by the server.
+    pub fn set(
+        &self,
+        cookie: Option<rdp::session_info::ServerAutoReconnect>,
+    ) -> Result<(), mpsc::error::SendError<ServerEvent>> {
+        self.sender.send(ServerEvent::SetAutoReconnectCookie(cookie))
+    }
+}
+
 pub enum ServerEvent {
     Quit(String),
     Clipboard(ClipboardMessage),
     Rdpsnd(RdpsndServerMessage),
     Echo(EchoServerMessage),
     SetCredentials(Credentials),
+    /// Replace or clear the Server Auto-Reconnect Cookie.
+    SetAutoReconnectCookie(Option<rdp::session_info::ServerAutoReconnect>),
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
     #[cfg(feature = "egfx")]
     Egfx(EgfxServerMessage),
     /// Trigger an RTT measurement probe (requires auto-detect enabled).
     AutoDetectRttRequest,
+}
+
+impl fmt::Debug for ServerEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Quit(reason) => f.debug_tuple("Quit").field(reason).finish(),
+            Self::Clipboard(..) => f.write_str("Clipboard(..)"),
+            Self::Rdpsnd(..) => f.write_str("Rdpsnd(..)"),
+            Self::Echo(..) => f.write_str("Echo(..)"),
+            Self::SetCredentials(..) => f.write_str("SetCredentials(..)"),
+            Self::SetAutoReconnectCookie(Some(..)) => f.write_str("SetAutoReconnectCookie(Some(..))"),
+            Self::SetAutoReconnectCookie(None) => f.write_str("SetAutoReconnectCookie(None)"),
+            Self::GetLocalAddr(..) => f.write_str("GetLocalAddr(..)"),
+            #[cfg(feature = "egfx")]
+            Self::Egfx(..) => f.write_str("Egfx(..)"),
+            Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
+        }
+    }
 }
 
 pub trait ServerEventSender {
@@ -556,6 +633,9 @@ impl RdpServer {
                 handle.store(u32::MAX, Ordering::Relaxed);
                 handle
             },
+            auto_reconnect_cookie: None,
+            previous_auto_reconnect_cookie: None,
+            auto_reconnect_sent: false,
         }
     }
 
@@ -572,6 +652,10 @@ impl RdpServer {
     /// the connection is rejected. Passing `None` clears any previously
     /// configured validator.
     ///
+    /// A valid Server Auto-Reconnect Cookie bypasses this validator. Applications
+    /// that must validate every connection should leave automatic reconnection
+    /// disabled.
+    ///
     /// Most callers should configure the validator at construction time via
     /// the builder's `with_credential_validator` method
     /// ([`RdpServer::builder`]); this setter exists for dynamic
@@ -580,6 +664,170 @@ impl RdpServer {
     /// Not used for CredSSP/Hybrid connections (those use pre-loaded credentials).
     pub fn set_credential_validator(&mut self, validator: Option<Arc<dyn CredentialValidator>>) {
         self.credential_validator = validator;
+    }
+
+    /// Set or clear the Server Auto-Reconnect Cookie (MS-RDPBCGR 2.2.4.2
+    /// `ARC_SC_PRIVATE_PACKET`) handed to the client during logon.
+    ///
+    /// When set to `Some`, the server sends a Save Session Info PDU carrying the
+    /// cookie right after activation. It verifies the returned
+    /// `ARC_CS_PRIVATE_PACKET` using the HMAC-MD5 verifier required by
+    /// MS-RDPBCGR 5.5, replaces the random after every accepted connection, and
+    /// sends an update every hour. Automatic reconnection requires TLS or Hybrid
+    /// security, which provides the all-zero client random required for Enhanced
+    /// RDP Security. The [`ServerAutoReconnect`] `logon_id` identifies the
+    /// session; the server generates replacement randoms with a CSPRNG.
+    ///
+    /// Pass `None` (the default) to send no cookie.
+    ///
+    /// Most callers should configure this at construction time via the builder
+    /// ([`RdpServer::builder`])'s `with_auto_reconnect_cookie`. To replace a
+    /// cookie while [`Self::run`] owns the server, use
+    /// [`Self::auto_reconnect_cookie_handle`].
+    ///
+    /// [`ServerAutoReconnect`]: ironrdp_pdu::rdp::session_info::ServerAutoReconnect
+    pub fn set_auto_reconnect_cookie(&mut self, cookie: Option<rdp::session_info::ServerAutoReconnect>) {
+        self.auto_reconnect_cookie = cookie;
+        self.previous_auto_reconnect_cookie = None;
+        self.auto_reconnect_sent = false;
+    }
+
+    /// Returns a handle for replacing the cookie while [`Self::run`] owns this
+    /// server.
+    pub fn auto_reconnect_cookie_handle(&self) -> AutoReconnectCookieHandle {
+        AutoReconnectCookieHandle {
+            sender: self.ev_sender.clone(),
+        }
+    }
+
+    fn supports_auto_reconnect(&self) -> bool {
+        matches!(
+            &self.opts.security,
+            RdpServerSecurity::Tls(_) | RdpServerSecurity::Hybrid(_)
+        )
+    }
+
+    fn verify_auto_reconnect_cookie(&self, reconnect: &rdp::client_info::ClientAutoReconnect) -> bool {
+        if !self.supports_auto_reconnect() {
+            return false;
+        }
+
+        [&self.auto_reconnect_cookie, &self.previous_auto_reconnect_cookie]
+            .into_iter()
+            .flatten()
+            .any(|cookie| reconnect.verify(cookie))
+    }
+
+    fn generate_auto_reconnect_cookie(logon_id: u32) -> rdp::session_info::ServerAutoReconnect {
+        let mut random_bits = [0; 16];
+        rand::rng().fill_bytes(&mut random_bits);
+
+        rdp::session_info::ServerAutoReconnect { logon_id, random_bits }
+    }
+
+    fn next_auto_reconnect_cookie(&self) -> Option<rdp::session_info::ServerAutoReconnect> {
+        if !self.supports_auto_reconnect() {
+            return None;
+        }
+
+        let cookie = self.auto_reconnect_cookie.as_ref()?;
+
+        if self.auto_reconnect_sent {
+            Some(Self::generate_auto_reconnect_cookie(cookie.logon_id))
+        } else {
+            Some(cookie.clone())
+        }
+    }
+
+    fn commit_auto_reconnect_rotation(&mut self, cookie: rdp::session_info::ServerAutoReconnect) {
+        if self.auto_reconnect_sent {
+            self.previous_auto_reconnect_cookie = self.auto_reconnect_cookie.replace(cookie);
+        } else {
+            self.auto_reconnect_cookie = Some(cookie);
+        }
+        self.auto_reconnect_sent = true;
+    }
+    async fn send_auto_reconnect_cookie(
+        cookie: rdp::session_info::ServerAutoReconnect,
+        writer: &mut impl FramedWrite,
+        io_channel_id: u16,
+        user_channel_id: u16,
+    ) -> Result<()> {
+        let pdu = rdp::headers::ShareDataPdu::SaveSessionInfo(rdp::session_info::SaveSessionInfoPdu {
+            info_type: rdp::session_info::InfoType::LogonExtended,
+            info_data: rdp::session_info::InfoData::LogonExtended(rdp::session_info::LogonInfoExtended {
+                present_fields_flags: rdp::session_info::LogonExFlags::AUTO_RECONNECT_COOKIE,
+                auto_reconnect: Some(cookie),
+                errors_info: None,
+            }),
+        });
+        let data = encode_share_data_pdu(pdu, io_channel_id, user_channel_id)?;
+        writer.write_all(&data).await.context("send auto-reconnect cookie")?;
+        debug!("Sent Server Auto-Reconnect Cookie (Save Session Info PDU)");
+
+        Ok(())
+    }
+
+    async fn send_next_auto_reconnect_cookie(
+        &mut self,
+        writer: &mut impl FramedWrite,
+        io_channel_id: u16,
+        user_channel_id: u16,
+    ) -> Result<()> {
+        let Some(cookie) = self.next_auto_reconnect_cookie() else {
+            return Ok(());
+        };
+
+        Self::send_auto_reconnect_cookie(cookie.clone(), writer, io_channel_id, user_channel_id).await?;
+        self.commit_auto_reconnect_rotation(cookie);
+
+        Ok(())
+    }
+
+    async fn rotate_auto_reconnect_cookie(
+        &mut self,
+        writer: &mut impl FramedWrite,
+        io_channel_id: u16,
+        user_channel_id: u16,
+    ) -> Result<()> {
+        if !self.supports_auto_reconnect() {
+            return Ok(());
+        }
+
+        let Some(cookie) = self.auto_reconnect_cookie.as_ref() else {
+            return Ok(());
+        };
+        let cookie = Self::generate_auto_reconnect_cookie(cookie.logon_id);
+
+        Self::send_auto_reconnect_cookie(cookie.clone(), writer, io_channel_id, user_channel_id).await?;
+        self.commit_auto_reconnect_rotation(cookie);
+
+        Ok(())
+    }
+
+    async fn update_auto_reconnect_cookie(
+        &mut self,
+        cookie: Option<rdp::session_info::ServerAutoReconnect>,
+        writer: &mut impl FramedWrite,
+        io_channel_id: u16,
+        user_channel_id: u16,
+    ) -> Result<()> {
+        let Some(cookie) = cookie else {
+            self.set_auto_reconnect_cookie(None);
+            return Ok(());
+        };
+
+        if !self.supports_auto_reconnect() {
+            self.set_auto_reconnect_cookie(Some(cookie));
+            return Ok(());
+        }
+
+        Self::send_auto_reconnect_cookie(cookie.clone(), writer, io_channel_id, user_channel_id).await?;
+        self.auto_reconnect_cookie = Some(cookie);
+        self.previous_auto_reconnect_cookie = None;
+        self.auto_reconnect_sent = true;
+
+        Ok(())
     }
 
     pub fn event_sender(&self) -> &mpsc::UnboundedSender<ServerEvent> {
@@ -949,6 +1197,9 @@ impl RdpServer {
                         ServerEvent::SetCredentials(creds) => {
                             self.set_credentials(Some(creds));
                         }
+                        ServerEvent::SetAutoReconnectCookie(cookie) => {
+                            self.set_auto_reconnect_cookie(cookie);
+                        }
                         ev => {
                             debug!("Unexpected event {:?}", ev);
                         }
@@ -1013,6 +1264,7 @@ impl RdpServer {
         writer: &mut impl FramedWrite,
         io_channel_id: u16,
         user_channel_id: u16,
+        message_channel_id: Option<u16>,
     ) -> Result<RunState> {
         match action {
             Action::FastPath => {
@@ -1022,7 +1274,7 @@ impl RdpServer {
 
             Action::X224 => {
                 if self
-                    .handle_x224(writer, io_channel_id, user_channel_id, &bytes)
+                    .handle_x224(writer, io_channel_id, user_channel_id, message_channel_id, &bytes)
                     .await
                     .context("X224 input error")?
                 {
@@ -1078,6 +1330,7 @@ impl RdpServer {
         writer: &mut impl FramedWrite,
         io_channel_id: u16,
         user_channel_id: u16,
+        message_channel_id: Option<u16>,
     ) -> Result<RunState> {
         // Avoid wave messages queuing up and causing extra delay. When a
         // batch carries more than `WAVE_KEEP` waves, drop the OLDEST ones
@@ -1107,6 +1360,10 @@ impl RdpServer {
                 }
                 ServerEvent::SetCredentials(creds) => {
                     self.set_credentials(Some(creds));
+                }
+                ServerEvent::SetAutoReconnectCookie(cookie) => {
+                    self.update_auto_reconnect_cookie(cookie, writer, io_channel_id, user_channel_id)
+                        .await?;
                 }
                 ServerEvent::Rdpsnd(s) => {
                     let Some(rdpsnd) = self.get_svc_processor::<RdpsndServer>() else {
@@ -1202,14 +1459,14 @@ impl RdpServer {
                     }
                 },
                 ServerEvent::AutoDetectRttRequest => {
-                    if let Some(ref mut ad) = self.autodetect {
-                        ad.expire_stale_probes(crate::autodetect::RTT_PROBE_MAX_AGE);
-                        let request = ad.send_rtt_request();
-                        let data = encode_share_data_pdu(
-                            rdp::headers::ShareDataPdu::AutoDetectReq(request),
-                            io_channel_id,
-                            user_channel_id,
-                        )?;
+                    // Auto-detect requests ride the MCS message channel
+                    // ([MS-RDPBCGR] 2.2.14.3). With none negotiated (the client
+                    // did not request it), there is nowhere to send them.
+                    if let (Some(ad), Some(message_channel_id)) = (self.autodetect.as_mut(), message_channel_id) {
+                        let now_ms = monotonic_now_ms();
+                        ad.expire_stale_probes(now_ms, crate::autodetect::RTT_PROBE_MAX_AGE_MS);
+                        let request = ad.send_rtt_request(now_ms);
+                        let data = encode_autodetect_request(request, message_channel_id, user_channel_id)?;
                         writer.write_all(&data).await?;
                     }
                 }
@@ -1225,6 +1482,7 @@ impl RdpServer {
         writer: &mut Framed<W>,
         io_channel_id: u16,
         user_channel_id: u16,
+        message_channel_id: Option<u16>,
         mut encoder: UpdateEncoder,
     ) -> Result<RunState>
     where
@@ -1236,6 +1494,7 @@ impl RdpServer {
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
+        let mut auto_reconnect_writer = writer.clone();
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let s = Rc::new(Mutex::new(self));
 
@@ -1245,7 +1504,14 @@ impl RdpServer {
                 let (action, bytes) = reader.read_pdu().await?;
                 let mut this = this.lock().await;
                 match this
-                    .dispatch_pdu(action, bytes, &mut writer, io_channel_id, user_channel_id)
+                    .dispatch_pdu(
+                        action,
+                        bytes,
+                        &mut writer,
+                        io_channel_id,
+                        user_channel_id,
+                        message_channel_id,
+                    )
                     .await?
                 {
                     RunState::Continue => continue,
@@ -1304,7 +1570,13 @@ impl RdpServer {
                 }
                 let mut this = this.lock().await;
                 match this
-                    .dispatch_server_events(&mut events, &mut event_writer, io_channel_id, user_channel_id)
+                    .dispatch_server_events(
+                        &mut events,
+                        &mut event_writer,
+                        io_channel_id,
+                        user_channel_id,
+                        message_channel_id,
+                    )
                     .await?
                 {
                     RunState::Continue => continue,
@@ -1313,10 +1585,24 @@ impl RdpServer {
             }
         };
 
+        let this = Rc::clone(&s);
+        let refresh_auto_reconnect_cookie = async move {
+            let mut interval = tokio::time::interval(AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL);
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+                let mut this = this.lock().await;
+                this.rotate_auto_reconnect_cookie(&mut auto_reconnect_writer, io_channel_id, user_channel_id)
+                    .await?;
+            }
+        };
+
         let state = tokio::select!(
             state = dispatch_pdu => state,
             state = dispatch_display => state,
             state = dispatch_events => state,
+            state = refresh_auto_reconnect_cookie => state,
         );
 
         debug!("End of client loop: {state:?}");
@@ -1335,11 +1621,24 @@ impl RdpServer {
     {
         debug!("Client accepted");
 
+        let is_auto_reconnect = if let Some(reconnect) = result.auto_reconnect.as_ref() {
+            if !self.verify_auto_reconnect_cookie(reconnect) {
+                warn!("Auto-reconnect cookie validation rejected");
+                send_access_denied(result.io_channel_id, result.user_channel_id, writer).await?;
+                bail!("auto-reconnect cookie validation rejected");
+            }
+
+            debug!("Auto-reconnect cookie validation accepted");
+            true
+        } else {
+            false
+        };
+
         // Validate credentials if a validator is configured. The validator runs here, in the
         // async server layer, rather than in the sans-I/O acceptor, because real validators
         // (PAM/LDAP/DB) are I/O-bound. On rejection, deny with a ServerSetErrorInfoPdu before
         // closing, matching the acceptor's exact-match denial path.
-        if let Some(validator) = self.credential_validator.clone() {
+        if !is_auto_reconnect && let Some(validator) = self.credential_validator.clone() {
             if let Some(creds) = &result.credentials {
                 match validator.validate(creds).await {
                     Ok(CredentialDecision::Accept) => {
@@ -1367,6 +1666,7 @@ impl RdpServer {
                 writer,
                 result.io_channel_id,
                 result.user_channel_id,
+                result.message_channel_id,
                 result.input_events,
             )
             .await?;
@@ -1374,7 +1674,7 @@ impl RdpServer {
 
         self.static_channels = result.static_channels;
         if !result.reactivation {
-            for (_type_id, channel, channel_id) in self.static_channels.iter_mut() {
+            for (_channel_key, channel, channel_id) in self.static_channels.iter_by_key_mut() {
                 debug!(?channel, ?channel_id, "Start");
                 let Some(channel_id) = channel_id else {
                     continue;
@@ -1474,8 +1774,18 @@ impl RdpServer {
         let encoder = UpdateEncoder::new(desktop_size, surface_flags, update_codecs, self.opts.max_request_size)
             .context("failed to initialize update encoder")?;
 
+        self.send_next_auto_reconnect_cookie(writer, result.io_channel_id, result.user_channel_id)
+            .await?;
+
         let state = self
-            .client_loop(reader, writer, result.io_channel_id, result.user_channel_id, encoder)
+            .client_loop(
+                reader,
+                writer,
+                result.io_channel_id,
+                result.user_channel_id,
+                result.message_channel_id,
+                encoder,
+            )
             .await
             .context("client loop failure")?;
 
@@ -1487,6 +1797,7 @@ impl RdpServer {
         writer: &mut impl FramedWrite,
         io_channel_id: u16,
         user_channel_id: u16,
+        message_channel_id: Option<u16>,
         frames: Vec<Vec<u8>>,
     ) -> Result<()> {
         for frame in frames {
@@ -1497,7 +1808,9 @@ impl RdpServer {
                 }
 
                 Ok(Action::X224) => {
-                    let _ = self.handle_x224(writer, io_channel_id, user_channel_id, &frame).await;
+                    let _ = self
+                        .handle_x224(writer, io_channel_id, user_channel_id, message_channel_id, &frame)
+                        .await;
                 }
 
                 // the frame here is always valid, because otherwise it would
@@ -1557,17 +1870,6 @@ impl RdpServer {
                     return Ok(true);
                 }
 
-                rdp::headers::ShareDataPdu::AutoDetectRsp(response) => {
-                    if let Some(ref mut ad) = self.autodetect {
-                        if let Some(rtt_ms) = ad.handle_response(&response) {
-                            self.autodetect_rtt.store(rtt_ms, Ordering::Relaxed);
-                            debug!(rtt_ms, seq = response.sequence_number(), "RTT measured");
-                        } else {
-                            trace!(seq = response.sequence_number(), "Unmatched auto-detect response");
-                        }
-                    }
-                }
-
                 // Client requests the server stop or resume sending display
                 // updates. mstsc sends `desktop_rect: None` on minimize and
                 // `desktop_rect: Some(rect)` on refocus. Without honoring
@@ -1610,11 +1912,33 @@ impl RdpServer {
         Ok(false)
     }
 
+    fn handle_message_channel_data(&mut self, data: SendDataRequest<'_>) {
+        // The MCS message channel currently carries only the auto-detect
+        // response. It is framed by a Basic Security Header (SEC_AUTODETECT_RSP),
+        // not a Share Control header.
+        match decode::<rdp::autodetect::AutoDetectRspPdu>(data.user_data.as_ref()) {
+            Ok(pdu) => {
+                if let Some(ref mut ad) = self.autodetect {
+                    if let Some(rtt_ms) = ad.handle_response(&pdu.response, monotonic_now_ms()) {
+                        self.autodetect_rtt.store(rtt_ms, Ordering::Relaxed);
+                        debug!(rtt_ms, seq = pdu.response.sequence_number(), "RTT measured");
+                    } else {
+                        trace!(seq = pdu.response.sequence_number(), "Unmatched auto-detect response");
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(error = format!("{error:#}"), "Unhandled MCS message channel PDU");
+            }
+        }
+    }
+
     async fn handle_x224(
         &mut self,
         writer: &mut impl FramedWrite,
         io_channel_id: u16,
         user_channel_id: u16,
+        message_channel_id: Option<u16>,
         frame: &[u8],
     ) -> Result<bool> {
         let message = decode::<X224<mcs::McsMessage<'_>>>(frame)?;
@@ -1628,6 +1952,11 @@ impl RdpServer {
                 );
                 if data.channel_id == io_channel_id {
                     return self.handle_io_channel_data(data).await;
+                }
+
+                if message_channel_id == Some(data.channel_id) {
+                    self.handle_message_channel_data(data);
+                    return Ok(false);
                 }
 
                 if let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) {
@@ -1728,12 +2057,35 @@ impl RdpServer {
     }
 }
 
-/// Encode a server-initiated Share Data PDU for the IO channel.
+/// Encode a server-initiated Auto-Detect Request PDU for the MCS message channel.
 ///
-/// `share_id` is hard-coded to 0, matching the existing convention in
-/// `deactivate_all()`. In practice, RDP clients do not validate `share_id`
-/// on server-initiated PDUs, but a future refactor could thread the
-/// negotiated value from the Demand Active exchange if needed.
+/// The request is framed by a Basic Security Header (SEC_AUTODETECT_REQ) per
+/// [MS-RDPBCGR] 2.2.14.3 and carried in an MCS Send Data Indication on the
+/// negotiated message channel, not as a Share Data PDU on the I/O channel.
+fn encode_autodetect_request(
+    request: rdp::autodetect::AutoDetectRequest,
+    message_channel_id: u16,
+    user_channel_id: u16,
+) -> Result<Vec<u8>> {
+    // Auto-detect rides the MCS message channel framed by a Basic Security
+    // Header (SEC_AUTODETECT_REQ), not a Share Control / Share Data header.
+    let pdu = rdp::autodetect::AutoDetectReqPdu::new(request);
+    let user_data = encode_vec(&pdu)?.into();
+    let mcs_pdu = SendDataIndication {
+        initiator_id: user_channel_id,
+        channel_id: message_channel_id,
+        user_data,
+    };
+    Ok(encode_vec(&X224(mcs_pdu))?)
+}
+
+/// Encode a Share Data PDU wrapped in a Share Control header and carried in an
+/// MCS Send Data Indication on the I/O channel.
+///
+/// A general `encode_share_data_pdu` helper previously lived here for the
+/// auto-detect path; #1348 rerouted auto-detect onto the message channel (see
+/// [`encode_autodetect_request`]), leaving this Save Session Info sender as the
+/// sole user, so the encoder now lives with it.
 fn encode_share_data_pdu(
     share_data_pdu: rdp::headers::ShareDataPdu,
     io_channel_id: u16,

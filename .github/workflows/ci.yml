@@ -74,22 +74,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install devel packages
-        if: ${{ runner.os == 'Linux' }}
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get -y install libasound2-dev
-
-      - name: Install NASM
-        if: ${{ runner.os == 'Windows' }}
-        run: |
-          choco install nasm
-          $Env:PATH += ";$Env:ProgramFiles\NASM"
-          echo "PATH=$Env:PATH" >> $Env:GITHUB_ENV
-        shell: pwsh
+      - name: Install build dependencies
+        uses: ./.github/actions/install-build-deps
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2.7.3
+        uses: Swatinem/rust-cache@v2.9.1
 
       - name: Binary cache
         uses: actions/cache@v5
@@ -105,8 +94,15 @@ jobs:
       - name: Tests (run)
         run: cargo xtask check tests -v
 
+      - name: Build ActiveX host harness
+        if: matrix.os == 'windows'
+        run: dotnet build .\crates\ironrdp-activex\tests\ironrdp-axhost\IronRdpAxHost.csproj --configuration Release
+
       - name: Lints
         run: cargo xtask check lints -v
+
+      - name: Dependencies
+        run: cargo xtask check dependencies -v
 
       - name: WASM (prepare)
         run: cargo xtask wasm install -v
@@ -126,7 +122,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2.7.3
+        uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: fuzz -> target
 
@@ -155,7 +151,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2.7.3
+        uses: Swatinem/rust-cache@v2.9.1
 
       - name: Binary cache
         uses: actions/cache@v5
@@ -181,7 +177,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2.7.3
+        uses: Swatinem/rust-cache@v2.9.1
 
       - name: Binary cache
         uses: actions/cache@v5
@@ -212,7 +208,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2.7.3
+        uses: Swatinem/rust-cache@v2.9.1
 
       - name: Setup matrix
         id: setup-matrix
@@ -232,13 +228,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install devel packages
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get -y install libasound2-dev
+      - name: Install build dependencies
+        uses: ./.github/actions/install-build-deps
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2.7.3
+        uses: Swatinem/rust-cache@v2.9.1
 
       - name: Binary cache
         uses: actions/cache@v5

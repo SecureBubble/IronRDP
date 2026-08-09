@@ -6,7 +6,6 @@ mod macros;
 
 pub mod fast_path;
 pub mod image;
-pub mod legacy;
 pub mod pointer;
 pub mod rfx; // FIXME: maybe this module should not be in this crate
 pub mod x224;
@@ -16,7 +15,8 @@ mod palette;
 
 use core::fmt;
 
-pub use active_stage::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason};
+pub use active_stage::{ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
+pub use fast_path::{BulkDecompressionErrorKind, FastPathBulkDecompressionFailure};
 
 pub type SessionResult<T> = Result<T, SessionError>;
 
@@ -26,6 +26,8 @@ pub enum SessionErrorKind {
     Pdu(ironrdp_pdu::PduError),
     Encode(ironrdp_core::EncodeError),
     Decode(ironrdp_core::DecodeError),
+    FastPathBulkDecompression(FastPathBulkDecompressionFailure),
+    InvalidBitmapSourceLength,
     Reason(String),
     General,
     Custom,
@@ -37,6 +39,8 @@ impl fmt::Display for SessionErrorKind {
             SessionErrorKind::Pdu(_) => write!(f, "PDU error"),
             SessionErrorKind::Encode(_) => write!(f, "encode error"),
             SessionErrorKind::Decode(_) => write!(f, "decode error"),
+            SessionErrorKind::FastPathBulkDecompression(_) => write!(f, "fast-path bulk decompression error"),
+            SessionErrorKind::InvalidBitmapSourceLength => write!(f, "invalid bitmap source length"),
             SessionErrorKind::Reason(description) => write!(f, "reason: {description}"),
             SessionErrorKind::General => write!(f, "general error"),
             SessionErrorKind::Custom => write!(f, "custom error"),
@@ -50,6 +54,8 @@ impl core::error::Error for SessionErrorKind {
             SessionErrorKind::Pdu(e) => Some(e),
             SessionErrorKind::Encode(e) => Some(e),
             SessionErrorKind::Decode(e) => Some(e),
+            SessionErrorKind::FastPathBulkDecompression(_) => None,
+            SessionErrorKind::InvalidBitmapSourceLength => None,
             SessionErrorKind::Reason(_) => None,
             SessionErrorKind::General => None,
             SessionErrorKind::Custom => None,

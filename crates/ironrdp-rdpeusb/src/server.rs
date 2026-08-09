@@ -12,6 +12,7 @@ use crate::io::{
     TransferInCompletionResult, TransferInPacket, TransferOutCompletionResult, TransferOutPacket, UsbRetractReason,
 };
 use crate::pdu::caps::RimExchangeCapabilityRequest;
+use crate::pdu::completion::ts_urb_result::{ExpectedTsUrbResult, Raw};
 use crate::pdu::completion::{IoControlCompletion, UrbCompletion, UrbCompletionNoData};
 use crate::pdu::header::{InterfaceId, Mask, MessageId};
 use crate::pdu::iface_manipulation::{InterfaceRelease, QueryInterfaceFailureResponse};
@@ -19,6 +20,7 @@ use crate::pdu::notify::ChannelCreated;
 use crate::pdu::sink::NoAckIsochWriteJitterBufSizeInMs;
 use crate::pdu::usb_dev::{
     CancelRequest, QueryDeviceText, RegisterRequestCallback, RetractDevice, TransferInRequest, TransferOutRequest,
+    ts_urb::{TsUrbInKind, TsUrbOutKind},
 };
 use crate::pdu::utils::RequestId;
 use crate::pdu::{UrbdrcClientControlPdu, UrbdrcClientDevicePdu};
@@ -233,10 +235,51 @@ pub struct UrbdrcDeviceServer {
 }
 
 enum Pending {
-    IoCtl { max_output_buf_size: u32 },
-    InternalIoCtl { max_output_buf_size: u32 },
-    TransferIn { max_output_buf_size: u32 },
-    TransferOut { max_output_buf_size: u32 },
+    IoCtl {
+        max_output_buf_size: u32,
+    },
+    InternalIoCtl {
+        max_output_buf_size: u32,
+    },
+    TransferIn {
+        max_output_buf_size: u32,
+        expected_result: ExpectedTsUrbResult,
+    },
+    TransferOut {
+        max_output_buf_size: u32,
+        expected_result: ExpectedTsUrbResult,
+    },
+}
+
+fn expected_result_for_in(kind: &TsUrbInKind) -> ExpectedTsUrbResult {
+    match kind {
+        TsUrbInKind::SelectConfig(_) => ExpectedTsUrbResult::SelectConfig,
+        TsUrbInKind::SelectIface(_) => ExpectedTsUrbResult::SelectIface,
+        TsUrbInKind::GetCurFrameNum(_) => ExpectedTsUrbResult::FrameNum,
+        TsUrbInKind::IsochTransfer(_) => ExpectedTsUrbResult::Isoch,
+        TsUrbInKind::PipeReq(_)
+        | TsUrbInKind::CtlTransfer(_)
+        | TsUrbInKind::BulkInterruptTransfer(_)
+        | TsUrbInKind::CtlDescReq(_)
+        | TsUrbInKind::CtlFeatReq(_)
+        | TsUrbInKind::CtlGetStatus(_)
+        | TsUrbInKind::VendorClassReq(_)
+        | TsUrbInKind::CtlGetConfig(_)
+        | TsUrbInKind::CtlGetIface(_)
+        | TsUrbInKind::OsFeatDescReq(_)
+        | TsUrbInKind::CtlTransferEx(_) => ExpectedTsUrbResult::HeaderOnly,
+    }
+}
+
+fn expected_result_for_out(kind: &TsUrbOutKind) -> ExpectedTsUrbResult {
+    match kind {
+        TsUrbOutKind::IsochTransfer(_) => ExpectedTsUrbResult::Isoch,
+        TsUrbOutKind::CtlTransfer(_)
+        | TsUrbOutKind::BulkInterruptTransfer(_)
+        | TsUrbOutKind::CtlDescReq(_)
+        | TsUrbOutKind::VendorClassReq(_)
+        | TsUrbOutKind::CtlTransferEx(_) => ExpectedTsUrbResult::HeaderOnly,
+    }
 }
 
 impl UrbdrcDeviceServer {
@@ -333,6 +376,7 @@ impl UrbdrcDeviceServer {
         let udev_iface = self.usb_device_iface()?;
         let request_id = self.request_id_alloc.alloc();
         let output_buffer_size = request.output_buffer_size;
+        let expected_result = expected_result_for_in(&request.ts_urb.kind);
         let ts_urb = request.ts_urb.into_ts_urb(request_id)?;
         let pdu = TransferInRequest {
             msg_id: self.msg_alloc.alloc(),
@@ -347,6 +391,7 @@ impl UrbdrcDeviceServer {
             request_id,
             Pending::TransferIn {
                 max_output_buf_size: output_buffer_size,
+                expected_result,
             },
         )?;
 
@@ -369,6 +414,7 @@ impl UrbdrcDeviceServer {
 
         let request_id = self.request_id_alloc.alloc();
         let no_ack = request.ts_urb.no_ack;
+        let expected_result = expected_result_for_out(&request.ts_urb.kind);
         let no_ack_isoch_write_jitter_buf_size = self
             .no_ack_isoch_write_jitter_buf_size
             .ok_or_else(|| pdu_other_err!("USB device capabilities uninitialized"))?;
@@ -387,6 +433,7 @@ impl UrbdrcDeviceServer {
                 request_id,
                 Pending::TransferOut {
                     max_output_buf_size: output_buffer_size,
+                    expected_result,
                 },
             )?;
         }
@@ -490,7 +537,11 @@ impl UrbdrcDeviceServer {
 
         let request_id = RequestId::from(completion.req_id);
 
-        let Some(Pending::TransferIn { max_output_buf_size }) = self.pending_io.remove(&request_id) else {
+        let Some(Pending::TransferIn {
+            max_output_buf_size,
+            expected_result,
+        }) = self.pending_io.remove(&request_id)
+        else {
             return Err(pdu_other_err!("completion mismatch"));
         };
 
@@ -500,11 +551,16 @@ impl UrbdrcDeviceServer {
             return Err(pdu_other_err!("output buffer exceeds maximum amount"));
         }
 
+        let ts_urb_result = completion
+            .ts_urb_result
+            .into_expected(expected_result)
+            .map_err(|e| decode_err!(e))?;
+
         self.backend.transfer_in_completed(
             channel_id,
             request_id,
             TransferInCompletionResult {
-                ts_urb_result: completion.ts_urb_result,
+                ts_urb_result,
                 hresult: completion.hresult,
                 output_buffer: completion.output_buffer,
             },
@@ -516,7 +572,7 @@ impl UrbdrcDeviceServer {
     fn handle_urb_completion_no_data(
         &mut self,
         channel_id: u32,
-        completion: UrbCompletionNoData,
+        completion: UrbCompletionNoData<Raw>,
     ) -> PduResult<Vec<DvcMessage>> {
         if completion.completion_iface != self.comp_iface {
             return Ok(Vec::new());
@@ -527,30 +583,38 @@ impl UrbdrcDeviceServer {
             return Err(pdu_other_err!("completion mismatch"));
         };
 
-        let is_transfer_out = match pending {
-            Pending::TransferIn { .. } => {
+        let (is_transfer_out, expected_result) = match pending {
+            Pending::TransferIn { expected_result, .. } => {
                 if completion.output_buffer_size != 0 {
                     return Err(pdu_other_err!("output buffer size must be zero"));
                 }
-                false
+                (false, expected_result)
             }
-            Pending::TransferOut { max_output_buf_size } => {
+            Pending::TransferOut {
+                max_output_buf_size,
+                expected_result,
+            } => {
                 if completion.output_buffer_size > max_output_buf_size {
                     return Err(pdu_other_err!("output buffer exceeds maximum amount"));
                 }
-                true
+                (true, expected_result)
             }
             Pending::IoCtl { .. } | Pending::InternalIoCtl { .. } => {
                 return Err(pdu_other_err!("completion mismatch"));
             }
         };
 
+        let ts_urb_result = completion
+            .ts_urb_result
+            .into_expected(expected_result)
+            .map_err(|e| decode_err!(e))?;
+
         if is_transfer_out {
             self.backend.transfer_out_completed(
                 channel_id,
                 request_id,
                 TransferOutCompletionResult {
-                    ts_urb_result: completion.ts_urb_result,
+                    ts_urb_result,
                     hresult: completion.hresult,
                     output_buffer_size: completion.output_buffer_size,
                 },
@@ -560,7 +624,7 @@ impl UrbdrcDeviceServer {
                 channel_id,
                 request_id,
                 TransferInCompletionResult {
-                    ts_urb_result: completion.ts_urb_result,
+                    ts_urb_result,
                     hresult: completion.hresult,
                     output_buffer: Vec::new(),
                 },

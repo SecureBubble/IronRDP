@@ -32,7 +32,7 @@ use ironrdp::rdperp::client::{RailChannel, RemoteApp};
 use ironrdp::rdperp::orders::WindowOrder;
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, fast_path};
+use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
 use ironrdp_egfx::client::GraphicsPipelineClient;
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
@@ -799,6 +799,7 @@ impl iron_remote_desktop::Session for Session {
         let mut draw_buffer = WriteBuf::new();
 
         // Full-desktop rectangle used for the post-connect Refresh Rect (see below).
+        // `desktop_size` is Copy, so read it before the builder consumes the rest.
         let desktop_refresh_rect = ironrdp::pdu::geometry::InclusiveRectangle {
             left: 0,
             top: 0,
@@ -806,7 +807,20 @@ impl iron_remote_desktop::Session for Session {
             bottom: connection_result.desktop_size.height.saturating_sub(1),
         };
 
-        let mut active_stage = ActiveStage::new(connection_result);
+        // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
+        let activation_factory = connection_result.activation_factory;
+
+        let mut active_stage = ActiveStageBuilder {
+            static_channels: connection_result.static_channels,
+            user_channel_id: connection_result.user_channel_id,
+            io_channel_id: connection_result.io_channel_id,
+            message_channel_id: connection_result.message_channel_id,
+            share_id: connection_result.share_id,
+            compression_type: connection_result.compression_type,
+            enable_server_pointer: connection_result.enable_server_pointer,
+            pointer_software_rendering: connection_result.pointer_software_rendering,
+        }
+        .build();
 
         // Timer interval for driving clipboard lock timeouts (5 second interval)
         let mut cleanup_interval = IntervalStream::new(5_000).fuse();
@@ -1215,7 +1229,7 @@ impl iron_remote_desktop::Session for Session {
                             hotspot_y,
                         })?;
                     }
-                    ActiveStageOutput::DeactivateAll(mut box_connection_activation) => {
+                    ActiveStageOutput::DeactivateAll => {
                         // Execute the Deactivation-Reactivation Sequence:
                         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                         debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
@@ -1227,11 +1241,11 @@ impl iron_remote_desktop::Session for Session {
                             requested_resize = None;
                         }
 
+                        let mut connection_activation = activation_factory.create();
                         let mut buf = WriteBuf::new();
                         'activation_seq: loop {
                             let written =
-                                single_sequence_step_read(&mut framed, &mut *box_connection_activation, &mut buf)
-                                    .await?;
+                                single_sequence_step_read(&mut framed, &mut connection_activation, &mut buf).await?;
 
                             if written.size().is_some() {
                                 self.writer_tx
@@ -1240,31 +1254,23 @@ impl iron_remote_desktop::Session for Session {
                             }
 
                             if let ConnectionActivationState::Finalized {
-                                io_channel_id,
-                                user_channel_id,
                                 desktop_size,
                                 share_id,
+                                input_flags: _,
                                 enable_server_pointer,
                                 pointer_software_rendering,
-                            } = box_connection_activation.connection_activation_state()
+                                ..
+                            } = connection_activation.connection_activation_state()
                             {
                                 debug!("Deactivation-Reactivation Sequence completed");
                                 image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
-                                // Create a new [`FastPathProcessor`] with potentially updated
-                                // io/user channel ids.
-                                active_stage.set_fastpath_processor(
-                                    fast_path::ProcessorBuilder {
-                                        io_channel_id,
-                                        user_channel_id,
-                                        share_id,
-                                        enable_server_pointer,
-                                        pointer_software_rendering,
-                                        bulk_decompressor: None,
-                                    }
-                                    .build(),
+                                active_stage.reactivate(
+                                    connection_activation.io_channel_id(),
+                                    connection_activation.user_channel_id(),
+                                    share_id,
+                                    enable_server_pointer,
+                                    pointer_software_rendering,
                                 );
-                                active_stage.set_share_id(share_id);
-                                active_stage.set_enable_server_pointer(enable_server_pointer);
                                 break 'activation_seq;
                             }
                         }
@@ -1278,6 +1284,15 @@ impl iron_remote_desktop::Session for Session {
                     }
                     ActiveStageOutput::AutoDetect(request) => {
                         debug!(?request, "Auto-detect");
+                    }
+                    ActiveStageOutput::AutoReconnectCookie(_) => {
+                        debug!("Server Auto-Reconnect Cookie received (automatic reconnection not implemented)");
+                    }
+                    ActiveStageOutput::SaveSessionInfo { logon_complete: true } => {
+                        debug!("RDP login complete");
+                    }
+                    ActiveStageOutput::SaveSessionInfo { logon_complete: false } => {
+                        debug!("RDP session info notification");
                     }
                     ActiveStageOutput::Terminate(reason) => break 'outer reason,
                 }
@@ -1709,10 +1724,12 @@ fn build_config(
         // TODO(#327): expose these options from the WASM module.
         enable_tls: true,
         enable_credssp: true,
+        enable_standard_rdp_security: false,
         keyboard_type: ironrdp::pdu::gcc::KeyboardType::IbmEnhanced,
         keyboard_subtype: 0,
         keyboard_layout: 0, // the server SHOULD use the default active input locale identifier
         keyboard_functional_keys_count: 12,
+        connection_type: ironrdp::pdu::gcc::ConnectionType::Lan,
         ime_file_name: String::new(),
         dig_product_id: String::new(),
         desktop_size: connector::DesktopSize {
@@ -2125,8 +2142,8 @@ where
             .context("failed to decode x509 certificate sent by proxy")?;
 
         let server_public_key = cert
-            .tbs_certificate
-            .subject_public_key_info
+            .tbs_certificate()
+            .subject_public_key_info()
             .subject_public_key
             .as_bytes()
             .context("subject public key BIT STRING is not aligned")?

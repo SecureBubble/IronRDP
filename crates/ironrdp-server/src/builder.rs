@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, server_codecs_capabilities};
+use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 use tokio_rustls::TlsAcceptor;
 
 use super::clipboard::CliprdrServerFactory;
@@ -42,7 +43,8 @@ pub struct BuilderDone {
     gfx_factory: Option<Box<dyn GfxServerFactory>>,
     display_suppressed: Option<Arc<AtomicBool>>,
     autodetect_rtt: Option<Arc<AtomicU32>>,
-    honor_client_desktop_size: bool,
+    honor_client_desktop_size: Option<DesktopSize>,
+    auto_reconnect_cookie: Option<ServerAutoReconnect>,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -143,7 +145,8 @@ impl RdpServerBuilder<WantsDisplay> {
                 gfx_factory: None,
                 display_suppressed: None,
                 autodetect_rtt: None,
-                honor_client_desktop_size: false,
+                honor_client_desktop_size: None,
+                auto_reconnect_cookie: None,
             },
         }
     }
@@ -165,7 +168,8 @@ impl RdpServerBuilder<WantsDisplay> {
                 gfx_factory: None,
                 display_suppressed: None,
                 autodetect_rtt: None,
-                honor_client_desktop_size: false,
+                honor_client_desktop_size: None,
+                auto_reconnect_cookie: None,
             },
         }
     }
@@ -239,13 +243,21 @@ impl RdpServerBuilder<BuilderDone> {
     /// Core Data of the connection handshake; the size echoed back in the
     /// client's Confirm Active is the value it copied from the server's Demand
     /// Active (per [MS-RDPBCGR] 2.2.1.13.2) and so cannot reveal what the
-    /// client asked for. With this enabled the acceptor adopts the requested
-    /// size (when within the protocol-legal range) before Demand Active is
-    /// sent, so the session starts at that size with no Deactivation-
-    /// Reactivation resize. The display handler observes the negotiated size
-    /// through [`RdpServerDisplay::request_initial_size`].
+    /// client asked for. With this enabled the acceptor first clamps the
+    /// requested size to the operator maximum and then, if the clamped size is
+    /// within the protocol-legal range, adopts it before Demand Active is sent,
+    /// so the session starts at that size with no Deactivation-Reactivation
+    /// resize. The display handler observes the negotiated size through
+    /// [`RdpServerDisplay::request_initial_size`].
     ///
-    /// Defaults to `false`, enforcing the size reported by the display handler.
+    /// Pass `Some(max)` to honor the client's request, clamped per dimension to
+    /// `max`: the client may ask for a smaller desktop, but never a larger one.
+    /// The desktop size is a client-controlled `u16` bounded only by the
+    /// protocol ([200, 8192]); `max` is the ceiling the server is willing to
+    /// render (for instance the host display's native resolution) so an
+    /// untrusted client can't drive the framebuffer/encoder allocation off that
+    /// number. Pass `None` (the default) to disable honoring and enforce the
+    /// size reported by the display handler.
     ///
     /// # Precondition
     ///
@@ -258,8 +270,8 @@ impl RdpServerBuilder<BuilderDone> {
     /// the display handler serves a fixed framebuffer.
     ///
     /// [`request_initial_size`]: crate::RdpServerDisplay::request_initial_size
-    pub fn with_honor_client_desktop_size(mut self, honor: bool) -> Self {
-        self.state.honor_client_desktop_size = honor;
+    pub fn with_honor_client_desktop_size(mut self, max: Option<DesktopSize>) -> Self {
+        self.state.honor_client_desktop_size = max;
         self
     }
 
@@ -270,6 +282,10 @@ impl RdpServerBuilder<BuilderDone> {
     /// validator before the session is established. Rejection or a backend
     /// error closes the connection. Pass `None` (the default) to skip
     /// validation entirely.
+    ///
+    /// A valid Server Auto-Reconnect Cookie bypasses this validator. Applications
+    /// that must validate every connection should leave automatic reconnection
+    /// disabled.
     ///
     /// Not used for CredSSP/Hybrid connections (those use pre-loaded
     /// credentials for NTLM challenge-response).
@@ -286,6 +302,24 @@ impl RdpServerBuilder<BuilderDone> {
     /// auto-detect is enabled via [`RdpServer::enable_autodetect`].
     pub fn with_autodetect_rtt_handle(mut self, handle: Arc<AtomicU32>) -> Self {
         self.state.autodetect_rtt = Some(handle);
+        self
+    }
+
+    /// Provision the Server Auto-Reconnect Cookie (MS-RDPBCGR 2.2.4.2
+    /// `ARC_SC_PRIVATE_PACKET`) handed to the client during logon.
+    ///
+    /// When set to `Some`, the server sends a Save Session Info PDU carrying the
+    /// cookie right after activation. It validates the returning client cookie,
+    /// generates a fresh CSPRNG random whenever a client connects, and updates
+    /// the active client hourly. Automatic reconnection requires TLS or Hybrid
+    /// security, which provides the all-zero client random required for Enhanced
+    /// RDP Security. `None` (the default) sends no cookie.
+    ///
+    /// See [`RdpServer::set_auto_reconnect_cookie`] for post-construction
+    /// configuration and [`RdpServer::auto_reconnect_cookie_handle`] for
+    /// updates while the server is running.
+    pub fn with_auto_reconnect_cookie(mut self, cookie: Option<ServerAutoReconnect>) -> Self {
+        self.state.auto_reconnect_cookie = cookie;
         self
     }
 
@@ -309,6 +343,7 @@ impl RdpServerBuilder<BuilderDone> {
             self.state.autodetect_rtt,
         );
         server.set_credential_validator(self.state.credential_validator);
+        server.set_auto_reconnect_cookie(self.state.auto_reconnect_cookie);
         server
     }
 }

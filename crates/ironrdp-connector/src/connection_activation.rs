@@ -1,12 +1,12 @@
 use core::mem;
 
 use ironrdp_pdu::rdp;
-use ironrdp_pdu::rdp::capability_sets::CapabilitySet;
+use ironrdp_pdu::rdp::capability_sets::{CapabilitySet, InputFlags};
 use tracing::{debug, warn};
 
 use crate::{
-    Config, ConnectionFinalizationSequence, ConnectorResult, DesktopSize, Sequence, State, Written, general_err,
-    legacy, reason_err,
+    Config, ConnectionFinalizationSequence, ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize,
+    Sequence, State, Written, general_err, reason_err,
 };
 
 /// Represents the Capability Exchange and Connection Finalization phases
@@ -25,54 +25,77 @@ use crate::{
 pub struct ConnectionActivationSequence {
     state: ConnectionActivationState,
     config: Config,
+    // The MCS channel IDs are invariant for the whole life of the sequence: they are negotiated
+    // once and never change, even across a Deactivation-Reactivation Sequence. They are stored
+    // here (rather than duplicated into every state variant).
+    io_channel_id: u16,
+    user_channel_id: u16,
 }
 
 impl ConnectionActivationSequence {
     pub fn new(config: Config, io_channel_id: u16, user_channel_id: u16) -> Self {
+        // TODO/FIXME: Investigate whether we really need to carry around the whole `Config` struct.
+        // RATIONALE(@CBenoit): Not very convenient when building in isolation.
+        //   I doubt this type really needs every field there.
         Self {
-            state: ConnectionActivationState::CapabilitiesExchange {
-                io_channel_id,
-                user_channel_id,
-            },
+            state: ConnectionActivationState::CapabilitiesExchange,
             config,
+            io_channel_id,
+            user_channel_id,
         }
     }
 
-    /// Returns the current state as a district type, rather than `&dyn State` provided by [`Self::state`].
+    pub fn io_channel_id(&self) -> u16 {
+        self.io_channel_id
+    }
+
+    pub fn user_channel_id(&self) -> u16 {
+        self.user_channel_id
+    }
+
+    /// Returns the current state as a distinct type, rather than `&dyn State` provided by [`Self::state`].
     pub fn connection_activation_state(&self) -> ConnectionActivationState {
         self.state
     }
+}
 
-    #[must_use]
-    pub fn reset_clone(&self) -> Self {
-        self.clone().reset()
+/// Factory producing fresh [`ConnectionActivationSequence`] instances.
+///
+/// The [`Config`] and MCS channel IDs required to build a connection activation sequence are
+/// invariant for the whole lifetime of the connection: they are negotiated once and never change,
+/// even across a [Deactivation-Reactivation Sequence]. This factory captures them so that a fresh,
+/// correctly-initialized sequence can be produced each time one is needed, driven until it is
+/// finalized, then dropped.
+///
+/// [Deactivation-Reactivation Sequence]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
+#[derive(Debug, Clone)]
+pub struct ConnectionActivationFactory {
+    config: Config,
+    io_channel_id: u16,
+    user_channel_id: u16,
+}
+
+impl ConnectionActivationFactory {
+    pub fn new(config: Config, io_channel_id: u16, user_channel_id: u16) -> Self {
+        Self {
+            config,
+            io_channel_id,
+            user_channel_id,
+        }
     }
 
-    fn reset(mut self) -> Self {
-        match &self.state {
-            ConnectionActivationState::CapabilitiesExchange {
-                io_channel_id,
-                user_channel_id,
-            }
-            | ConnectionActivationState::ConnectionFinalization {
-                io_channel_id,
-                user_channel_id,
-                ..
-            }
-            | ConnectionActivationState::Finalized {
-                io_channel_id,
-                user_channel_id,
-                ..
-            } => {
-                self.state = ConnectionActivationState::CapabilitiesExchange {
-                    io_channel_id: *io_channel_id,
-                    user_channel_id: *user_channel_id,
-                };
+    pub fn io_channel_id(&self) -> u16 {
+        self.io_channel_id
+    }
 
-                self
-            }
-            ConnectionActivationState::Consumed => self,
-        }
+    pub fn user_channel_id(&self) -> u16 {
+        self.user_channel_id
+    }
+
+    /// Produces a fresh [`ConnectionActivationSequence`] in the initial `CapabilitiesExchange` state.
+    #[must_use]
+    pub fn create(&self) -> ConnectionActivationSequence {
+        ConnectionActivationSequence::new(self.config.clone(), self.io_channel_id, self.user_channel_id)
     }
 }
 
@@ -81,7 +104,7 @@ impl Sequence for ConnectionActivationSequence {
         match &self.state {
             ConnectionActivationState::Consumed => None,
             ConnectionActivationState::Finalized { .. } => None,
-            ConnectionActivationState::CapabilitiesExchange { .. } => Some(&ironrdp_pdu::X224_HINT),
+            ConnectionActivationState::CapabilitiesExchange => Some(&ironrdp_pdu::X224_HINT),
             ConnectionActivationState::ConnectionFinalization {
                 connection_finalization,
                 ..
@@ -100,20 +123,19 @@ impl Sequence for ConnectionActivationSequence {
                     "connector sequence state is finalized or consumed (this is a bug)"
                 ));
             }
-            ConnectionActivationState::CapabilitiesExchange {
-                io_channel_id,
-                user_channel_id,
-            } => {
+            ConnectionActivationState::CapabilitiesExchange => {
                 debug!("Capabilities Exchange");
 
-                let send_data_indication_ctx = legacy::decode_send_data_indication(input)?;
-                let share_control_ctx = legacy::decode_share_control(send_data_indication_ctx)?;
+                let send_data_indication_ctx =
+                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
+                let share_control_ctx =
+                    rdp::headers::decode_share_control(send_data_indication_ctx).map_err(ConnectorError::decode)?;
 
                 debug!(message = ?share_control_ctx.pdu, "Received");
 
-                if share_control_ctx.channel_id != io_channel_id {
+                if share_control_ctx.channel_id != self.io_channel_id {
                     warn!(
-                        io_channel_id,
+                        io_channel_id = self.io_channel_id,
                         share_control_ctx.channel_id, "Unexpected channel ID for received Share Control Pdu"
                     );
                 }
@@ -132,10 +154,7 @@ impl Sequence for ConnectionActivationSequence {
                     debug!(
                         "Skipping Server Deactivate All PDU received during Capabilities Exchange, awaiting Server Demand Active"
                     );
-                    self.state = ConnectionActivationState::CapabilitiesExchange {
-                        io_channel_id,
-                        user_channel_id,
-                    };
+                    self.state = ConnectionActivationState::CapabilitiesExchange;
                     return Ok(Written::Nothing);
                 }
 
@@ -144,21 +163,70 @@ impl Sequence for ConnectionActivationSequence {
                 {
                     server_demand_active.pdu.capability_sets
                 } else {
+                    // Instead of reactivating after a Deactivate-All, a server may end the
+                    // session (MS-RDPBCGR §1.3.1.3) by sending a Set Error Info PDU carrying the
+                    // disconnect reason. FreeRDP-based servers such as GNOME Remote Desktop do
+                    // this, for example when the backend screencast session cannot be created.
+                    // Surface that reason so the disconnect is explained rather than reported as
+                    // an unexpected PDU.
+                    if let rdp::headers::ShareControlPdu::Data(rdp::headers::ShareDataHeader {
+                        share_data_pdu:
+                            rdp::headers::ShareDataPdu::ServerSetErrorInfo(rdp::server_error_info::ServerSetErrorInfoPdu(
+                                error_info,
+                            )),
+                        ..
+                    }) = share_control_ctx.pdu
+                    {
+                        // ERRINFO_NONE is informational (it clears a previously reported error),
+                        // not a disconnect. Skip it and keep waiting for the Demand Active PDU,
+                        // matching how the connection finalization sequence treats it.
+                        if let rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
+                            rdp::server_error_info::ProtocolIndependentCode::None,
+                        ) = error_info
+                        {
+                            self.state = ConnectionActivationState::CapabilitiesExchange;
+                            return Ok(Written::Nothing);
+                        }
+
+                        return Err(reason_err!(
+                            "ConnectionActivation::CapabilitiesExchange",
+                            "server ended the session with error info: {}",
+                            error_info.description()
+                        ));
+                    }
+
                     return Err(reason_err!(
                         "ConnectionActivation::CapabilitiesExchange",
                         "unexpected Share Control PDU during capabilities exchange: got {} (expected Server Demand Active PDU)",
-                        share_control_ctx.pdu.as_short_name(),
+                        rdp::headers::describe_unexpected_share_control_pdu(&share_control_ctx.pdu),
                     ));
                 };
 
-                for c in &capability_sets {
-                    if let CapabilitySet::General(g) = c {
-                        if g.protocol_version != rdp::capability_sets::PROTOCOL_VER {
-                            warn!(version = g.protocol_version, "Unexpected protocol version");
+                let (refresh_rect_support, suppress_output_support) = capability_sets
+                    .iter()
+                    .find_map(|capability_set| {
+                        let CapabilitySet::General(general) = capability_set else {
+                            return None;
+                        };
+                        if general.protocol_version != rdp::capability_sets::PROTOCOL_VER {
+                            warn!(version = general.protocol_version, "Unexpected protocol version");
                         }
-                        break;
-                    }
-                }
+                        Some((general.refresh_rect_support, general.suppress_output_support))
+                    })
+                    .unwrap_or((false, false));
+
+                // Keep the server's Input capability flags so the session layer can tell whether
+                // fast-path input was negotiated: per [MS-RDPBCGR] 2.2.8.1.2, the client MUST NOT
+                // send fast-path input events unless the server advertised
+                // `INPUT_FLAG_FASTPATH_INPUT` or `INPUT_FLAG_FASTPATH_INPUT2`. Servers that omit
+                // both (e.g. VirtualBox VRDP) may reject fast-path input PDUs outright.
+                let input_flags = capability_sets
+                    .iter()
+                    .find_map(|c| match c {
+                        CapabilitySet::Input(i) => Some(i.input_flags),
+                        _ => None,
+                    })
+                    .unwrap_or_else(InputFlags::empty);
 
                 // At this point we have already sent a requested desktop size to the server -- either as a part of the
                 // [`TS_UD_CS_CORE`] (on initial connection) or the [`DISPLAYCONTROL_MONITOR_LAYOUT`] (on resize event).
@@ -186,39 +254,42 @@ impl Sequence for ConnectionActivationSequence {
                 let share_id = share_control_ctx.share_id;
 
                 let client_confirm_active = rdp::headers::ShareControlPdu::ClientConfirmActive(
-                    create_client_confirm_active(&self.config, capability_sets, desktop_size),
+                    create_client_confirm_active(&self.config, capability_sets, desktop_size)?,
                 );
 
                 debug!(message = ?client_confirm_active, "Send");
 
-                let written = legacy::encode_share_control(
-                    user_channel_id,
-                    io_channel_id,
+                let written = rdp::headers::encode_share_control(
+                    self.user_channel_id,
+                    self.io_channel_id,
                     share_id,
                     client_confirm_active,
                     output,
-                )?;
+                )
+                .map_err(ConnectorError::encode)?;
 
                 (
                     Written::from_size(written)?,
                     ConnectionActivationState::ConnectionFinalization {
-                        io_channel_id,
-                        user_channel_id,
                         desktop_size,
                         share_id,
+                        input_flags,
+                        refresh_rect_support,
+                        suppress_output_support,
                         connection_finalization: ConnectionFinalizationSequence::new(
-                            io_channel_id,
-                            user_channel_id,
+                            self.io_channel_id,
+                            self.user_channel_id,
                             share_id,
                         ),
                     },
                 )
             }
             ConnectionActivationState::ConnectionFinalization {
-                io_channel_id,
-                user_channel_id,
                 desktop_size,
                 share_id,
+                input_flags,
+                refresh_rect_support,
+                suppress_output_support,
                 mut connection_finalization,
             } => {
                 debug!("Connection Finalization");
@@ -227,20 +298,22 @@ impl Sequence for ConnectionActivationSequence {
 
                 let next_state = if !connection_finalization.state.is_terminal() {
                     ConnectionActivationState::ConnectionFinalization {
-                        io_channel_id,
-                        user_channel_id,
                         desktop_size,
                         share_id,
+                        input_flags,
+                        refresh_rect_support,
+                        suppress_output_support,
                         connection_finalization,
                     }
                 } else {
                     ConnectionActivationState::Finalized {
-                        io_channel_id,
-                        user_channel_id,
                         desktop_size,
                         share_id,
+                        input_flags,
                         enable_server_pointer: self.config.enable_server_pointer,
                         pointer_software_rendering: self.config.pointer_software_rendering,
+                        refresh_rect_support,
+                        suppress_output_support,
                     }
                 };
 
@@ -258,24 +331,32 @@ impl Sequence for ConnectionActivationSequence {
 pub enum ConnectionActivationState {
     #[default]
     Consumed,
-    CapabilitiesExchange {
-        io_channel_id: u16,
-        user_channel_id: u16,
-    },
+    CapabilitiesExchange,
     ConnectionFinalization {
-        io_channel_id: u16,
-        user_channel_id: u16,
         desktop_size: DesktopSize,
         share_id: u32,
+        /// The server's Input capability flags from the Server Demand Active PDU.
+        input_flags: InputFlags,
+        refresh_rect_support: bool,
+        suppress_output_support: bool,
         connection_finalization: ConnectionFinalizationSequence,
     },
     Finalized {
-        io_channel_id: u16,
-        user_channel_id: u16,
         desktop_size: DesktopSize,
         share_id: u32,
+        /// The server's Input capability flags from the Server Demand Active PDU.
+        ///
+        /// Per [MS-RDPBCGR] 2.2.8.1.2, fast-path input events may only be sent when
+        /// `INPUT_FLAG_FASTPATH_INPUT` or `INPUT_FLAG_FASTPATH_INPUT2` is present.
+        ///
+        /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/b8e7c588-51cb-455b-bb73-92d480903133
+        input_flags: InputFlags,
         enable_server_pointer: bool,
         pointer_software_rendering: bool,
+        /// Whether the server permits client Refresh Rect PDUs for visual recovery.
+        refresh_rect_support: bool,
+        /// Whether the server permits Suppress Output PDUs for visual recovery.
+        suppress_output_support: bool,
     },
 }
 
@@ -283,7 +364,7 @@ impl State for ConnectionActivationState {
     fn name(&self) -> &'static str {
         match self {
             ConnectionActivationState::Consumed => "Consumed",
-            ConnectionActivationState::CapabilitiesExchange { .. } => "CapabilitiesExchange",
+            ConnectionActivationState::CapabilitiesExchange => "CapabilitiesExchange",
             ConnectionActivationState::ConnectionFinalization { .. } => "ConnectionFinalization",
             ConnectionActivationState::Finalized { .. } => "Finalized",
         }
@@ -304,11 +385,11 @@ fn create_client_confirm_active(
     config: &Config,
     mut server_capability_sets: Vec<CapabilitySet>,
     desktop_size: DesktopSize,
-) -> rdp::capability_sets::ClientConfirmActive {
+) -> ConnectorResult<rdp::capability_sets::ClientConfirmActive> {
     use ironrdp_pdu::rdp::capability_sets::{
         BITMAP_CACHE_ENTRIES_NUM, Bitmap, BitmapCache, BitmapDrawingFlags, Brush, CacheDefinition, CacheEntry,
         ClientConfirmActive, CmdFlags, DemandActive, FrameAcknowledge, GLYPH_CACHE_NUM, General, GeneralExtraFlags,
-        GlyphCache, GlyphSupportLevel, Input, InputFlags, LargePointer, LargePointerSupportFlags, MultifragmentUpdate,
+        GlyphCache, GlyphSupportLevel, Input, LargePointer, LargePointerSupportFlags, MultifragmentUpdate,
         OffscreenBitmapCache, Order, OrderFlags, OrderSupportExFlags, Pointer, SERVER_CHANNEL_ID, Sound, SoundFlags,
         SupportLevel, SurfaceCommands, VirtualChannel, VirtualChannelFlags, client_codecs_capabilities,
     };
@@ -320,6 +401,7 @@ fn create_client_confirm_active(
         .as_ref()
         .map(|bitmap| bitmap.lossy_compression)
         .unwrap_or(false);
+    let pref_bits_per_pix = requested_bitmap_color_depth(config.bitmap.as_ref())?;
 
     let drawing_flags = if lossy_bitmap_compression {
         BitmapDrawingFlags::ALLOW_SKIP_ALPHA
@@ -336,7 +418,7 @@ fn create_client_confirm_active(
             ..Default::default()
         }),
         CapabilitySet::Bitmap(Bitmap {
-            pref_bits_per_pix: 32,
+            pref_bits_per_pix,
             desktop_width: desktop_size.width,
             desktop_height: desktop_size.height,
             // This is required to be true in order for the Microsoft::Windows::RDS::DisplayControl DVC to work.
@@ -443,11 +525,54 @@ fn create_client_confirm_active(
         ]));
     }
 
-    ClientConfirmActive {
+    Ok(ClientConfirmActive {
         originator_id: SERVER_CHANNEL_ID,
         pdu: DemandActive {
             source_descriptor: "IRONRDP".to_owned(),
             capability_sets: server_capability_sets,
         },
+    })
+}
+
+/// Returns the color depth requested by the client configuration for the Bitmap Capability Set.
+///
+/// [MS-RDPBCGR] requires `preferredBitsPerPixel` to match the requested Client Core Data color
+/// depth. Keeping these values aligned is particularly important for non-32-bpp clients: a 32-bpp
+/// Bitmap Capability Set permits the server to select RDP 6.0 bitmap compression instead.
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/49e7bcb9-a8d7-46f5-987e-46c63c44b2c4
+fn requested_bitmap_color_depth(bitmap: Option<&crate::BitmapConfig>) -> ConnectorResult<u16> {
+    match bitmap.map_or(32, |bitmap| bitmap.color_depth) {
+        15 => Ok(15),
+        16 => Ok(16),
+        24 => Ok(24),
+        32 => Ok(32),
+        color_depth => Err(reason_err!(
+            "create client confirm active",
+            "unsupported bitmap color depth: {color_depth}"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::requested_bitmap_color_depth;
+    use crate::BitmapConfig;
+
+    #[test]
+    fn bitmap_capability_uses_requested_color_depth() {
+        assert_eq!(requested_bitmap_color_depth(None).unwrap(), 32);
+        for expected_color_depth in [15, 16, 24, 32] {
+            let bitmap = BitmapConfig {
+                color_depth: u32::from(expected_color_depth),
+                lossy_compression: false,
+                codecs: ironrdp_pdu::rdp::capability_sets::BitmapCodecs(Vec::new()),
+            };
+
+            assert_eq!(
+                requested_bitmap_color_depth(Some(&bitmap)).unwrap(),
+                expected_color_depth
+            );
+        }
     }
 }

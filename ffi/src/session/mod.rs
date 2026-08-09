@@ -2,7 +2,6 @@ pub mod image;
 
 #[diplomat::bridge]
 pub mod ffi {
-
     use super::image::ffi::DecodedImage;
     use crate::clipboard::message::ffi::{ClipboardFormatId, ClipboardFormatIterator, FormatDataResponse};
     use crate::connector::activation::ffi::ConnectionActivationSequence;
@@ -15,7 +14,10 @@ pub mod ffi {
     use crate::utils::ffi::{BytesSlice, Position, VecU8};
 
     #[diplomat::opaque]
-    pub struct ActiveStage(pub ironrdp::session::ActiveStage);
+    pub struct ActiveStage(
+        pub ironrdp::session::ActiveStage,
+        pub ironrdp::connector::connection_activation::ConnectionActivationFactory,
+    );
 
     #[diplomat::opaque]
     pub struct ActiveStageOutput(pub ironrdp::session::ActiveStageOutput);
@@ -39,12 +41,36 @@ pub mod ffi {
 
     impl ActiveStage {
         pub fn new(connection_result: &mut ConnectionResult) -> Result<Box<Self>, Box<IronRdpError>> {
-            Ok(Box::new(ActiveStage(ironrdp::session::ActiveStage::new(
-                connection_result
-                    .0
-                    .take()
-                    .ok_or_else(|| ValueConsumedError::for_item("connection_result"))?,
-            ))))
+            let connection_result = connection_result
+                .0
+                .take()
+                .ok_or_else(|| ValueConsumedError::for_item("connection_result"))?;
+
+            // Retain the factory to drive the Deactivation-Reactivation Sequence.
+            let activation_factory = connection_result.activation_factory;
+
+            let stage = ironrdp::session::ActiveStageBuilder {
+                static_channels: connection_result.static_channels,
+                user_channel_id: connection_result.user_channel_id,
+                io_channel_id: connection_result.io_channel_id,
+                message_channel_id: connection_result.message_channel_id,
+                share_id: connection_result.share_id,
+                compression_type: connection_result.compression_type,
+                enable_server_pointer: connection_result.enable_server_pointer,
+                pointer_software_rendering: connection_result.pointer_software_rendering,
+            }
+            .build();
+
+            Ok(Box::new(ActiveStage(stage, activation_factory)))
+        }
+
+        /// Produces a fresh connection activation sequence to drive the Deactivation-Reactivation
+        /// Sequence.
+        ///
+        /// Call this upon receiving a [`ActiveStageOutputType::DeactivateAll`] output, drive the
+        /// returned sequence until it is finalized, then discard it.
+        pub fn create_connection_activation(&self) -> Box<ConnectionActivationSequence> {
+            Box::new(ConnectionActivationSequence(Box::new(self.1.create())))
         }
 
         pub fn process(
@@ -160,6 +186,11 @@ pub mod ffi {
                 .transpose()?)
         }
 
+        /// Rebuilds the fast-path processor for a Deactivation-Reactivation Sequence, keeping the
+        /// negotiated bulk compression alive.
+        ///
+        /// The name is kept for ABI compatibility; this now also applies `enable_server_pointer`,
+        /// which previously only reached the processor and not the active stage itself.
         pub fn set_fastpath_processor(
             &mut self,
             io_channel_id: u16,
@@ -168,18 +199,13 @@ pub mod ffi {
             enable_server_pointer: bool,
             pointer_software_rendering: bool,
         ) {
-            self.0.set_fastpath_processor(
-                ironrdp::session::fast_path::ProcessorBuilder {
-                    io_channel_id,
-                    user_channel_id,
-                    share_id,
-                    enable_server_pointer,
-                    pointer_software_rendering,
-                    bulk_decompressor: None,
-                }
-                .build(),
+            self.0.reactivate(
+                io_channel_id,
+                user_channel_id,
+                share_id,
+                enable_server_pointer,
+                pointer_software_rendering,
             );
-            self.0.set_share_id(share_id);
         }
 
         pub fn set_enable_server_pointer(&mut self, enable_server_pointer: bool) {
@@ -201,6 +227,8 @@ pub mod ffi {
         /// Use `get_autodetect_network_characteristics()` to retrieve
         /// RTT and bandwidth values for connection quality monitoring.
         AutoDetect,
+        SaveSessionInfo,
+        AutoReconnectCookie,
     }
 
     impl ActiveStageOutput {
@@ -213,11 +241,15 @@ pub mod ffi {
                 ironrdp::session::ActiveStageOutput::PointerPosition { .. } => ActiveStageOutputType::PointerPosition,
                 ironrdp::session::ActiveStageOutput::PointerBitmap { .. } => ActiveStageOutputType::PointerBitmap,
                 ironrdp::session::ActiveStageOutput::Terminate { .. } => ActiveStageOutputType::Terminate,
-                ironrdp::session::ActiveStageOutput::DeactivateAll { .. } => ActiveStageOutputType::DeactivateAll,
+                ironrdp::session::ActiveStageOutput::DeactivateAll => ActiveStageOutputType::DeactivateAll,
                 ironrdp::session::ActiveStageOutput::MultitransportRequest { .. } => {
                     ActiveStageOutputType::MultitransportRequest
                 }
                 ironrdp::session::ActiveStageOutput::AutoDetect { .. } => ActiveStageOutputType::AutoDetect,
+                ironrdp::session::ActiveStageOutput::SaveSessionInfo { .. } => ActiveStageOutputType::SaveSessionInfo,
+                ironrdp::session::ActiveStageOutput::AutoReconnectCookie { .. } => {
+                    ActiveStageOutputType::AutoReconnectCookie
+                }
             }
         }
 
@@ -266,18 +298,6 @@ pub mod ffi {
             match &self.0 {
                 ironrdp::session::ActiveStageOutput::Terminate(reason) => Ok(GracefulDisconnectReason(reason.clone())),
                 _ => Err(IncorrectEnumTypeError::on_variant("Terminate")
-                    .of_enum("ActiveStageOutput")
-                    .into()),
-            }
-            .map(Box::new)
-        }
-
-        pub fn get_deactivate_all(&self) -> Result<Box<ConnectionActivationSequence>, Box<IronRdpError>> {
-            match &self.0 {
-                ironrdp::session::ActiveStageOutput::DeactivateAll(cas) => {
-                    Ok(ConnectionActivationSequence(cas.clone()))
-                }
-                _ => Err(IncorrectEnumTypeError::on_variant("DeactivateAll")
                     .of_enum("ActiveStageOutput")
                     .into()),
             }

@@ -8,7 +8,7 @@ use clap::Parser;
 use clap::clap_derive::ValueEnum;
 use ironrdp::client::config::{
     ClipboardType as ResolvedClipboardType, Config, ConfigBuilder, Destination, DvcProxyInfo, MissingField,
-    TransportKind,
+    TransportKind, VmConnectMode,
 };
 use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
 use ironrdp_cfg::PropertySetExt as _;
@@ -62,6 +62,14 @@ struct Args {
     #[clap(short, long, value_parser)]
     log_file: Option<String>,
 
+    /// Run as a visible GUI host for the IronRDP local RPC protocol.
+    #[clap(long)]
+    rpc: bool,
+
+    /// Override the agent-compatible RPC endpoint (defaults to the per-user agent endpoint).
+    #[clap(long, requires = "rpc")]
+    rpc_endpoint: Option<String>,
+
     #[clap(long, value_parser)]
     gw_endpoint: Option<String>,
     #[clap(long, value_parser)]
@@ -70,6 +78,7 @@ struct Args {
     gw_pass: Option<String>,
 
     /// An address on which the client will connect.
+    #[clap(env = "RDP_HOSTNAME")]
     destination: Option<Destination>,
 
     /// Path to a .rdp file to read the configuration from.
@@ -77,7 +86,7 @@ struct Args {
     rdp_file: Option<PathBuf>,
 
     /// A target RDP server user name
-    #[clap(short, long)]
+    #[clap(short, long, env = "RDP_USERNAME")]
     username: Option<String>,
 
     /// An optional target RDP server domain name
@@ -85,7 +94,7 @@ struct Args {
     domain: Option<String>,
 
     /// A target RDP server user password
-    #[clap(short, long)]
+    #[clap(short, long, env = "RDP_PASSWORD", hide_env_values = true)]
     password: Option<String>,
 
     /// Proxy URL to connect to for the RDCleanPath
@@ -97,6 +106,18 @@ struct Args {
     /// Authentication token to insert in the RDCleanPath packet
     #[clap(long, requires("rdcleanpath_url"))]
     rdcleanpath_token: Option<String>,
+
+    /// Connect to a Hyper-V VM console instead of an RDP host, by VM ID (`Get-VM | Select Id`).
+    ///
+    /// The destination is the Hyper-V host, which listens on port 2179. TLS and CredSSP are
+    /// required (do not combine with `--no-tls` / `--no-credssp`). Not supported with
+    /// `--gw-endpoint` / RDCleanPath until those transports can target port 2179.
+    #[clap(long, value_name = "VM_ID")]
+    vmconnect: Option<String>,
+
+    /// Use the Hyper-V basic console instead of Enhanced Session mode.
+    #[clap(long, requires = "vmconnect")]
+    vmconnect_basic: bool,
 
     /// The keyboard type
     #[clap(long, value_enum, default_value_t = KeyboardType::IbmEnhanced)]
@@ -225,6 +246,8 @@ pub struct ViewerConfig {
     // CLI-only settings that are not representable as `.rdp` file properties.
     log_file: Option<String>,
     dump_rdp: Option<PathBuf>,
+    rpc: bool,
+    rpc_endpoint: Option<String>,
 }
 
 impl ViewerConfig {
@@ -255,6 +278,19 @@ impl ViewerConfig {
         let log_file = args.log_file.clone();
         let dump_rdp = args.dump_rdp.clone();
 
+        if args.rpc {
+            if args.rdp_file.is_some() || dump_rdp.is_some() {
+                anyhow::bail!("--rpc cannot be combined with --rdp-file or --dump-rdp");
+            }
+            return Ok(Self {
+                builder: ConfigBuilder::new(),
+                log_file,
+                dump_rdp: None,
+                rpc: true,
+                rpc_endpoint: args.rpc_endpoint,
+            });
+        }
+
         // The library overlays everything expressible as a `.rdp` property: destination, credentials,
         // transport, channels, desktop size, audio, DVC proxies, etc.
         let builder = ConfigBuilder::from_property_set(&properties)?;
@@ -270,6 +306,8 @@ impl ViewerConfig {
             builder,
             log_file,
             dump_rdp,
+            rpc: false,
+            rpc_endpoint: None,
         })
     }
 
@@ -289,6 +327,16 @@ impl ViewerConfig {
     /// Path to dump the effective `.rdp` PropertySet to, if `--dump-rdp` was given.
     pub fn dump_rdp(&self) -> Option<&std::path::Path> {
         self.dump_rdp.as_deref()
+    }
+
+    /// Whether the viewer should host the local RPC server.
+    pub fn rpc_mode(&self) -> bool {
+        self.rpc
+    }
+
+    /// Endpoint explicitly selected for the RPC host.
+    pub fn rpc_endpoint(&self) -> Option<&str> {
+        self.rpc_endpoint.as_deref()
     }
 }
 
@@ -351,6 +399,15 @@ fn apply_cli_to_builder(mut builder: ConfigBuilder, args: Args, redirect_clipboa
     }
 
     // Transport overrides: RDCleanPath takes precedence over Gateway.
+    if let Some(vm_id) = args.vmconnect {
+        let mode = if args.vmconnect_basic {
+            VmConnectMode::Basic
+        } else {
+            VmConnectMode::Enhanced
+        };
+        builder = builder.with_vmconnect_mode(vm_id, mode);
+    }
+
     if let Some(url) = args.rdcleanpath_url {
         builder = builder.with_transport(TransportKind::RDCleanPath { url });
 

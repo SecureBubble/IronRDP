@@ -3,8 +3,6 @@
 
 mod macros;
 
-pub mod legacy;
-
 mod channel_connection;
 mod connection;
 pub mod connection_activation;
@@ -26,7 +24,10 @@ use ironrdp_pdu::{PduHint, gcc, x224};
 pub use sspi;
 
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
-pub use self::connection::{ClientConnector, ClientConnectorState, ConnectionResult, encode_send_data_request};
+pub use self::connection::{
+    ClientConnector, ClientConnectorState, ConnectionResult, DynamicStaticChannelAttachError, MultitransportResult,
+    encode_send_data_request,
+};
 pub use self::connection_finalization::{ConnectionFinalizationSequence, ConnectionFinalizationState};
 pub use self::license_exchange::{LicenseExchangeSequence, LicenseExchangeState};
 pub use self::server_name::ServerName;
@@ -111,6 +112,7 @@ pub struct SmartCardIdentity {
 #[derive(Debug, Clone)]
 pub enum Credentials {
     UsernamePassword {
+        /// An empty username suppresses the X.224 `mstshash` cookie.
         username: String,
         password: String,
     },
@@ -123,7 +125,8 @@ pub enum Credentials {
 impl Credentials {
     fn username(&self) -> Option<&str> {
         match self {
-            Self::UsernamePassword { username, .. } => Some(username),
+            Self::UsernamePassword { username, .. } if !username.is_empty() => Some(username),
+            Self::UsernamePassword { .. } => None,
             Self::SmartCard { .. } => None, // Username is ultimately provided by the smart card certificate.
         }
     }
@@ -190,6 +193,17 @@ pub struct Config {
     /// computers.
     #[doc(alias("enable_nla", "nla"))]
     pub enable_credssp: bool,
+    /// Allow Standard RDP Security (`PROTOCOL_RDP`, empty X.224 flags).
+    ///
+    /// When both [`enable_tls`](Self::enable_tls) and [`enable_credssp`](Self::enable_credssp) are
+    /// `false`, the connector would otherwise advertise no enhanced protocols. IronRDP only supports
+    /// the `ENCRYPTION_LEVEL_NONE` variant of standard RDP security (no RC4 Security Exchange), which
+    /// is appropriate for trusted local transports such as Windows Sandbox named pipes — not for
+    /// ordinary TCP sessions.
+    ///
+    /// Defaults should stay `false`. Enable this only for known-local paths that opt in explicitly
+    /// (e.g. `Transport::NamedPipe`).
+    pub enable_standard_rdp_security: bool,
     pub credentials: Credentials,
     pub domain: Option<String>,
     /// The build number of the client.
@@ -202,6 +216,8 @@ pub struct Config {
     pub keyboard_subtype: u32,
     pub keyboard_functional_keys_count: u32,
     pub keyboard_layout: u32,
+    /// Network profile advertised in the Client Core Data GCC block.
+    pub connection_type: gcc::ConnectionType,
     pub ime_file_name: String,
     pub bitmap: Option<BitmapConfig>,
     pub dig_product_id: String,

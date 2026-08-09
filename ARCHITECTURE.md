@@ -172,11 +172,24 @@ Reusable client engine library: holds the `Config`/`ConfigBuilder`, the `RdpClie
 input/output event types, and the WebSocket transport. Consumed by `ironrdp-viewer` and any
 other embedder (e.g. a headless agent).
 
+#### [`crates/ironrdp-vmconnect`](./crates/ironrdp-vmconnect)
+
+Hyper-V VM console front-end implementing the PCB → TLS → CredSSP → X.224 connection ordering.
+This crate is an **API Boundary**, exposed directly through the `ironrdp` meta crate's optional
+`vmconnect` feature and integrated into `ironrdp-client` through its optional `vmconnect` feature.
+
 #### [`crates/ironrdp-viewer`](./crates/ironrdp-viewer)
 
 Portable RDP client binary without GPU acceleration. A thin wrapper around `ironrdp-client`
 that adds the winit/softbuffer GUI event loop, the clap CLI, the inquire prompts and the
 `.rdp` file / PropertySet plumbing.
+
+#### [`crates/ironrdp-daemon`](./crates/ironrdp-daemon)
+
+Internal reusable persistent RDP-session support. It provides local RPC daemon lifecycle and
+server handling, retained framebuffer, input and screenshot handling, session log buffering, NOW
+endpoint management, and durable NOW operations. Its RPC schema and transport dependency is
+[`ironrdp-rpc`](./crates/ironrdp-rpc); it is not published.
 
 #### [`crates/ironrdp-web`](./crates/ironrdp-web)
 

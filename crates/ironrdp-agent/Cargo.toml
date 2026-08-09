@@ -1,6 +1,6 @@
 [package]
 name = "ironrdp-agent"
-version = "0.0.0"
+version = "0.1.0"
 readme = "README.md"
 description = "CLI-driven, daemon-backed agentic RDP client suitable for LLM consumption"
 edition.workspace = true
@@ -11,54 +11,46 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-# Not publishing for now.
-publish = false
-
 [lib]
 doctest = false
-test = false
 
 [[bin]]
 name = "ironrdp-agent"
 path = "src/main.rs"
 test = false
 
-[features]
-# Exposes otherwise-internal modules (e.g. the wire codec helpers) for unit testing from the
-# workspace test suite. Hidden from docs; not intended for downstream use.
-internal = []
-
 [dependencies]
-# RDP client engine: only the TLS backend is mandated
-ironrdp-client = { path = "../ironrdp-client", features = ["rustls"] }
-
 # Configuration model and codecs
-ironrdp-core = { path = "../ironrdp-core", features = ["alloc"] }
-ironrdp-pdu = { path = "../ironrdp-pdu" }
-ironrdp-propertyset = { path = "../ironrdp-propertyset" }
-ironrdp-cfg = { path = "../ironrdp-cfg" }
-ironrdp-rdpfile = { path = "../ironrdp-rdpfile" }
-ironrdp-input = { path = "../ironrdp-input" }
+ironrdp-propertyset = { path = "../ironrdp-propertyset", version = "0.1" }
+ironrdp-cfg = { path = "../ironrdp-cfg", version = "0.1" }
+ironrdp-rdpfile = { path = "../ironrdp-rdpfile", version = "0.1" }
+ironrdp-input = { path = "../ironrdp-input", version = "0.7" }
+ironrdp-daemon = { path = "../ironrdp-daemon", version = "0.1" }
+ironrdp-rpc = { path = "../ironrdp-rpc", version = "0.1" }
 
-# Async runtime and IPC transport
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util", "time", "signal"] }
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "rt"] }
 
 # CLI
-clap = { version = "4.6", features = ["derive", "cargo"] }
-
-# Logging (ring-buffer tracing layer)
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# PNG encoding for screenshots
-png = "0.18"
+clap = { version = "4.6", features = ["derive", "cargo", "env"] }
 
 # Utils
 anyhow = "1"
-whoami = "2.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+[target.'cfg(windows)'.dependencies]
+# Windows Sandbox control plane: gRPC/HTTP2 over a per-user named pipe.
+bytes = "1"
+h2 = "0.4"
+http = "1"
+md-5 = "0.10"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
 
 [lints]
 workspace = true

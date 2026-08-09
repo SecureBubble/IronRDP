@@ -33,27 +33,21 @@ pub fn bulk_decompress_mppc(data: &[u8]) {
     } else {
         (CompressionType::Rdp5, 0x01)
     };
-    let Ok(mut bulk) = BulkCompressor::new(comp_type) else {
-        return;
-    };
+    let mut bulk = BulkCompressor::new(comp_type);
     let _ = bulk.decompress(payload, flags::PACKET_COMPRESSED | algo_bits);
 }
 
 pub fn bulk_decompress_ncrush(data: &[u8]) {
     use ironrdp_bulk::{BulkCompressor, CompressionType, flags};
 
-    let Ok(mut bulk) = BulkCompressor::new(CompressionType::Rdp6) else {
-        return;
-    };
+    let mut bulk = BulkCompressor::new(CompressionType::Rdp6);
     let _ = bulk.decompress(data, flags::PACKET_COMPRESSED | 0x02);
 }
 
 pub fn bulk_decompress_xcrush(data: &[u8]) {
     use ironrdp_bulk::{BulkCompressor, CompressionType, flags};
 
-    let Ok(mut bulk) = BulkCompressor::new(CompressionType::Rdp61) else {
-        return;
-    };
+    let mut bulk = BulkCompressor::new(CompressionType::Rdp61);
     let _ = bulk.decompress(data, flags::PACKET_COMPRESSED | 0x03);
 }
 
@@ -84,9 +78,7 @@ pub fn bulk_round_trip(data: &[u8]) {
         _ => CompressionType::Rdp61,
     };
 
-    let Ok(mut sender) = BulkCompressor::new(algo) else {
-        return;
-    };
+    let mut sender = BulkCompressor::new(algo);
     let Ok((compressed_size, compress_flags)) = sender.compress(src) else {
         return;
     };
@@ -101,9 +93,7 @@ pub fn bulk_round_trip(data: &[u8]) {
         sender.compressed_data(compressed_size)
     };
 
-    let Ok(mut receiver) = BulkCompressor::new(algo) else {
-        return;
-    };
+    let mut receiver = BulkCompressor::new(algo);
     let decompressed = receiver
         .decompress(payload, compress_flags)
         .unwrap_or_else(|e| panic!("bulk round-trip decompress failed for {algo:?}: {e:?}"));
@@ -118,7 +108,9 @@ pub fn pdu_decode(data: &[u8]) {
     };
     use ironrdp_pdu::mcs::{ConnectInitial, ConnectResponse, McsMessage};
     use ironrdp_pdu::nego::{ConnectionConfirm, ConnectionRequest};
-    use ironrdp_pdu::rdp::{ClientInfoPdu, capability_sets, headers, server_error_info, server_license, vc};
+    use ironrdp_pdu::rdp::{
+        ClientInfoPdu, capability_sets, headers, multitransport, server_error_info, server_license, vc,
+    };
     use ironrdp_pdu::x224::X224;
     use ironrdp_pdu::{bitmap, codecs, fast_path, gcc, input, pcb, surface_commands};
 
@@ -140,6 +132,11 @@ pub fn pdu_decode(data: &[u8]) {
     let _ = decode::<gcc::ConferenceCreateResponse>(data);
 
     let _ = decode::<server_license::LicensePdu>(data);
+
+    // Post-licensing multitransport bootstrapping: the connector try-decodes
+    // arbitrary server bytes as a request to distinguish it from Demand Active.
+    let _ = decode::<multitransport::MultitransportRequestPdu>(data);
+    let _ = decode::<multitransport::MultitransportResponsePdu>(data);
 
     let _ = decode::<vc::ChannelPduHeader>(data);
 
@@ -195,18 +192,34 @@ pub fn pdu_decode(data: &[u8]) {
 
 /// Helper for [`pdu_round_trip`].
 ///
-/// Exercises `decode` → `encode_vec` → re-`decode`, silently dropping `Err`
-/// results from any stage. The oracle's value is in detecting INTERNAL
-/// panics from inside the encoder/decoder (e.g., `unreachable!()` reached
-/// on a valid decoded state), not in asserting Err-result symmetry. Many
-/// `ironrdp-pdu` types have known asymmetric `Encode` impls that return
-/// `"Encoding not implemented"` for variants the decoder still accepts;
-/// those are tracked separately and not in scope for this oracle.
+/// Exercises `decode` → `encode_vec` → re-`decode` → re-`encode_vec`.
+///
+/// A failing `decode` of the fuzzer's input is expected and skipped, and a
+/// failing `encode` is tolerated because several `ironrdp-pdu` types return
+/// `"Encoding not implemented"` for variants the decoder still accepts.
+///
+/// A *successful* encode is asserted to be re-decodable, because at that point the
+/// bytes were produced by this crate from a state this crate accepted. Emitting
+/// bytes we cannot read back is an encoder/decoder disagreement, and on the wire
+/// that is a peer refusing our PDU.
+///
+/// Byte stability across the round trip is deliberately NOT asserted. Several
+/// decoders normalise: `LogonInfoVersion1` reads `domainNameSize`, range-checks it,
+/// and then keeps only the trimmed string, so a PDU whose size field disagrees with
+/// its own padding cannot re-encode to identical bytes no matter how correct both
+/// halves are. That is a property of types that discard redundant wire fields, not
+/// a defect, so asserting it would report design as breakage.
 macro_rules! pdu_round_trip_one {
     ($data:expr, $ty:ty) => {{
         if let Ok(pdu) = ironrdp_core::decode::<$ty>($data) {
             if let Ok(encoded) = ironrdp_core::encode_vec(&pdu) {
-                let _ = ironrdp_core::decode::<$ty>(&encoded);
+                if let Err(e) = ironrdp_core::decode::<$ty>(&encoded) {
+                    panic!(
+                        "{}: encoded {} bytes that failed to decode again: {e}",
+                        stringify!($ty),
+                        encoded.len(),
+                    );
+                }
             }
         }
     }};
@@ -229,13 +242,20 @@ macro_rules! pdu_round_trip_one {
 ///   decoder-accepted inputs.
 /// - Panics in the decoder when fed encoder-produced bytes (re-decode path).
 ///
+/// - An encoder that emits bytes it cannot read back.
+///
 /// What this does NOT catch:
 ///
 /// - Encode returning `Err`. Many PDU types intentionally return errors for
 ///   partially-implemented variants; exercising them is the encoder
 ///   developer's responsibility, not this oracle's.
-/// - Re-decode returning `Err`. Surfaces an asymmetry but not a memory-safety
-///   bug; tracked via filed follow-up issues, not this oracle.
+///
+/// Re-decode returning `Err` used to be excluded here, on the grounds that an
+/// encode/decode disagreement is not a memory-safety bug and could be tracked
+/// separately. In practice it was not: the `BandwidthMeasureStop` asymmetry
+/// fixed in the preceding commit went unnoticed because nothing asserted this,
+/// and it was found by hand while writing an unrelated test. Emitting bytes we
+/// cannot read back is a real defect on the wire, so it is asserted now.
 ///
 /// Initial type coverage mirrors `pdu_decode` so the same corpus feeds both
 /// oracles. As new PDU types gain `Encode` impls, they auto-extend coverage
@@ -245,7 +265,7 @@ pub fn pdu_round_trip(data: &[u8]) {
     use ironrdp_pdu::nego::{ConnectionConfirm, ConnectionRequest};
     use ironrdp_pdu::rdp::capability_sets::CapabilitySet;
     use ironrdp_pdu::rdp::headers::ShareControlHeader;
-    use ironrdp_pdu::rdp::{ClientInfoPdu, server_error_info, server_license, vc};
+    use ironrdp_pdu::rdp::{self, ClientInfoPdu, multitransport, server_error_info, server_license, vc};
     use ironrdp_pdu::x224::X224;
     use ironrdp_pdu::{bitmap, codecs, fast_path, gcc, input, pcb, surface_commands};
 
@@ -273,6 +293,10 @@ pub fn pdu_round_trip(data: &[u8]) {
     // Licensing
     pdu_round_trip_one!(data, server_license::LicensePdu);
 
+    // Multitransport bootstrapping (server request / client response)
+    pdu_round_trip_one!(data, multitransport::MultitransportRequestPdu);
+    pdu_round_trip_one!(data, multitransport::MultitransportResponsePdu);
+
     // Virtual channel header
     pdu_round_trip_one!(data, vc::ChannelPduHeader);
 
@@ -286,6 +310,12 @@ pub fn pdu_round_trip(data: &[u8]) {
     pdu_round_trip_one!(data, surface_commands::FrameMarkerPdu);
     pdu_round_trip_one!(data, surface_commands::ExtendedBitmapDataPdu<'_>);
     pdu_round_trip_one!(data, surface_commands::BitmapDataHeader);
+
+    // Network auto-detect. The `BandwidthMeasureStop` encode/decode asymmetry fixed in
+    // the preceding commit lives here; with the re-decode assertion above, this coverage
+    // is what would have caught it.
+    pdu_round_trip_one!(data, rdp::autodetect::AutoDetectReqPdu);
+    pdu_round_trip_one!(data, rdp::autodetect::AutoDetectRspPdu);
 
     // Codecs
     pdu_round_trip_one!(data, codecs::rfx::Block<'_>);
@@ -355,6 +385,122 @@ pub fn egfx_round_trip(data: &[u8]) {
     pdu_round_trip_one!(data, CapabilitiesConfirmPdu);
     pdu_round_trip_one!(data, Avc420BitmapStream<'_>);
     pdu_round_trip_one!(data, Avc444BitmapStream<'_>);
+}
+
+/// AVC420 decode-side wrapper fuzz oracle.
+///
+/// Fuzzes the IronRDP wrapper layer between a wire `Avc420BitmapStream` and
+/// the consumer's `H264Decoder`. Specifically targets `avc_to_annex_b`, the
+/// AVC-length-prefix to Annex-B conversion that runs before OpenH264 sees
+/// any bytes.
+///
+/// The oracle runs two paths on each input:
+///
+/// - Direct: call `avc_to_annex_b(data)` on the raw fuzz input. This
+///   exercises the wrapper on arbitrary byte distributions, including
+///   inputs that do not parse as `Avc420BitmapStream`.
+/// - Decode-chain: try `Avc420BitmapStream::decode(data)`; on success, call
+///   `avc_to_annex_b(stream.data)`. This exercises the wrapper on the
+///   realistic post-decode payload distribution.
+///
+/// What this catches: panics in the wrapper, OOM via attacker-controlled
+/// NAL length encoding, contract violations on the produced Annex-B byte
+/// stream that downstream H264Decoder callers rely on.
+///
+/// What this does NOT catch: OpenH264 itself (covered by OSS-Fuzz), the
+/// post-OpenH264 YUV-to-RGBA conversion path in `OpenH264Decoder::decode`,
+/// AVC444 luma plus chroma split (covered by a sibling target).
+pub fn egfx_avc420_decode(data: &[u8]) {
+    use ironrdp_egfx::pdu::{Avc420BitmapStream, avc_to_annex_b};
+
+    let _ = avc_to_annex_b(data);
+
+    let mut cursor = ironrdp_core::ReadCursor::new(data);
+    if let Ok(stream) = ironrdp_core::decode_cursor::<Avc420BitmapStream<'_>>(&mut cursor) {
+        let _ = avc_to_annex_b(stream.data);
+    }
+}
+
+/// Multi-frame oracle for the EGFX graphics pipeline client.
+///
+/// H.264 decoding maintains reference-picture state, SPS/PPS context, and
+/// decoder configuration across frames; surface caching and codec dispatch
+/// state in egfx all carry forward across PDUs. Single-shot fuzzers cannot
+/// reach frame-to-frame state corruption because they construct a fresh
+/// decoder per iteration. This oracle constructs ONE `GraphicsPipelineClient`
+/// at iteration start and drives a sequence of `GfxPdu`s through it, exposing
+/// cross-PDU state to the fuzzer.
+///
+/// Harness shape: `Arbitrary`-derived `Vec<GfxPdu>` (each variant `Arbitrary`
+/// via the cascade in PR #1334). Each PDU is encoded back to wire bytes,
+/// wrapped in a single uncompressed ZGFX segment, and fed to the client's
+/// public `DvcProcessor::process` entry point. This exercises the same path
+/// production traffic takes: ZGFX decompress -> `GfxPdu` decode -> dispatch
+/// to per-variant handler -> state machine + surface cache update.
+///
+/// What this catches: panics or sanitizer reports along the dispatch + state
+/// machine path when fed adversarially-ordered or malformed-payload PDUs;
+/// inconsistent surface-cache state under attacker-controlled
+/// CreateSurface / DeleteSurface / Map* orderings; corrupted frame-id state
+/// from interleaved StartFrame / EndFrame / FrameAcknowledge sequences;
+/// ZGFX-wrapper integration bugs separate from the standalone ZGFX coverage
+/// in `egfx_zgfx_decompress`.
+///
+/// What this does NOT catch: cross-frame H.264 decoder state corruption.
+/// The client is constructed with `h264_decoder: None`, so H264-bearing
+/// PDUs (WireToSurface1 with AVC codecs) don't reach the H.264 decoder.
+/// The standalone `egfx_avc420_decode` and `egfx_avc444_decode` targets
+/// cover the H.264 wrapper. Wiring a real (or mock) H.264 decoder into
+/// this harness can be a follow-up if frame-to-frame H.264 state coverage
+/// surfaces as a gap.
+pub fn egfx_multi_frame(data: &[u8]) {
+    use arbitrary::{Arbitrary as _, Unstructured};
+    use ironrdp_core::encode_vec;
+    use ironrdp_dvc::DvcProcessor as _;
+    use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+    use ironrdp_egfx::pdu::GfxPdu;
+    use ironrdp_graphics::zgfx::wrap_uncompressed;
+
+    /// No-op handler. Every callback default-impls in the trait, so the empty
+    /// struct gets all defaults for free. The handler exists to satisfy
+    /// `GraphicsPipelineClient::new`'s API; the fuzz oracle does not inspect
+    /// any of the dispatched events.
+    struct NoOpHandler;
+    impl GraphicsPipelineHandler for NoOpHandler {}
+
+    let mut unstructured = Unstructured::new(data);
+    let Ok(pdus) = Vec::<GfxPdu>::arbitrary(&mut unstructured) else {
+        return;
+    };
+
+    let mut client = GraphicsPipelineClient::new(Box::new(NoOpHandler), None);
+
+    // Initialise the channel state by invoking the DvcProcessor::start entry.
+    // The returned advertise message is discarded; the call's side effect is
+    // putting the client's internal state machine into its post-start state.
+    const FUZZ_CHANNEL_ID: u32 = 0;
+    let _ = client.start(FUZZ_CHANNEL_ID);
+
+    for pdu in pdus {
+        // Encode each PDU back to wire bytes so the client processes through
+        // the same decode + dispatch path real traffic takes. Skip PDUs whose
+        // encoder rejects the Arbitrary-generated values rather than aborting
+        // the iteration; the next PDU may still exercise interesting state.
+        let Ok(pdu_bytes) = encode_vec(&pdu) else {
+            continue;
+        };
+
+        // Wrap the encoded PDU in an uncompressed ZGFX segment so the client's
+        // ZGFX decompressor produces the PDU bytes unmodified. This bypasses
+        // the ZGFX decoder layer (covered separately by egfx_zgfx_decompress)
+        // and concentrates fuzz pressure on the dispatch + state machine.
+        let payload = wrap_uncompressed(&pdu_bytes);
+
+        // Errors and panics propagate to libFuzzer naturally; we discard the
+        // Result since the oracle's job is to surface bugs, not to enforce
+        // dispatcher semantics.
+        let _ = client.process(FUZZ_CHANNEL_ID, &payload);
+    }
 }
 
 pub fn rle_decompress_bitmap(input: BitmapInput<'_>) {

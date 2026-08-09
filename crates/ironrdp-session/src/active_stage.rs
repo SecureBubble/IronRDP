@@ -1,87 +1,117 @@
 use std::sync::Arc;
 
-use ironrdp_bulk::BulkCompressor;
-use ironrdp_connector::ConnectionResult;
-use ironrdp_connector::connection_activation::ConnectionActivationSequence;
+use ironrdp_bulk::{BulkCompressor, CompressionType as BulkCompressionType};
 use ironrdp_core::{ReadCursor, WriteBuf};
 use ironrdp_displaycontrol::client::DisplayControlClient;
-use ironrdp_dvc::{DrdynvcClient, DvcProcessor, DynamicVirtualChannel};
+use ironrdp_dvc::{DrdynvcClient, DvcClientProcessor, DynamicChannelRef};
 use ironrdp_graphics::pointer::DecodedPointer;
+use ironrdp_pdu::gcc::ChannelName;
 use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::rdp::autodetect::AutoDetectRequest;
-use ironrdp_pdu::rdp::client_info::CompressionType as PduCompressionType;
+use ironrdp_pdu::rdp::client_info::CompressionType;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
+use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
+use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
 use ironrdp_pdu::slow_path::{self, GraphicsUpdateType};
 use ironrdp_pdu::{Action, mcs};
-use ironrdp_svc::{SvcMessage, SvcProcessor, SvcProcessorMessages};
-use tracing::{debug, info, warn};
+use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages};
+use tracing::{debug, warn};
 
 use crate::fast_path::UpdateKind;
 use crate::image::DecodedImage;
 use crate::{SessionError, SessionErrorExt as _, SessionResult, fast_path, x224};
 
-/// Converts the PDU-layer compression type to the bulk crate's compression type.
-fn to_bulk_compression_type(ct: PduCompressionType) -> ironrdp_bulk::CompressionType {
-    match ct {
-        PduCompressionType::K8 => ironrdp_bulk::CompressionType::Rdp4,
-        PduCompressionType::K64 => ironrdp_bulk::CompressionType::Rdp5,
-        PduCompressionType::Rdp6 => ironrdp_bulk::CompressionType::Rdp6,
-        PduCompressionType::Rdp61 => ironrdp_bulk::CompressionType::Rdp61,
+fn to_bulk_compression_type(compression_type: CompressionType) -> BulkCompressionType {
+    match compression_type {
+        CompressionType::K8 => BulkCompressionType::Rdp4,
+        CompressionType::K64 => BulkCompressionType::Rdp5,
+        CompressionType::Rdp6 => BulkCompressionType::Rdp6,
+        CompressionType::Rdp61 => BulkCompressionType::Rdp61,
     }
 }
 
 pub struct ActiveStage {
     x224_processor: x224::Processor,
     fast_path_processor: fast_path::Processor,
+    /// Shared server-to-client compression history across all output transports.
+    bulk_decompressor: Option<BulkCompressor>,
     enable_server_pointer: bool,
 }
 
-impl ActiveStage {
-    pub fn new(connection_result: ConnectionResult) -> Self {
+/// Builder for [`ActiveStage`].
+///
+/// All fields are required; they are typically taken straight from `ironrdp-connector`’s
+/// `ConnectionResult` once the connection sequence is finalized.
+pub struct ActiveStageBuilder {
+    pub static_channels: StaticChannelSet,
+    pub user_channel_id: u16,
+    pub io_channel_id: u16,
+    pub message_channel_id: Option<u16>,
+    pub share_id: u32,
+    /// The bulk compression type negotiated during connection activation.
+    pub compression_type: Option<CompressionType>,
+    /// Enable server-side pointer updates (client-side pointer rendering).
+    pub enable_server_pointer: bool,
+    /// Use software rendering mode for pointer bitmap generation.
+    pub pointer_software_rendering: bool,
+}
+
+impl ActiveStageBuilder {
+    pub fn build(self) -> ActiveStage {
+        let Self {
+            static_channels,
+            user_channel_id,
+            io_channel_id,
+            message_channel_id,
+            share_id,
+            compression_type,
+            enable_server_pointer,
+            pointer_software_rendering,
+        } = self;
+
         let x224_processor = x224::Processor::new(
-            connection_result.static_channels,
-            connection_result.user_channel_id,
-            connection_result.io_channel_id,
-            connection_result.share_id,
-            connection_result.connection_activation,
+            static_channels,
+            user_channel_id,
+            io_channel_id,
+            message_channel_id,
+            share_id,
         );
 
-        // Create bulk decompressor if compression was negotiated
-        let bulk_decompressor = connection_result.compression_type.and_then(|ct| {
-            let bulk_ct = to_bulk_compression_type(ct);
-            match BulkCompressor::new(bulk_ct) {
-                Ok(compressor) => {
-                    info!(compression_type = %bulk_ct, "Bulk decompressor initialized for FastPath");
-                    Some(compressor)
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create bulk decompressor, compression disabled");
-                    None
-                }
-            }
-        });
-
         let fast_path_processor = fast_path::ProcessorBuilder {
-            io_channel_id: connection_result.io_channel_id,
-            user_channel_id: connection_result.user_channel_id,
-            share_id: connection_result.share_id,
-            enable_server_pointer: connection_result.enable_server_pointer,
-            pointer_software_rendering: connection_result.pointer_software_rendering,
-            bulk_decompressor,
+            io_channel_id,
+            user_channel_id,
+            share_id,
+            enable_server_pointer,
+            pointer_software_rendering,
         }
         .build();
 
-        Self {
+        ActiveStage {
             x224_processor,
             fast_path_processor,
-            enable_server_pointer: connection_result.enable_server_pointer,
+            bulk_decompressor: new_bulk_decompressor(compression_type),
+            enable_server_pointer,
         }
     }
+}
 
+fn new_bulk_decompressor(compression_type: Option<CompressionType>) -> Option<BulkCompressor> {
+    compression_type.map(|compression_type| BulkCompressor::new(to_bulk_compression_type(compression_type)))
+}
+
+impl ActiveStage {
     pub fn update_mouse_pos(&mut self, x: u16, y: u16) {
         self.fast_path_processor.update_mouse_pos(x, y);
+    }
+
+    /// Returns whether a malformed Fast-Path bitmap was discarded and needs a full visual recovery.
+    ///
+    /// The caller decides whether the negotiated capabilities permit a recovery request.
+    pub fn take_bitmap_recovery_request(&mut self) -> bool {
+        self.fast_path_processor.take_bitmap_recovery_request()
     }
 
     /// Encodes outgoing input events and modifies image if necessary (e.g for client-side pointer
@@ -141,14 +171,16 @@ impl ActiveStage {
         let (mut stage_outputs, processor_updates) = match action {
             Action::FastPath => {
                 let mut output = WriteBuf::new();
-                let processor_updates = self.fast_path_processor.process(image, frame, &mut output)?;
+                let processor_updates =
+                    self.fast_path_processor
+                        .process(image, frame, &mut output, &mut self.bulk_decompressor)?;
                 (
                     vec![ActiveStageOutput::ResponseFrame(output.into_inner())],
                     processor_updates,
                 )
             }
             Action::X224 => {
-                let x224_outputs = self.x224_processor.process(frame)?;
+                let x224_outputs = self.x224_processor.process(frame, &mut self.bulk_decompressor)?;
                 let mut stage_outputs = Vec::new();
                 let mut processor_updates = Vec::new();
 
@@ -196,6 +228,10 @@ impl ActiveStage {
         Ok(stage_outputs)
     }
 
+    /// Replaces the fast-path processor wholesale.
+    ///
+    /// Prefer [`ActiveStage::reactivate`] for a Deactivation-Reactivation Sequence: it also
+    /// updates the share_id and the server-pointer setting, which a bare replacement does not.
     pub fn set_fastpath_processor(&mut self, processor: fast_path::Processor) {
         self.fast_path_processor = processor;
     }
@@ -207,12 +243,41 @@ impl ActiveStage {
     }
 
     /// Updates the share_id used by the x224 processor for encoding ShareDataPdu.
-    /// Must be called during Deactivation-Reactivation if the server assigns a new share_id.
+    ///
+    /// [`ActiveStage::reactivate`] already does this, so a Deactivation-Reactivation Sequence does
+    /// not need to call it.
     pub fn set_share_id(&mut self, share_id: u32) {
         self.x224_processor.set_share_id(share_id);
     }
 
     pub fn set_enable_server_pointer(&mut self, enable_server_pointer: bool) {
+        self.enable_server_pointer = enable_server_pointer;
+    }
+
+    /// Rebuilds the fast-path processor for a [Deactivation-Reactivation Sequence].
+    ///
+    /// The shared bulk decompression history is retained. The server signals any history reset
+    /// with the PACKET_FLUSHED and PACKET_AT_FRONT compression flags, which are applied per update.
+    ///
+    /// [Deactivation-Reactivation Sequence]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
+    pub fn reactivate(
+        &mut self,
+        io_channel_id: u16,
+        user_channel_id: u16,
+        share_id: u32,
+        enable_server_pointer: bool,
+        pointer_software_rendering: bool,
+    ) {
+        self.fast_path_processor = fast_path::ProcessorBuilder {
+            io_channel_id,
+            user_channel_id,
+            share_id,
+            enable_server_pointer,
+            pointer_software_rendering,
+        }
+        .build();
+        // The x224 processor encodes ShareDataPdu with the server's (possibly new) share_id.
+        self.x224_processor.set_share_id(share_id);
         self.enable_server_pointer = enable_server_pointer;
     }
 
@@ -230,6 +295,68 @@ impl ActiveStage {
         Ok(vec![ActiveStageOutput::ResponseFrame(frame.into_inner())])
     }
 
+    /// Requests a full redraw of the negotiated desktop.
+    fn request_full_refresh(&self, width: u16, height: u16) -> SessionResult<Vec<u8>> {
+        debug_assert!(width != 0 && height != 0);
+        let mut frame = WriteBuf::new();
+        self.x224_processor.encode_static(
+            &mut frame,
+            ShareDataPdu::RefreshRectangle(RefreshRectanglePdu {
+                areas_to_refresh: vec![InclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: width.saturating_sub(1),
+                    bottom: height.saturating_sub(1),
+                }],
+            }),
+        )?;
+        Ok(frame.into_inner())
+    }
+
+    /// Requests a full redraw using a server-supported recovery PDU.
+    ///
+    /// A Suppress Output toggle is preferred when supported because it is the documented Refresh
+    /// Rect workaround for affected Microsoft RDP servers.
+    ///
+    /// [MS-RDPBCGR 2.2.11.3.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/0be71491-0b01-402c-947d-080706ccf91b
+    pub fn request_full_redraw(
+        &self,
+        width: u16,
+        height: u16,
+        refresh_rect_support: bool,
+        suppress_output_support: bool,
+    ) -> SessionResult<Vec<Vec<u8>>> {
+        debug_assert!(width != 0 && height != 0);
+        if suppress_output_support {
+            let mut suppress = WriteBuf::new();
+            self.x224_processor.encode_static(
+                &mut suppress,
+                ShareDataPdu::SuppressOutput(SuppressOutputPdu { desktop_rect: None }),
+            )?;
+
+            let mut resume = WriteBuf::new();
+            self.x224_processor.encode_static(
+                &mut resume,
+                ShareDataPdu::SuppressOutput(SuppressOutputPdu {
+                    desktop_rect: Some(InclusiveRectangle {
+                        left: 0,
+                        top: 0,
+                        right: width.saturating_sub(1),
+                        bottom: height.saturating_sub(1),
+                    }),
+                }),
+            )?;
+
+            return Ok(vec![suppress.into_inner(), resume.into_inner()]);
+        }
+
+        if refresh_rect_support {
+            return Ok(vec![self.request_full_refresh(width, height)?]);
+        }
+
+        Ok(Vec::new())
+    }
+
     /// Send a pdu on the static global channel. Typically used to send input events
     pub fn encode_static(&self, output: &mut WriteBuf, pdu: ShareDataPdu) -> SessionResult<usize> {
         self.x224_processor.encode_static(output, pdu)
@@ -243,12 +370,28 @@ impl ActiveStage {
         self.x224_processor.get_svc_processor_mut()
     }
 
-    pub fn get_dvc<T: DvcProcessor + 'static>(&mut self) -> Option<&DynamicVirtualChannel> {
+    pub fn get_dvc<T: DvcClientProcessor + 'static>(&self) -> Option<DynamicChannelRef<'_, T>> {
         self.x224_processor.get_dvc::<T>()
     }
 
-    pub fn get_dvc_by_channel_id(&mut self, channel_id: u32) -> Option<&DynamicVirtualChannel> {
+    pub fn get_dvc_by_channel_id<T: DvcClientProcessor + 'static>(
+        &self,
+        channel_id: u32,
+    ) -> Option<DynamicChannelRef<'_, T>> {
         self.x224_processor.get_dvc_by_channel_id(channel_id)
+    }
+
+    /// Returns whether the Display Control channel is available and has received server capabilities.
+    ///
+    /// `None` means no Display Control client is configured. `Some(false)` means it is configured
+    /// but its dynamic channel is still opening or has not received its capabilities PDU.
+    pub fn display_control_ready(&mut self) -> Option<bool> {
+        let Some(dvc) = self.get_dvc::<DisplayControlClient>() else {
+            return self
+                .get_svc_processor::<DrdynvcClient>()
+                .and_then(|drdynvc| drdynvc.has_registered_dvc::<DisplayControlClient>().then_some(false));
+        };
+        Some(dvc.processor().ready())
     }
 
     /// Completes user's SVC request with data, required to sent it over the network and returns
@@ -260,10 +403,19 @@ impl ActiveStage {
         self.x224_processor.process_svc_processor_messages(messages)
     }
 
+    /// Completes an SVC request for a runtime-defined channel name.
+    pub fn process_svc_messages_by_name(
+        &self,
+        channel_name: &ChannelName,
+        messages: Vec<SvcMessage>,
+    ) -> SessionResult<Vec<u8>> {
+        self.x224_processor.process_svc_messages_by_name(channel_name, messages)
+    }
+
     /// Fully encodes a resize request for sending over the Display Control Virtual Channel.
     ///
-    /// If the Display Control Virtual Channel is not available, or not yet connected, this method
-    /// will return `None`.
+    /// If the Display Control Virtual Channel is not available, not yet connected, or has not
+    /// received its required server capabilities PDU, this method returns `None`.
     ///
     /// Per [2.2.2.2.1]:
     /// - The `width` MUST be greater than or equal to 200 pixels and less than or equal to 8192 pixels, and MUST NOT be an odd value.
@@ -283,25 +435,24 @@ impl ActiveStage {
         physical_dims: Option<(u32, u32)>,
     ) -> Option<SessionResult<Vec<u8>>> {
         if let Some(dvc) = self.get_dvc::<DisplayControlClient>() {
-            if let Some(channel_id) = dvc.channel_id() {
-                let display_control = dvc.channel_processor_downcast_ref::<DisplayControlClient>()?;
-                let svc_messages = match display_control.encode_single_primary_monitor(
-                    channel_id,
-                    width,
-                    height,
-                    scale_factor,
-                    physical_dims,
-                ) {
-                    Ok(messages) => messages,
-                    Err(e) => return Some(Err(SessionError::encode(e))),
-                };
-
-                return Some(
-                    self.process_svc_processor_messages(SvcProcessorMessages::<DrdynvcClient>::new(svc_messages)),
-                );
-            } else {
-                debug!("Could not encode a resize: Display Control Virtual Channel is not yet connected");
+            let channel_id = dvc.channel_id();
+            let display_control = dvc.processor();
+            if !display_control.ready() {
+                debug!("Could not encode a resize: Display Control capabilities have not been received");
+                return None;
             }
+            let svc_messages = match display_control.encode_single_primary_monitor(
+                channel_id,
+                width,
+                height,
+                scale_factor,
+                physical_dims,
+            ) {
+                Ok(messages) => messages,
+                Err(e) => return Some(Err(SessionError::encode(e))),
+            };
+
+            return Some(self.process_svc_processor_messages(SvcProcessorMessages::<DrdynvcClient>::new(svc_messages)));
         } else {
             debug!("Could not encode a resize: Display Control Virtual Channel is not available");
         }
@@ -326,7 +477,18 @@ pub enum ActiveStageOutput {
     },
     PointerBitmap(Arc<DecodedPointer>),
     Terminate(GracefulDisconnectReason),
-    DeactivateAll(Box<ConnectionActivationSequence>),
+    /// Server Save Session Info notification ([MS-RDPBCGR] 2.2.10.1).
+    ///
+    /// This value-free event deliberately excludes server-provided session details, which can
+    /// include credentials and auto-reconnect cookies.
+    SaveSessionInfo {
+        /// Whether the notification unambiguously reports a completed logon.
+        logon_complete: bool,
+    },
+    /// Received a Server Deactivate All PDU. The consumer should execute the [Deactivation-Reactivation Sequence].
+    ///
+    /// [Deactivation-Reactivation Sequence]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
+    DeactivateAll,
     /// Server Initiate Multitransport Request. The application should establish a
     /// sideband UDP transport using the provided request parameters.
     ///
@@ -343,6 +505,16 @@ pub enum ActiveStageOutput {
     ///
     /// [\[MS-RDPBCGR\] 2.2.14.1.5]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/228ffc5c-b60c-4d3e-9781-ac613f822fdf
     AutoDetect(AutoDetectRequest),
+    /// Server Auto-Reconnect Cookie ([\[MS-RDPBCGR\] 2.2.4.2]), received in a Save
+    /// Session Info PDU.
+    ///
+    /// Hold this and pass it to `ClientConnector::with_auto_reconnect_cookie` when
+    /// reconnecting after an ungraceful disconnect, so the server can reattach the
+    /// session without a fresh logon. It can arrive more than once per session,
+    /// since the server regenerates it hourly; keep the most recent.
+    ///
+    /// [\[MS-RDPBCGR\] 2.2.4.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/18f4f605-0ee3-4175-8a62-cf8775252547
+    AutoReconnectCookie(ServerAutoReconnect),
 }
 
 impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
@@ -374,9 +546,11 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
 
                 Ok(Self::Terminate(desc))
             }
-            x224::ProcessorOutput::DeactivateAll(cas) => Ok(Self::DeactivateAll(cas)),
+            x224::ProcessorOutput::SaveSessionInfo { logon_complete } => Ok(Self::SaveSessionInfo { logon_complete }),
+            x224::ProcessorOutput::DeactivateAll => Ok(Self::DeactivateAll),
             x224::ProcessorOutput::MultitransportRequest(pdu) => Ok(Self::MultitransportRequest(pdu)),
             x224::ProcessorOutput::AutoDetect(request) => Ok(Self::AutoDetect(request)),
+            x224::ProcessorOutput::AutoReconnectCookie(cookie) => Ok(Self::AutoReconnectCookie(cookie)),
             // GraphicsUpdate and PointerUpdate are consumed in ActiveStage::process()
             // before reaching this conversion.
             x224::ProcessorOutput::GraphicsUpdate(_) | x224::ProcessorOutput::PointerUpdate(_) => Err(
@@ -430,7 +604,7 @@ fn process_slow_path_graphics(
             Ok(Vec::new())
         }
         GraphicsUpdateType::Palette => {
-            warn!("Slow-path palette update not supported (8bpp)");
+            fast_path_processor.process_palette_update(data);
             Ok(Vec::new())
         }
         // Synchronize is an artifact from the T.128 multipoint protocol
@@ -451,4 +625,76 @@ fn process_slow_path_pointer(
     let mut src = ReadCursor::new(data);
     let pointer = slow_path::decode_slow_path_pointer(&mut src).map_err(SessionError::decode)?;
     fast_path_processor.process_pointer_update(image, pointer)
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_graphics::image_processing::PixelFormat;
+    use ironrdp_pdu::pointer::{ColorPointerAttribute, Point16, PointerAttribute, PointerUpdateData};
+
+    use super::*;
+
+    #[test]
+    fn full_redraw_prefers_suppress_output_toggle_when_supported() {
+        let stage = ActiveStageBuilder {
+            static_channels: StaticChannelSet::new(),
+            user_channel_id: 1001,
+            io_channel_id: 1003,
+            message_channel_id: None,
+            share_id: 1,
+            compression_type: None,
+            enable_server_pointer: true,
+            pointer_software_rendering: false,
+        }
+        .build();
+
+        let suppress_output_frames = stage.request_full_redraw(1024, 768, true, true).unwrap();
+        assert_eq!(suppress_output_frames.len(), 2);
+        assert!(suppress_output_frames.iter().all(|frame| !frame.is_empty()));
+
+        assert_eq!(stage.request_full_redraw(1024, 768, true, false).unwrap().len(), 1);
+        assert!(stage.request_full_redraw(1024, 768, false, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn slow_path_palette_applies_to_indexed_pointer() {
+        let mut palette_data = vec![0; 8 + 256 * 3];
+        palette_data[0..2].copy_from_slice(&0x0002u16.to_le_bytes());
+        palette_data[4..8].copy_from_slice(&256u32.to_le_bytes());
+        palette_data[8 + 3..8 + 6].copy_from_slice(&[0x10, 0x20, 0x30]);
+
+        let mut processor = fast_path::ProcessorBuilder {
+            io_channel_id: 0,
+            user_channel_id: 0,
+            share_id: 0,
+            enable_server_pointer: true,
+            pointer_software_rendering: false,
+        }
+        .build();
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+
+        let palette_updates = process_slow_path_graphics(&mut processor, &mut image, &palette_data)
+            .expect("slow-path palette update should succeed");
+        assert!(palette_updates.is_empty());
+
+        let pointer = PointerAttribute {
+            xor_bpp: 8,
+            color_pointer: ColorPointerAttribute {
+                cache_index: 0,
+                hot_spot: Point16 { x: 0, y: 0 },
+                width: 1,
+                height: 1,
+                xor_mask: &[1, 0],
+                and_mask: &[0, 0],
+            },
+        };
+        let pointer_updates = processor
+            .process_pointer_update(&mut image, PointerUpdateData::New(pointer))
+            .expect("indexed pointer should decode with slow-path palette");
+
+        let [UpdateKind::PointerBitmap(pointer)] = pointer_updates.as_slice() else {
+            panic!("expected an accelerated pointer bitmap");
+        };
+        assert_eq!(pointer.bitmap_data, [0x10, 0x20, 0x30, 0xff]);
+    }
 }
