@@ -32,7 +32,7 @@ use ironrdp::rdperp::client::{RailChannel, RemoteApp};
 use ironrdp::rdperp::orders::WindowOrder;
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
+use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
 use ironrdp_egfx::client::GraphicsPipelineClient;
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
@@ -47,7 +47,7 @@ use crate::canvas::Canvas;
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::error::IronError;
-use crate::graphics::{WasmGraphicsHandler, WasmGraphicsMessageProxy};
+use crate::graphics::{blend_watermark_into, WasmGraphicsHandler, WasmGraphicsMessageProxy, Watermark};
 use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
 use crate::network_client::WasmNetworkClient;
@@ -95,6 +95,11 @@ struct SessionBuilderInner {
     unlock_callback: Option<js_sys::Function>,
     locks_expired_callback: Option<js_sys::Function>,
     format_list_response_callback: Option<js_sys::Function>,
+
+    /// WebCodecs AVC decode callback (extension `avc_decode_callback`). The run loop
+    /// calls it with a compressed H.264 main sub-stream; JS decodes it and returns
+    /// RGBA via the `on_avc_decoded` extension. Absent = AVC frames dropped (logged).
+    avc_decode_callback: Option<js_sys::Function>,
 
     // Setting printer stream callbacks activates the virtual printer.
     invalid_print_job_stream_callbacks: bool,
@@ -144,6 +149,7 @@ impl Default for SessionBuilderInner {
             unlock_callback: None,
             locks_expired_callback: None,
             format_list_response_callback: None,
+            avc_decode_callback: None,
 
             invalid_print_job_stream_callbacks: false,
             print_job_stream_callbacks: None,
@@ -361,6 +367,11 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     }
                 }
             };
+            // WebCodecs H.264 decode callback. Registering it lets the run loop hand
+            // AVC main sub-streams to the browser decoder (see the `Avc` run-loop arm).
+            |avc_decode_callback: JsValue| {
+                self.0.borrow_mut().avc_decode_callback = avc_decode_callback.dyn_into::<js_sys::Function>().ok();
+            };
         }
 
         self.clone()
@@ -390,6 +401,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             unlock_callback,
             locks_expired_callback,
             format_list_response_callback,
+            avc_decode_callback,
             invalid_print_job_stream_callbacks,
             print_job_stream_callbacks,
             printer_name,
@@ -433,6 +445,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             unlock_callback = inner.unlock_callback.clone();
             locks_expired_callback = inner.locks_expired_callback.clone();
             format_list_response_callback = inner.format_list_response_callback.clone();
+            avc_decode_callback = inner.avc_decode_callback.clone();
             invalid_print_job_stream_callbacks = inner.invalid_print_job_stream_callbacks;
             print_job_stream_callbacks = inner.print_job_stream_callbacks.clone();
             printer_name = inner.printer_name.clone();
@@ -615,6 +628,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             render_canvas,
             set_cursor_style_callback,
             set_cursor_style_callback_context,
+            avc_decode_callback,
 
             input_events_rx: RefCell::new(Some(input_events_rx)),
             rdp_reader: RefCell::new(Some(rdp_reader)),
@@ -641,8 +655,22 @@ pub(crate) enum RdpInputEvent {
     FastPath(FastPathInputEvents),
     /// An EGFX-decoded output region, ready to blit to the canvas. Sent by
     /// [`crate::graphics::WasmGraphicsHandler`] (which is `Send` and cannot touch
-    /// the `!Send` canvas) so the run loop can draw it.
+    /// the `!Send` canvas) so the run loop can draw it. Also the return path for
+    /// out-of-band AVC decode: JS hands back RGBA as one of these.
     Graphics(GraphicsRegion),
+    /// A raw AVC (H.264) main sub-stream that must be decoded out-of-band by the
+    /// browser (WebCodecs `VideoDecoder`). The graphics handler is `Send` and has no
+    /// JS access, so it forwards the compressed frame here; the run loop hands it to
+    /// the JS decode callback, which later returns RGBA via [`RdpInputEvent::AvcRegion`].
+    Avc(AvcFrameEvent),
+    /// An out-of-band-decoded AVC region (RGBA), returned by the JS WebCodecs decoder,
+    /// with the eGFX `frame_id` it presents. Unlike [`RdpInputEvent::Graphics`], this
+    /// bypassed the handler's surface buffer, so the run loop re-blends the watermark
+    /// before drawing — and then sends the deferred FrameAcknowledge for `frame_id`.
+    AvcRegion(GraphicsRegion, u32),
+    /// The current session watermark, forwarded by the graphics handler so the run
+    /// loop can re-blend it onto out-of-band AVC regions.
+    Watermark(Watermark),
     Resize {
         width: u32,
         height: u32,
@@ -673,6 +701,23 @@ pub(crate) struct GraphicsRegion {
     pub(crate) data: Vec<u8>,
 }
 
+/// A raw AVC (H.264) main sub-stream awaiting out-of-band (WebCodecs) decode, with
+/// its destination already resolved to output (desktop) coordinates.
+#[derive(Debug)]
+pub(crate) struct AvcFrameEvent {
+    pub(crate) surface_id: u16,
+    /// eGFX frame this picture belongs to; echoed back on present so the run loop can
+    /// send the deferred FrameAcknowledge (flow control).
+    pub(crate) frame_id: u32,
+    /// Destination origin + size in output (desktop) coordinates.
+    pub(crate) x: u32,
+    pub(crate) y: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// Main (`stream1`) H.264 bitstream (Annex B).
+    pub(crate) main_stream: Vec<u8>,
+}
+
 pub(crate) struct SessionTerminationInfo {
     reason: GracefulDisconnectReason,
 }
@@ -692,6 +737,8 @@ pub(crate) struct Session {
     render_canvas: HtmlCanvasElement,
     set_cursor_style_callback: js_sys::Function,
     set_cursor_style_callback_context: JsValue,
+    /// WebCodecs AVC decode callback; `None` if no browser decoder was registered.
+    avc_decode_callback: Option<js_sys::Function>,
 
     // Consumed when `run` is called
     input_events_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpInputEvent>>>,
@@ -797,6 +844,10 @@ impl iron_remote_desktop::Session for Session {
 
         // Reused across frames so per-region extraction doesn't allocate on every draw.
         let mut draw_buffer = WriteBuf::new();
+
+        // Latest session watermark, forwarded by the graphics handler. Re-blended onto
+        // out-of-band AVC regions (which bypass the handler's flush-time re-blend).
+        let mut current_watermark: Option<Watermark> = None;
 
         // Full-desktop rectangle used for the post-connect Refresh Rect (see below).
         // `desktop_size` is Copy, so read it before the builder consumes the rest.
@@ -1004,6 +1055,72 @@ impl iron_remote_desktop::Session for Session {
                             let mut data = region.data;
                             if let Err(e) = gui.draw(&mut data, rect) {
                                 warn!(error = format!("{e:#}"), "failed to draw EGFX region");
+                            }
+                            Vec::new()
+                        }
+                        RdpInputEvent::Watermark(wm) => {
+                            // Retain the current watermark for re-blending onto AVC regions.
+                            current_watermark = Some(wm);
+                            Vec::new()
+                        }
+                        RdpInputEvent::AvcRegion(region, frame_id) => {
+                            // Out-of-band AVC decode bypassed the handler's surface
+                            // buffer (and thus its flush-time watermark re-blend), so
+                            // re-blend the mark here before painting, then draw exactly
+                            // like a normal Graphics region.
+                            let (rx, ry, rw, rh) = (region.x, region.y, region.width, region.height);
+                            let mut data = region.data;
+                            if let Some(wm) = &current_watermark {
+                                blend_watermark_into(wm, &mut data, rx, ry, rw, rh);
+                            }
+                            let right = rx.saturating_add(rw).saturating_sub(1);
+                            let bottom = ry.saturating_add(rh).saturating_sub(1);
+                            let rect = ironrdp::pdu::geometry::InclusiveRectangle {
+                                left: rx.min(u32::from(u16::MAX)) as u16,
+                                top: ry.min(u32::from(u16::MAX)) as u16,
+                                right: right.min(u32::from(u16::MAX)) as u16,
+                                bottom: bottom.min(u32::from(u16::MAX)) as u16,
+                            };
+                            if let Err(e) = gui.draw(&mut data, rect) {
+                                warn!(error = format!("{e:#}"), "failed to draw AVC region");
+                            }
+                            // The frame is now presented — send its DEFERRED
+                            // FrameAcknowledge so the server paces to our real display
+                            // rate instead of flooding the async decoder (the FreeRDP
+                            // flow-control model; the fix for both latency and A/V sync).
+                            match encode_avc_frame_ack(&mut active_stage, frame_id) {
+                                Ok(Some(frame)) => vec![ActiveStageOutput::ResponseFrame(frame)],
+                                Ok(None) => Vec::new(),
+                                Err(e) => {
+                                    warn!(error = format!("{e:#}"), "failed to send AVC frame-ack");
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        RdpInputEvent::Avc(frame) => {
+                            // Hand the compressed AVC main sub-stream to the browser
+                            // WebCodecs decoder. It decodes asynchronously and returns
+                            // RGBA via the `on_avc_decoded` extension, which re-enters
+                            // the loop as an `RdpInputEvent::AvcRegion`.
+                            if let Some(cb) = &self.avc_decode_callback {
+                                let data = js_sys::Uint8Array::from(frame.main_stream.as_slice());
+                                let args = js_sys::Array::from_iter([
+                                    JsValue::from_f64(f64::from(frame.surface_id)),
+                                    JsValue::from_f64(f64::from(frame.frame_id)),
+                                    JsValue::from_f64(f64::from(frame.x)),
+                                    JsValue::from_f64(f64::from(frame.y)),
+                                    JsValue::from_f64(f64::from(frame.width)),
+                                    JsValue::from_f64(f64::from(frame.height)),
+                                    data.into(),
+                                ]);
+                                if let Err(err) = cb.apply(&JsValue::NULL, &args) {
+                                    warn!(?err, "AVC decode callback threw");
+                                }
+                            } else {
+                                trace!(
+                                    bytes = frame.main_stream.len(),
+                                    "AVC frame dropped: no WebCodecs decoder registered"
+                                );
                             }
                             Vec::new()
                         }
@@ -1454,6 +1571,27 @@ impl iron_remote_desktop::Session for Session {
 
                 return Ok(JsValue::NULL);
             };
+            // Return path for out-of-band AVC decode: JS hands back RGBA for a region
+            // it decoded via WebCodecs. Re-enters the loop as a Graphics region and is
+            // blitted to the canvas by the existing `RdpInputEvent::Graphics` arm.
+            |on_avc_decoded: JsValue| {
+                let obj = into_object(on_avc_decoded)?;
+                let frame_id = get_u32(&obj, "frameId")?;
+                let x = get_u32(&obj, "x")?;
+                let y = get_u32(&obj, "y")?;
+                let width = get_u32(&obj, "width")?;
+                let height = get_u32(&obj, "height")?;
+                let data_val = js_sys::Reflect::get(&obj, &JsValue::from_str("data"))
+                    .map_err(|e| IronError::from(anyhow::anyhow!("get property `data`: {e:?}")))?;
+                let data = js_sys::Uint8Array::new(&data_val).to_vec();
+
+                self.input_events_tx
+                    .unbounded_send(RdpInputEvent::AvcRegion(GraphicsRegion { x, y, width, height, data }, frame_id))
+                    .context("send AVC-decoded region")
+                    .map_err(IronError::from)?;
+
+                return Ok(JsValue::NULL);
+            };
         }
 
         Err(
@@ -1461,6 +1599,40 @@ impl iron_remote_desktop::Session for Session {
                 .with_kind(IronErrorKind::General),
         )
     }
+}
+
+/// Encode a deferred graphics `FrameAcknowledge` for a now-presented AVC frame into
+/// wire bytes. Reaches the `GraphicsPipelineClient` through the DRDYNVC static
+/// processor (the only exposed mutable path), pops the deferred ack for `frame_id`,
+/// and frames it drdynvc → SVC → x224. Returns `None` when the graphics channel isn't
+/// active or `frame_id` has no pending ack.
+fn encode_avc_frame_ack(active_stage: &mut ActiveStage, frame_id: u32) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(gfx_channel_id) = active_stage
+        .get_dvc::<GraphicsPipelineClient>()
+        .map(|dvc| dvc.channel_id())
+    else {
+        return Ok(None);
+    };
+
+    let ack_msgs = {
+        let Some(drdynvc) = active_stage.get_svc_processor_mut::<DrdynvcClient>() else {
+            return Ok(None);
+        };
+        let Some(mut chan) = drdynvc.get_dvc_by_channel_id_mut::<GraphicsPipelineClient>(gfx_channel_id) else {
+            return Ok(None);
+        };
+        chan.processor_mut().build_frame_ack(frame_id)
+    };
+    if ack_msgs.is_empty() {
+        return Ok(None);
+    }
+
+    let svc = ironrdp::dvc::encode_dvc_messages(gfx_channel_id, ack_msgs, ironrdp::svc::ChannelFlags::empty())
+        .map_err(|e| anyhow::anyhow!("encode gfx frame-ack (drdynvc): {e}"))?;
+    let frame = active_stage
+        .encode_dvc_messages(svc)
+        .map_err(|e| anyhow::anyhow!("frame gfx frame-ack (svc): {e}"))?;
+    Ok(Some(frame))
 }
 
 fn into_object(val: JsValue) -> Result<js_sys::Object, IronError> {
@@ -1961,14 +2133,19 @@ async fn connect(
             drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
         }
         if let Some(graphics_handler) = graphics_handler {
-            // Do NOT advertise AVC420/AVC444: there is no H.264 decoder attached
-            // (the WebCodecs "Stage 1" decoder never landed), so any AVC frame the
-            // server sends is skipped and leaves a stale/blank region — the scattered
-            // "speckle" artifacts. With AVC unadvertised the server encodes those
-            // regions with ClearCodec / RFX-Progressive instead, which this client
-            // decodes correctly. Re-enable only once a real H.264 decoder is wired in.
+            // AVC MVP (2026-08-10): advertise AVC420/AVC444 caps so the server (AVD/
+            // Windows) sends AVC. The H.264 main sub-stream is decoded out-of-band by
+            // the browser WebCodecs decoder (see `AvcFrame`/`on_avc_frame` →
+            // `avc_decode_callback`), giving full-color 4:2:0 desktop/video.
+            //
+            // TEST-ONLY at this stage: keep this `advertise_avc(true)` for the AVC
+            // test build. PROD must revert to `.advertise_avc(false)` until the
+            // remaining gaps close (crisp 4:4:4 aux-stream recombination;
+            // SurfaceToSurface-over-AVC + RDPGFX frame-ack ordering). With AVC
+            // unadvertised the server falls back to ClearCodec / RFX-Progressive,
+            // which this client already decodes correctly.
             drdynvc = drdynvc.with_dynamic_channel(
-                GraphicsPipelineClient::new(Box::new(graphics_handler), None).advertise_avc(false),
+                GraphicsPipelineClient::new(Box::new(graphics_handler), None).advertise_avc(true),
             );
         }
         connector.attach_static_channel(drdynvc);

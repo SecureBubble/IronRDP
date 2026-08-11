@@ -61,14 +61,14 @@ use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::ProgressiveDecoder;
 use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_graphics::zgfx;
-use ironrdp_pdu::geometry::{ExclusiveRectangle, Rectangle as _};
+use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
 use tracing::{debug, info, trace, warn};
 
 use crate::CHANNEL_NAME;
 use crate::decode::H264Decoder;
 use crate::pdu::{
-    Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
+    Avc420BitmapStream, Avc444BitmapStream, Encoding, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
     CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, CapabilityVersion, Codec1Type, DeleteEncodingContextPdu,
     EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
     MapSurfaceToWindowPdu, PixelFormat, ProtectSurfacePdu, QueueDepth, RawCapabilitySet, SolidFillPdu,
@@ -206,6 +206,37 @@ pub struct BitmapUpdate {
     pub width: u16,
     /// Height of the decoded data in pixels
     pub height: u16,
+}
+
+/// A raw AVC (H.264) frame handed off for out-of-band decoding.
+///
+/// Unlike [`BitmapUpdate`], the client does NOT decode H.264 itself when no Rust
+/// [`H264Decoder`] is attached — it forwards the compressed main sub-stream to an
+/// out-of-band decoder (the browser WebCodecs `VideoDecoder`), which returns RGBA
+/// asynchronously and composites it via the normal region path. Delivered to
+/// [`GraphicsPipelineHandler::on_avc_frame`].
+///
+/// MVP scope: only the main (`stream1`) YUV420 picture is forwarded — decoding it
+/// alone yields a full-color 4:2:0 image. The auxiliary (4:4:4 chroma) sub-stream is
+/// layered on in a later milestone (see the AVC444v2 recombination work).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct AvcFrame<'a> {
+    /// Surface this frame targets.
+    pub surface_id: u16,
+    /// The eGFX frame this AVC picture belongs to. The out-of-band decoder echoes it
+    /// back on present so the client can send the deferred `FrameAcknowledge` for it
+    /// (flow control — see [`GraphicsPipelineClient::acknowledge_avc_frame`]).
+    pub frame_id: u32,
+    /// Which AVC codec produced it (`Avc444` = 0x0E or `Avc444v2` = 0x0F).
+    pub codec_id: Codec1Type,
+    /// Destination rectangle within the surface (exclusive `right`/`bottom`).
+    pub destination_rectangle: ExclusiveRectangle,
+    /// The main (`stream1`) H.264 bitstream in AVC format (4-byte big-endian
+    /// length-prefixed NAL units, NOT Annex B). A complete YUV420 picture.
+    pub main_stream: &'a [u8],
+    /// Metablock region rectangles: the dirty sub-rects updated within this frame.
+    pub regions: &'a [InclusiveRectangle],
 }
 
 // ============================================================================
@@ -372,6 +403,14 @@ pub trait GraphicsPipelineHandler: Send {
     ///
     /// This is a catch-all for any GfxPdu variant not matched above.
     fn on_unhandled_pdu(&mut self, _pdu: &GfxPdu) {}
+
+    /// Called for an AVC (H.264) frame that must be decoded out-of-band.
+    ///
+    /// The client forwards the compressed main sub-stream (it does not decode H.264
+    /// itself); the handler decodes it — e.g. via the browser WebCodecs
+    /// `VideoDecoder` — and composites the resulting RGBA through its normal region
+    /// path. Default: no-op (AVC frames dropped).
+    fn on_avc_frame(&mut self, _frame: &AvcFrame<'_>) {}
 }
 
 // ============================================================================
@@ -427,7 +466,21 @@ pub struct GraphicsPipelineClient {
     current_frame_id: Option<u32>,
     frames_queued: u32,
     total_frames_decoded: u32,
+    /// True if the frame currently being assembled (StartFrame..EndFrame) carried an
+    /// AVC (async-decoded) picture, so its `FrameAcknowledge` must be deferred.
+    current_frame_has_avc: bool,
+    /// FrameAcknowledges deferred until the out-of-band AVC decoder signals present.
+    /// Maps `frame_id -> total_frames_decoded` snapshot taken at EndFrame. Flushing
+    /// happens in [`GraphicsPipelineClient::build_frame_ack`]; this is the FreeRDP
+    /// flow-control model (ack after present so the server paces to our display rate).
+    deferred_acks: BTreeMap<u32, u32>,
 }
+
+/// Safety cap on outstanding deferred AVC acks. If a decoded frame is never presented
+/// (decoder error / lost frame), acking it here keeps the server's flow-control window
+/// from stalling forever. Set generously so it only fires on genuine loss, not normal
+/// backpressure.
+const MAX_DEFERRED_ACKS: usize = 64;
 
 impl GraphicsPipelineClient {
     /// Create a new `GraphicsPipelineClient`
@@ -450,6 +503,8 @@ impl GraphicsPipelineClient {
             current_frame_id: None,
             frames_queued: 0,
             total_frames_decoded: 0,
+            current_frame_has_avc: false,
+            deferred_acks: BTreeMap::new(),
         }
     }
 
@@ -542,6 +597,7 @@ impl GraphicsPipelineClient {
             }
             GfxPdu::StartFrame(start) => {
                 self.current_frame_id = Some(start.frame_id);
+                self.current_frame_has_avc = false;
                 self.frames_queued = self.frames_queued.saturating_add(1);
                 trace!(frame_id = start.frame_id, "StartFrame");
                 Ok(vec![])
@@ -711,6 +767,10 @@ impl GraphicsPipelineClient {
         // ResetGraphics, and a ResetGraphics does not re-negotiate capabilities.
         self.current_frame_id = None;
         self.frames_queued = 0;
+        self.current_frame_has_avc = false;
+        // Drop deferred acks: their frame_ids belong to the previous stream and will
+        // never be presented now, so holding them would leak / stall flow control.
+        self.deferred_acks.clear();
 
         // Reset decoder state for new stream
         if let Some(ref mut decoder) = self.h264_decoder {
@@ -815,12 +875,7 @@ impl GraphicsPipelineClient {
                 self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
             }
             Codec1Type::Avc444 | Codec1Type::Avc444v2 => {
-                info!(
-                    surface_id = pdu.surface_id,
-                    codec = ?pdu.codec_id,
-                    len = pdu.bitmap_data.len(),
-                    "AVC444 frame received (Stage 0 stub: decode pending out-of-band)"
-                );
+                self.decode_avc444(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data, pdu.codec_id);
             }
             Codec1Type::ClearCodec => {
                 self.decode_clearcodec(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
@@ -890,6 +945,89 @@ impl GraphicsPipelineClient {
 
         self.handler.on_bitmap_updated(&update);
         Ok(())
+    }
+
+    /// Parse an AVC444 / AVC444v2 (`WireToSurface1`) bitmap stream and log its structure.
+    ///
+    /// MILESTONE 1 (2026-08-10): parse + structured log ONLY — no H.264 decode / no
+    /// composite yet. This upgrades the Stage-0 stub so we can confirm our parser
+    /// handles real AVD wire frames before the async WebCodecs bridge lands.
+    ///
+    /// AVC444 multiplexes TWO H.264 sub-streams — main/luma (`stream1`) and aux/chroma
+    /// (`stream2`) — under the 2-bit LC field ([`Encoding`]):
+    /// - `LumaAndChroma` (LC=0): both present → full 4:4:4 update.
+    /// - `Luma` (LC=1): only `stream1` (luma); chroma retained from the prior frame.
+    /// - `Chroma` (LC=2): only `stream1`, but it carries the *chroma* frame (the aux
+    ///   sequence rides the stream-1 wire slot); luma retained.
+    ///
+    /// Parse errors are logged, not propagated, so one malformed frame can't abort the
+    /// probe session mid-stream.
+    fn decode_avc444(
+        &mut self,
+        surface_id: u16,
+        dest_rect: &ExclusiveRectangle,
+        bitmap_data: &[u8],
+        codec_id: Codec1Type,
+    ) {
+        let mut cursor = ReadCursor::new(bitmap_data);
+        let stream = match Avc444BitmapStream::decode(&mut cursor) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    surface_id,
+                    codec = ?codec_id,
+                    len = bitmap_data.len(),
+                    error = %e,
+                    "AVC444 parse failed"
+                );
+                return;
+            }
+        };
+
+        // Which semantic sequence does the stream-1 slot feed? For LC=2 the stream-1
+        // slot carries the aux/chroma frame; otherwise it is the main/luma frame.
+        let stream1_role = if stream.encoding == Encoding::CHROMA {
+            "chroma(aux)"
+        } else {
+            "luma(main)"
+        };
+        let (s2_regions, s2_len) = stream
+            .stream2
+            .as_ref()
+            .map_or((0, 0), |s2| (s2.rectangles.len(), s2.data.len()));
+
+        debug!(
+            surface_id,
+            codec = ?codec_id,
+            lc = ?stream.encoding,
+            stream1_role,
+            dest_w = dest_rect.width(),
+            dest_h = dest_rect.height(),
+            s1_regions = stream.stream1.rectangles.len(),
+            s1_len = stream.stream1.data.len(),
+            s2_present = stream.stream2.is_some(),
+            s2_regions,
+            s2_len,
+            "AVC444 parsed"
+        );
+
+        // MVP (single-decoder path): forward only the main/stream1 YUV420 picture.
+        // Decoding it alone yields a full-color 4:2:0 image. For LC=CHROMA (aux-only)
+        // there is no main update to forward — that case is handled once the 4:4:4
+        // recombination layer lands.
+        if stream.encoding != Encoding::CHROMA {
+            // Mark this eGFX frame as carrying async AVC so its FrameAcknowledge is
+            // deferred until the browser decoder presents it (flow control).
+            self.current_frame_has_avc = true;
+            self.handler.on_avc_frame(&AvcFrame {
+                surface_id,
+                frame_id: self.current_frame_id.unwrap_or(0),
+                codec_id,
+                destination_rectangle: dest_rect.clone(),
+                main_stream: stream.stream1.data,
+                regions: &stream.stream1.rectangles,
+            });
+        }
     }
 
     /// Decode a ClearCodec (`WireToSurface1`) bitmap and emit it through `on_bitmap_updated`.
@@ -1048,7 +1186,6 @@ impl GraphicsPipelineClient {
         self.handler.on_bitmap_updated(&update);
     }
 
-    #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
     fn handle_end_frame(&mut self, frame_id: u32) -> PduResult<Vec<DvcMessage>> {
         self.total_frames_decoded = self.total_frames_decoded.wrapping_add(1);
         self.current_frame_id = None;
@@ -1056,15 +1193,64 @@ impl GraphicsPipelineClient {
 
         self.handler.on_frame_complete(frame_id);
 
-        // Per [3.3.5.12]: client MUST send FrameAcknowledge after EndFrame
-        let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
-            queue_depth: QueueDepth::from_u32(self.frames_queued),
-            frame_id,
-            total_frames_decoded: self.total_frames_decoded,
-        });
+        // Per [3.3.5.12] the client MUST send a FrameAcknowledge after EndFrame — but
+        // WHEN matters for flow control. Synchronous codecs (ClearCodec/Progressive/
+        // Planar) are already composited here, so we ack immediately. AVC decodes
+        // asynchronously in the browser, so acking now would tell the server we're
+        // keeping up when we're not — it would flood an async decoder and the picture
+        // would lag seconds behind. Instead we DEFER the ack until the decoder signals
+        // present (see `build_frame_ack`), which paces the server to our real display
+        // rate exactly as FreeRDP does with its synchronous decode+paint.
+        if self.current_frame_has_avc {
+            self.deferred_acks.insert(frame_id, self.total_frames_decoded);
+            trace!(frame_id, "Deferring FrameAcknowledge until AVC present");
+
+            // Safety valve: never let a lost present stall the server's window forever.
+            let mut flush = Vec::new();
+            while self.deferred_acks.len() > MAX_DEFERRED_ACKS {
+                let Some((&oldest, &total)) = self.deferred_acks.iter().next() else {
+                    break;
+                };
+                self.deferred_acks.remove(&oldest);
+                warn!(frame_id = oldest, "Flushing stale deferred AVC ack (never presented)");
+                flush.push(self.make_frame_ack(oldest, total));
+            }
+            return Ok(flush);
+        }
 
         trace!(frame_id, "Sending FrameAcknowledge");
-        Ok(vec![Box::new(ack) as DvcMessage])
+        Ok(vec![self.make_frame_ack(frame_id, self.total_frames_decoded)])
+    }
+
+    /// Build a `FrameAcknowledge` DVC message. `queue_depth` reports the count still
+    /// awaiting present, which signals backpressure to the server.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion; deferred_acks.len() bounded by MAX_DEFERRED_ACKS"
+    )]
+    fn make_frame_ack(&self, frame_id: u32, total_frames_decoded: u32) -> DvcMessage {
+        let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+            queue_depth: QueueDepth::from_u32(self.deferred_acks.len() as u32),
+            frame_id,
+            total_frames_decoded,
+        });
+        Box::new(ack) as DvcMessage
+    }
+
+    /// Emit the deferred `FrameAcknowledge` for an AVC frame the out-of-band decoder
+    /// has now presented. Called by the session run loop when the browser signals
+    /// present. Returns the ack DVC message(s) to encode+write, or empty if `frame_id`
+    /// is unknown (already acked, never deferred, or a non-AVC frame).
+    #[must_use]
+    pub fn build_frame_ack(&mut self, frame_id: u32) -> Vec<DvcMessage> {
+        match self.deferred_acks.remove(&frame_id) {
+            Some(total) => {
+                trace!(frame_id, "Sending deferred FrameAcknowledge (AVC presented)");
+                vec![self.make_frame_ack(frame_id, total)]
+            }
+            None => Vec::new(),
+        }
     }
 }
 

@@ -20,14 +20,14 @@
 use std::collections::HashMap;
 
 use futures_channel::mpsc;
-use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineHandler, Surface};
+use ironrdp_egfx::client::{AvcFrame, BitmapUpdate, GraphicsPipelineHandler, Surface};
 use ironrdp_egfx::pdu::{
     CacheToSurfacePdu, MapSurfaceToScaledOutputPdu, ProtectSurfacePdu, SolidFillPdu, SurfaceToCachePdu,
     SurfaceToSurfacePdu, WatermarkPdu,
 };
 use tracing::warn;
 
-use crate::session::{GraphicsRegion, RdpInputEvent};
+use crate::session::{AvcFrameEvent, GraphicsRegion, RdpInputEvent};
 
 /// A surface (or cached region) as a tightly packed RGBA8888 buffer.
 struct SurfaceBuf {
@@ -101,7 +101,8 @@ impl SurfaceBuf {
 /// h/v padding, `cell_*` from its two constant words (0x017E/0x00CD). Only the
 /// [`WasmGraphicsHandler::blend_watermark`] math depends on this reading, so it
 /// is cheap to correct once verified.
-struct Watermark {
+#[derive(Clone)]
+pub(crate) struct Watermark {
     /// QR tile, RGBA8888 (converted from the PDU's ARGB8888).
     rgba: Vec<u8>,
     width: u32,
@@ -114,6 +115,68 @@ struct Watermark {
     off_y: u32,
     /// 8-bit blend strength (0..=255), derived from the PDU's 0..=10000 opacity.
     opacity: u32,
+}
+
+impl core::fmt::Debug for Watermark {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Omit the (large) rgba buffer from Debug output.
+        f.debug_struct("Watermark")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("cell_w", &self.cell_w)
+            .field("cell_h", &self.cell_h)
+            .field("opacity", &self.opacity)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Blend the tiled watermark onto a freshly extracted output region using a neutral,
+/// background-opposing contrast so it stays legible on light *and* dark content.
+/// `data` is tight RGBA for the `w`x`h` block whose top-left sits at output
+/// coordinate `(out_x, out_y)`. Shared by the handler's flush and the run loop's
+/// out-of-band AVC path (which composites decoded frames outside the surface buffer).
+pub(crate) fn blend_watermark_into(wm: &Watermark, data: &mut [u8], out_x: u32, out_y: u32, w: u32, h: u32) {
+    if wm.cell_w == 0 || wm.cell_h == 0 || wm.opacity == 0 {
+        return;
+    }
+    for row in 0..h {
+        let oy = out_y + row;
+        let cy = oy % wm.cell_h;
+        if cy < wm.off_y || cy >= wm.off_y + wm.height {
+            continue; // this output row falls between watermark tiles
+        }
+        let wy = cy - wm.off_y;
+        for col in 0..w {
+            let ox = out_x + col;
+            let cx = ox % wm.cell_w;
+            if cx < wm.off_x || cx >= wm.off_x + wm.width {
+                continue;
+            }
+            let wx = cx - wm.off_x;
+            let wsrc = ((wy * wm.width + wx) * 4) as usize;
+            let Some(wpix) = wm.rgba.get(wsrc..wsrc + 4) else {
+                continue;
+            };
+            // Effective alpha = tile alpha scaled by the requested opacity.
+            let a = (u32::from(wpix[3]) * wm.opacity) / 255;
+            if a == 0 {
+                continue;
+            }
+            let didx = ((row * w + col) * 4) as usize;
+            let Some(dpix) = data.get_mut(didx..didx + 4) else {
+                continue;
+            };
+            // NEUTRAL luminance delta whose sign opposes the background so the QR
+            // stays legible on light and dark alike (see the handler note below).
+            let lum = (u32::from(dpix[0]) * 77 + u32::from(dpix[1]) * 150 + u32::from(dpix[2]) * 29) >> 8;
+            let d = a as i32;
+            for c in 0..3 {
+                let v = i32::from(dpix[c]);
+                dpix[c] = if lum >= 128 { (v - d).max(0) } else { (v + d).min(255) } as u8;
+            }
+            // Leave alpha channel; the canvas forces opaque on present.
+        }
+    }
 }
 
 /// Accumulated dirty rectangle in surface-local coordinates (exclusive max).
@@ -159,6 +222,21 @@ impl WasmGraphicsMessageProxy {
     fn send(&self, region: GraphicsRegion) {
         if self.tx.unbounded_send(RdpInputEvent::Graphics(region)).is_err() {
             warn!("Failed to send graphics region, receiver is closed");
+        }
+    }
+
+    /// Hand a compressed AVC main sub-stream to the run loop for out-of-band decode.
+    fn send_avc(&self, frame: AvcFrameEvent) {
+        if self.tx.unbounded_send(RdpInputEvent::Avc(frame)).is_err() {
+            warn!("Failed to send AVC frame, receiver is closed");
+        }
+    }
+
+    /// Forward the current watermark to the run loop so it can re-blend it onto
+    /// out-of-band AVC regions (which bypass this handler's flush-time re-blend).
+    fn send_watermark(&self, wm: Watermark) {
+        if self.tx.unbounded_send(RdpInputEvent::Watermark(wm)).is_err() {
+            warn!("Failed to send watermark, receiver is closed");
         }
     }
 
@@ -217,53 +295,14 @@ impl WasmGraphicsHandler {
     /// neutral, background-opposing contrast so it stays legible on light *and*
     /// dark content. `data` is tight RGBA for the `w`x`h` block whose top-left
     /// sits at output coordinate `(out_x, out_y)`. No-op when no watermark is set.
+    /// Re-blend the retained watermark onto a freshly extracted output region during
+    /// the handler's own flush. The QR is a white module mask; the shared
+    /// [`blend_watermark_into`] applies a neutral luminance delta whose sign opposes
+    /// the background so it stays legible on light *and* dark content. No-op when no
+    /// watermark is set.
     fn blend_watermark(&self, data: &mut [u8], out_x: u32, out_y: u32, w: u32, h: u32) {
-        let Some(wm) = &self.watermark else { return };
-        if wm.cell_w == 0 || wm.cell_h == 0 || wm.opacity == 0 {
-            return;
-        }
-        for row in 0..h {
-            let oy = out_y + row;
-            let cy = oy % wm.cell_h;
-            if cy < wm.off_y || cy >= wm.off_y + wm.height {
-                continue; // this output row falls between watermark tiles
-            }
-            let wy = cy - wm.off_y;
-            for col in 0..w {
-                let ox = out_x + col;
-                let cx = ox % wm.cell_w;
-                if cx < wm.off_x || cx >= wm.off_x + wm.width {
-                    continue;
-                }
-                let wx = cx - wm.off_x;
-                let wsrc = ((wy * wm.width + wx) * 4) as usize;
-                let Some(wpix) = wm.rgba.get(wsrc..wsrc + 4) else {
-                    continue;
-                };
-                // Effective alpha = tile alpha scaled by the requested opacity.
-                let a = (u32::from(wpix[3]) * wm.opacity) / 255;
-                if a == 0 {
-                    continue;
-                }
-                let didx = ((row * w + col) * 4) as usize;
-                let Some(dpix) = data.get_mut(didx..didx + 4) else {
-                    continue;
-                };
-                // The QR is a white module mask. A plain white blend vanishes on a
-                // white background (e.g. a File Explorer window) — unlike the native
-                // client. Apply a NEUTRAL luminance delta whose sign opposes the
-                // background instead: darken light pixels, lighten dark ones, by `a`.
-                // On black this equals the old white-add (0 -> a); on white it now
-                // darkens (255 -> 255-a). The mark stays gray and legible on any
-                // background. `wpix[3]` (module presence) already gated `a` above.
-                let lum = (u32::from(dpix[0]) * 77 + u32::from(dpix[1]) * 150 + u32::from(dpix[2]) * 29) >> 8;
-                let d = a as i32;
-                for c in 0..3 {
-                    let v = i32::from(dpix[c]);
-                    dpix[c] = if lum >= 128 { (v - d).max(0) } else { (v + d).min(255) } as u8;
-                }
-                // Leave alpha channel; the canvas forces opaque on present.
-            }
+        if let Some(wm) = &self.watermark {
+            blend_watermark_into(wm, data, out_x, out_y, w, h);
         }
     }
 }
@@ -340,6 +379,30 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
             surface.blit(x, y, w, h, &update.data, w);
         }
         self.mark_dirty(update.surface_id, x, y, w, h);
+    }
+
+    fn on_avc_frame(&mut self, frame: &AvcFrame<'_>) {
+        // The client does not decode H.264; forward the compressed main sub-stream to
+        // the run loop, which hands it to the browser WebCodecs decoder. Translate the
+        // surface-space destination rect into output (desktop) coordinates via the
+        // surface's mapped origin so the async-decoded RGBA lands correctly. Surface 0
+        // (the AVD desktop) is normally mapped at (0,0); if a frame arrives before the
+        // surface is mapped, fall back to that origin.
+        let dr = &frame.destination_rectangle;
+        let (ox, oy) = self.mapped.get(&frame.surface_id).copied().unwrap_or((0, 0));
+        let x = ox + u32::from(dr.left);
+        let y = oy + u32::from(dr.top);
+        let width = u32::from(dr.right.saturating_sub(dr.left));
+        let height = u32::from(dr.bottom.saturating_sub(dr.top));
+        self.proxy.send_avc(AvcFrameEvent {
+            surface_id: frame.surface_id,
+            frame_id: frame.frame_id,
+            x,
+            y,
+            width,
+            height,
+            main_stream: frame.main_stream.to_vec(),
+        });
     }
 
     fn on_solid_fill(&mut self, pdu: &SolidFillPdu) {
@@ -469,7 +532,7 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         } else {
             self.output_height.max(height)
         };
-        self.watermark = Some(Watermark {
+        let wm = Watermark {
             rgba,
             width,
             height,
@@ -481,7 +544,12 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
             // ≈10000 opaque), NOT a 0..=255 alpha. Map it to an 8-bit blend factor
             // so a given value matches mstsc (e.g. 1000 -> ~10%, not fully opaque).
             opacity: u32::from(pdu.opacity).min(10_000) * 255 / 10_000,
-        });
+        };
+        // Forward to the run loop so it can re-blend the mark onto out-of-band
+        // AVC regions (which composite outside this handler's surface buffers and
+        // therefore miss the flush-time re-blend below).
+        self.proxy.send_watermark(wm.clone());
+        self.watermark = Some(wm);
         // Repaint mapped surfaces fully so the watermark shows without waiting for
         // the server to touch every region.
         let mapped_ids: Vec<u16> = self.mapped.keys().copied().collect();

@@ -128,3 +128,35 @@ export function submitFileContents(params: { stream_id: number; is_error: boolea
 export function initiateFileCopy(files: FileInfo[]): Extension {
     return new Extension('initiate_file_copy', files as unknown);
 }
+
+// AVC (H.264) WebCodecs decode extensions
+//
+// Registering `avcDecodeCallback` lets the run loop hand a compressed AVC main
+// sub-stream to the browser WebCodecs decoder. The decoder returns RGBA
+// asynchronously via `onAvcDecoded` (invoked through Session.invokeExtension), which
+// re-enters the run loop as a normal output region.
+
+export function avcDecodeCallback(
+    cb: (
+        surfaceId: number,
+        frameId: number,
+        x: number,
+        y: number,
+        width: number,
+        height: number,
+        data: Uint8Array,
+    ) => void,
+): Extension {
+    return new Extension('avc_decode_callback', cb as unknown);
+}
+
+export function onAvcDecoded(params: {
+    frameId: number;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    data: Uint8Array;
+}): Extension {
+    return new Extension('on_avc_decoded', params as unknown);
+}

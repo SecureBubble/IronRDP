@@ -5,6 +5,7 @@ import type { Config } from '../services/Config';
 import type { Extension } from './Extension';
 import type { Callback } from '../lib/Observable';
 import type { FileTransferProvider } from './FileTransferProvider';
+import type { AvcDecoderProvider } from './AvcDecoderProvider';
 
 export interface UserInteraction {
     setVisibility(state: boolean): void;
@@ -54,4 +55,6 @@ export interface UserInteraction {
      * @returns The same provider, with monitoring hooks composed in
      */
     enableFileTransfer(provider: FileTransferProvider): FileTransferProvider;
+
+    enableAvcDecoder(provider: AvcDecoderProvider): AvcDecoderProvider;
 }

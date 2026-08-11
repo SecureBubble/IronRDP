@@ -9,6 +9,7 @@ import { Config } from './Config';
 import type { Extension } from '../interfaces/Extension';
 import type { ClipboardService } from './clipboard.service';
 import type { FileTransferProvider } from '../interfaces/FileTransferProvider';
+import type { AvcDecoderProvider } from '../interfaces/AvcDecoderProvider';
 
 export class PublicAPI {
     private remoteDesktopService: RemoteDesktopService;
@@ -113,6 +114,10 @@ export class PublicAPI {
         return this.remoteDesktopService.enableFileTransfer(provider);
     }
 
+    private enableAvcDecoder(provider: AvcDecoderProvider): AvcDecoderProvider {
+        return this.remoteDesktopService.enableAvcDecoder(provider);
+    }
+
     getExposedFunctions(): UserInteraction {
         return {
             setVisibility: this.setVisibility.bind(this),
@@ -135,6 +140,7 @@ export class PublicAPI {
             sendClipboardData: this.sendClipboardData.bind(this),
             invokeExtension: this.invokeExtension.bind(this),
             enableFileTransfer: this.enableFileTransfer.bind(this),
+            enableAvcDecoder: this.enableAvcDecoder.bind(this),
         };
     }
 }

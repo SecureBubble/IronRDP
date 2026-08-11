@@ -18,6 +18,7 @@ import type { Extension } from '../interfaces/Extension';
 import { Observable } from '../lib/Observable';
 import type { SessionTerminationInfo } from '../interfaces/SessionTerminationInfo';
 import type { FileTransferProvider } from '../interfaces/FileTransferProvider';
+import type { AvcDecoderProvider } from '../interfaces/AvcDecoderProvider';
 
 type OnRemoteClipboardChanged = (data: ClipboardData) => void;
 type OnForceClipboardUpdate = () => void;
@@ -36,6 +37,7 @@ export class RemoteDesktopService {
     private onWarningCallback?: OnWarning;
     private onClipboardRemoteUpdate?: OnClipboardRemoteUpdate;
     private fileTransferProvider?: FileTransferProvider;
+    private avcDecoderProvider?: AvcDecoderProvider;
     private cursorHasOverride: boolean = false;
     private lastCursorStyle: string = 'default';
     private enableClipboard: boolean = true;
@@ -116,6 +118,18 @@ export class RemoteDesktopService {
         return provider;
     }
 
+    /**
+     * Enable out-of-band AVC (H.264) decode. Must be called before connect().
+     *
+     * @param provider - Protocol-specific decoder (e.g. WebCodecs-backed AvcDecoder)
+     * @returns The same provider, for chaining
+     */
+    enableAvcDecoder(provider: AvcDecoderProvider): AvcDecoderProvider {
+        this.avcDecoderProvider?.dispose();
+        this.avcDecoderProvider = provider;
+        return provider;
+    }
+
     mouseIn(event: MouseEvent) {
         if (!this.session) return;
         this.syncModifier(event);
@@ -148,6 +162,7 @@ export class RemoteDesktopService {
 
     shutdown() {
         this.fileTransferProvider?.dispose();
+        this.avcDecoderProvider?.dispose();
         this.session?.shutdown();
     }
 
@@ -200,6 +215,13 @@ export class RemoteDesktopService {
                 sessionBuilder.extension(ext);
             }
         }
+        // AVC (H.264) decode is protocol-specific and routed through the extension
+        // mechanism: the provider supplies the decode callback extension.
+        if (this.avcDecoderProvider != null) {
+            for (const ext of this.avcDecoderProvider.getBuilderExtensions()) {
+                sessionBuilder.extension(ext);
+            }
+        }
         if (this.onCanvasResized != null) {
             sessionBuilder.canvasResizedCallback(this.onCanvasResized);
         }
@@ -214,6 +236,7 @@ export class RemoteDesktopService {
 
         this.session = session;
         this.fileTransferProvider?.setSession(session);
+        this.avcDecoderProvider?.setSession(session);
 
         this.resizeObservable.publish({
             desktopSize: session.desktopSize(),

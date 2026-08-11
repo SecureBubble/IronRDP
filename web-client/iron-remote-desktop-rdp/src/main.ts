@@ -74,6 +74,10 @@ export function enableCredssp(enable: boolean): Extension {
     return new Extension('enable_credssp', enable);
 }
 
+// --- AVC (H.264) WebCodecs decode (RDP-specific) ---
+
+export { AvcDecoder } from './AvcDecoder';
+
 // --- File transfer (RDP-specific) ---
 
 export { RdpFileTransferProvider } from './RdpFileTransferProvider';
@@ -115,5 +119,7 @@ export {
     printerDeviceId,
     printerDriverName,
     soundCallbacks,
+    avcDecodeCallback,
+    onAvcDecoded,
 } from './extensions';
 export type { PrintJobStreamCallbacks, SoundCallbacks } from './extensions';
