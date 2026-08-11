@@ -100,6 +100,10 @@ struct SessionBuilderInner {
     /// calls it with a compressed H.264 main sub-stream; JS decodes it and returns
     /// RGBA via the `on_avc_decoded` extension. Absent = AVC frames dropped (logged).
     avc_decode_callback: Option<js_sys::Function>,
+    /// AVC watermark callback (extension `avc_watermark_callback`). The run loop calls
+    /// it when the session watermark changes so the GPU direct-draw path can overdraw
+    /// it onto each AVC frame (the CPU path re-blends it in Rust instead).
+    avc_watermark_callback: Option<js_sys::Function>,
 
     // Setting printer stream callbacks activates the virtual printer.
     invalid_print_job_stream_callbacks: bool,
@@ -150,6 +154,7 @@ impl Default for SessionBuilderInner {
             locks_expired_callback: None,
             format_list_response_callback: None,
             avc_decode_callback: None,
+            avc_watermark_callback: None,
 
             invalid_print_job_stream_callbacks: false,
             print_job_stream_callbacks: None,
@@ -372,6 +377,9 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |avc_decode_callback: JsValue| {
                 self.0.borrow_mut().avc_decode_callback = avc_decode_callback.dyn_into::<js_sys::Function>().ok();
             };
+            |avc_watermark_callback: JsValue| {
+                self.0.borrow_mut().avc_watermark_callback = avc_watermark_callback.dyn_into::<js_sys::Function>().ok();
+            };
         }
 
         self.clone()
@@ -402,6 +410,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             locks_expired_callback,
             format_list_response_callback,
             avc_decode_callback,
+            avc_watermark_callback,
             invalid_print_job_stream_callbacks,
             print_job_stream_callbacks,
             printer_name,
@@ -446,6 +455,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             locks_expired_callback = inner.locks_expired_callback.clone();
             format_list_response_callback = inner.format_list_response_callback.clone();
             avc_decode_callback = inner.avc_decode_callback.clone();
+            avc_watermark_callback = inner.avc_watermark_callback.clone();
             invalid_print_job_stream_callbacks = inner.invalid_print_job_stream_callbacks;
             print_job_stream_callbacks = inner.print_job_stream_callbacks.clone();
             printer_name = inner.printer_name.clone();
@@ -629,6 +639,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             set_cursor_style_callback,
             set_cursor_style_callback_context,
             avc_decode_callback,
+            avc_watermark_callback,
 
             input_events_rx: RefCell::new(Some(input_events_rx)),
             rdp_reader: RefCell::new(Some(rdp_reader)),
@@ -668,6 +679,10 @@ pub(crate) enum RdpInputEvent {
     /// bypassed the handler's surface buffer, so the run loop re-blends the watermark
     /// before drawing — and then sends the deferred FrameAcknowledge for `frame_id`.
     AvcRegion(GraphicsRegion, u32),
+    /// An AVC frame the JS decoder drew directly to the canvas on the GPU (no pixel
+    /// readback). Carries only the eGFX `frame_id` so the run loop sends its deferred
+    /// FrameAcknowledge — no drawing needed here (JS already presented it).
+    AvcPresented(u32),
     /// The current session watermark, forwarded by the graphics handler so the run
     /// loop can re-blend it onto out-of-band AVC regions.
     Watermark(Watermark),
@@ -739,6 +754,8 @@ pub(crate) struct Session {
     set_cursor_style_callback_context: JsValue,
     /// WebCodecs AVC decode callback; `None` if no browser decoder was registered.
     avc_decode_callback: Option<js_sys::Function>,
+    /// AVC watermark callback; forwards the session watermark to the GPU draw path.
+    avc_watermark_callback: Option<js_sys::Function>,
 
     // Consumed when `run` is called
     input_events_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpInputEvent>>>,
@@ -1059,7 +1076,26 @@ impl iron_remote_desktop::Session for Session {
                             Vec::new()
                         }
                         RdpInputEvent::Watermark(wm) => {
-                            // Retain the current watermark for re-blending onto AVC regions.
+                            // Forward the tile to the GPU AVC draw path so JS can overdraw
+                            // it on each frame (the CPU fallback re-blends `current_watermark`
+                            // in Rust instead).
+                            if let Some(cb) = &self.avc_watermark_callback {
+                                let rgba = js_sys::Uint8Array::from(wm.rgba.as_slice());
+                                let args = js_sys::Array::from_iter([
+                                    rgba.into(),
+                                    JsValue::from_f64(f64::from(wm.width)),
+                                    JsValue::from_f64(f64::from(wm.height)),
+                                    JsValue::from_f64(f64::from(wm.cell_w)),
+                                    JsValue::from_f64(f64::from(wm.cell_h)),
+                                    JsValue::from_f64(f64::from(wm.off_x)),
+                                    JsValue::from_f64(f64::from(wm.off_y)),
+                                    JsValue::from_f64(f64::from(wm.opacity)),
+                                ]);
+                                if let Err(err) = cb.apply(&JsValue::NULL, &args) {
+                                    warn!(?err, "AVC watermark callback threw");
+                                }
+                            }
+                            // Retain the current watermark for re-blending onto CPU AVC regions.
                             current_watermark = Some(wm);
                             Vec::new()
                         }
@@ -1093,6 +1129,19 @@ impl iron_remote_desktop::Session for Session {
                                 Ok(None) => Vec::new(),
                                 Err(e) => {
                                     warn!(error = format!("{e:#}"), "failed to send AVC frame-ack");
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        RdpInputEvent::AvcPresented(frame_id) => {
+                            // GPU direct-draw path: JS already composited the VideoFrame
+                            // onto the canvas (no readback). Nothing to paint here — just
+                            // send the deferred FrameAcknowledge for the presented frame.
+                            match encode_avc_frame_ack(&mut active_stage, frame_id) {
+                                Ok(Some(frame)) => vec![ActiveStageOutput::ResponseFrame(frame)],
+                                Ok(None) => Vec::new(),
+                                Err(e) => {
+                                    warn!(error = format!("{e:#}"), "failed to send AVC frame-ack (gpu)");
                                     Vec::new()
                                 }
                             }
@@ -1588,6 +1637,19 @@ impl iron_remote_desktop::Session for Session {
                 self.input_events_tx
                     .unbounded_send(RdpInputEvent::AvcRegion(GraphicsRegion { x, y, width, height, data }, frame_id))
                     .context("send AVC-decoded region")
+                    .map_err(IronError::from)?;
+
+                return Ok(JsValue::NULL);
+            };
+            // GPU direct-draw present signal: JS drew the frame to the canvas itself,
+            // so it returns only the frame_id for the deferred FrameAcknowledge.
+            |on_avc_presented: JsValue| {
+                let obj = into_object(on_avc_presented)?;
+                let frame_id = get_u32(&obj, "frameId")?;
+
+                self.input_events_tx
+                    .unbounded_send(RdpInputEvent::AvcPresented(frame_id))
+                    .context("send AVC presented")
                     .map_err(IronError::from)?;
 
                 return Ok(JsValue::NULL);

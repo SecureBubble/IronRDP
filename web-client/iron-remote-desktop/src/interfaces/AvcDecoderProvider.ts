@@ -17,6 +17,10 @@ export interface AvcDecoderProvider {
     /** Called after connect() with the live session (the RGBA return path). */
     setSession(session: Session): void;
 
+    /** Called after connect() with the render canvas, so decoded frames can be drawn
+     *  directly on the GPU (no readback). Optional — absent = CPU readback path. */
+    setCanvas?(canvas: HTMLCanvasElement): void;
+
     /** Clean up the decoder. */
     dispose(): void;
 }

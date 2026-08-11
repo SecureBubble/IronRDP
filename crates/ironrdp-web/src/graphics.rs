@@ -104,17 +104,17 @@ impl SurfaceBuf {
 #[derive(Clone)]
 pub(crate) struct Watermark {
     /// QR tile, RGBA8888 (converted from the PDU's ARGB8888).
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
+    pub(crate) rgba: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// Repeat pitch of the tiling grid.
-    cell_w: u32,
-    cell_h: u32,
+    pub(crate) cell_w: u32,
+    pub(crate) cell_h: u32,
     /// QR offset within each cell.
-    off_x: u32,
-    off_y: u32,
+    pub(crate) off_x: u32,
+    pub(crate) off_y: u32,
     /// 8-bit blend strength (0..=255), derived from the PDU's 0..=10000 opacity.
-    opacity: u32,
+    pub(crate) opacity: u32,
 }
 
 impl core::fmt::Debug for Watermark {

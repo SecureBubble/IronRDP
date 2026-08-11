@@ -13,7 +13,7 @@
  * the session config before connect and calls `setSession()` once connected.
  */
 
-import { avcDecodeCallback, onAvcDecoded } from './extensions';
+import { avcDecodeCallback, onAvcDecoded, onAvcPresented, avcWatermarkCallback } from './extensions';
 import type { Extension } from '../../../crates/ironrdp-web/pkg/ironrdp_web';
 
 /** The subset of the connected Session we call back into. */
@@ -131,6 +131,15 @@ export class AvcDecoder {
     private rgbaBuffer: ArrayBuffer | null = null;
     /** Prefer VideoFrame.copyTo (async, non-blocking); fall back to canvas on error. */
     private useCopyTo = true;
+    /** The shared render canvas 2D context. When set, AVC frames are drawn straight
+     *  onto it (GPU→GPU, no readback) — the "Enhanced graphics" fast path. */
+    private renderCtx: CanvasRenderingContext2D | null = null;
+    /** GPU direct-draw enabled; flipped off (per session) if drawImage ever fails. */
+    private useGpu = true;
+    /** Session watermark as a repeating pattern (built from the forwarded tile), drawn
+     *  over each GPU-composited frame with a background-opposing blend. */
+    private wmPattern: CanvasPattern | null = null;
+    private wmOpacity = 0;
 
     /** Extensions registered on the SessionBuilder so the run loop can call us. */
     getBuilderExtensions(): Extension[] {
@@ -138,12 +147,81 @@ export class AvcDecoder {
             avcDecodeCallback((_surfaceId, frameId, x, y, width, height, data) => {
                 this.decode(frameId, x, y, width, height, data);
             }),
+            avcWatermarkCallback((rgba, width, height, cellW, cellH, offX, offY, opacity) => {
+                this.setWatermark(rgba, width, height, cellW, cellH, offX, offY, opacity);
+            }),
         ];
     }
 
     /** Give us the live session (its `invokeExtension` is our RGBA return path). */
     setSession(session: SessionLike): void {
         this.session = session;
+    }
+
+    /** Give us the render canvas so AVC frames can be drawn directly on the GPU
+     *  (no readback). getContext('2d') returns the same context WASM composites into,
+     *  so the two paths share one surface. If absent, we fall back to CPU readback. */
+    setCanvas(canvas: HTMLCanvasElement): void {
+        try {
+            this.renderCtx = canvas.getContext('2d') as CanvasRenderingContext2D | null;
+        } catch {
+            this.renderCtx = null;
+        }
+        if (!this.renderCtx) {
+            console.warn('[AVC] no 2D context on render canvas; using CPU readback path');
+        }
+    }
+
+    /** Build the watermark into a repeating canvas pattern: a cellW×cellH transparent
+     *  cell with the QR tile placed at (offX,offY), tiled from the canvas origin so it
+     *  aligns to the desktop grid — matching the CPU blend's placement. */
+    setWatermark(
+        rgba: Uint8Array,
+        width: number,
+        height: number,
+        cellW: number,
+        cellH: number,
+        offX: number,
+        offY: number,
+        opacity: number,
+    ): void {
+        this.wmPattern = null;
+        this.wmOpacity = 0;
+        if (!this.renderCtx || cellW <= 0 || cellH <= 0 || width <= 0 || height <= 0 || opacity <= 0) {
+            return;
+        }
+        try {
+            const size = width * height * 4;
+            const tile = new ImageData(new Uint8ClampedArray(rgba.subarray(0, size)), width, height);
+            const cell = new OffscreenCanvas(cellW, cellH);
+            const cctx = cell.getContext('2d');
+            if (!cctx) {
+                return;
+            }
+            cctx.putImageData(tile, offX, offY);
+            this.wmPattern = this.renderCtx.createPattern(cell, 'repeat');
+            this.wmOpacity = opacity;
+        } catch (e) {
+            console.warn('[AVC] watermark pattern setup failed', e);
+            this.wmPattern = null;
+            this.wmOpacity = 0;
+        }
+    }
+
+    /** Overdraw the watermark onto a just-presented AVC region using a background-
+     *  opposing blend ('difference'): the mark stays legible on light and dark content
+     *  alike, done on the GPU with no readback. Scaled by the requested opacity. */
+    private drawWatermark(x: number, y: number, w: number, h: number): void {
+        const ctx = this.renderCtx;
+        if (!ctx || !this.wmPattern || this.wmOpacity <= 0) {
+            return;
+        }
+        ctx.save();
+        ctx.globalCompositeOperation = 'difference';
+        ctx.globalAlpha = this.wmOpacity / 255;
+        ctx.fillStyle = this.wmPattern;
+        ctx.fillRect(x, y, w, h);
+        ctx.restore();
     }
 
     dispose(): void {
@@ -267,14 +345,36 @@ export class AvcDecoder {
     }
 
     /**
-     * Read the frame back to RGBA and hand it to the run loop. The readback is the
-     * heavy step (GPU→CPU); we use the async `VideoFrame.copyTo` so it does NOT block
-     * the main thread the way `drawImage`+`getImageData` did (that stalled the rAF
-     * handler ~50ms/frame). Falls back to the canvas path if `copyTo` is unavailable.
+     * Present a decoded frame. Fast path: draw the VideoFrame straight onto the shared
+     * render canvas on the GPU (no GPU→CPU readback) and signal present-only for the
+     * frame-ack. Fallback: read back to RGBA (async `copyTo`, else canvas) and hand the
+     * pixels to the run loop to blit. GPU is used when a render context is available;
+     * a failed `drawImage` disables it for the rest of the session.
      */
     private async presentFrame(frame: VideoFrame, g: Geom): Promise<void> {
         const w = g.width || frame.displayWidth;
         const h = g.height || frame.displayHeight;
+
+        // GPU direct-draw fast path.
+        if (this.useGpu && this.renderCtx) {
+            try {
+                // Crop the coded top-left w×h (macroblock padding) to the dest rect.
+                this.renderCtx.drawImage(frame, 0, 0, w, h, g.x, g.y, w, h);
+                this.drawWatermark(g.x, g.y, w, h);
+                this.session?.invokeExtension(onAvcPresented({ frameId: g.frameId }));
+                return;
+            } catch (e) {
+                console.warn('[AVC] GPU drawImage failed; switching to CPU readback for later frames', e);
+                this.useGpu = false;
+                // This frame is dropped (closed below, not acked); the client's
+                // deferred-ack safety cap covers it. Subsequent frames take CPU.
+                return;
+            } finally {
+                frame.close();
+            }
+        }
+
+        // CPU readback fallback.
         try {
             let rgba: Uint8Array | null = null;
             if (this.useCopyTo) {

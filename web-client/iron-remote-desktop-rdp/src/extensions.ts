@@ -160,3 +160,27 @@ export function onAvcDecoded(params: {
 }): Extension {
     return new Extension('on_avc_decoded', params as unknown);
 }
+
+/** GPU direct-draw present signal: JS drew the frame to the canvas itself, so it
+ *  returns only the frame_id for the deferred FrameAcknowledge (no pixels). */
+export function onAvcPresented(params: { frameId: number }): Extension {
+    return new Extension('on_avc_presented', params as unknown);
+}
+
+/** Session watermark forwarded to the GPU AVC draw path so it can overdraw the tile
+ *  onto each frame. `rgba` is the width×height ARGB→RGBA tile; it repeats on a
+ *  cellW×cellH grid with the tile at (offX,offY); opacity is 0..=255. */
+export function avcWatermarkCallback(
+    cb: (
+        rgba: Uint8Array,
+        width: number,
+        height: number,
+        cellW: number,
+        cellH: number,
+        offX: number,
+        offY: number,
+        opacity: number,
+    ) => void,
+): Extension {
+    return new Extension('avc_watermark_callback', cb as unknown);
+}
