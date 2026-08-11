@@ -42,6 +42,14 @@ export function displayControl(enable: boolean): Extension {
     return new Extension('display_control', enable);
 }
 
+// Advertise AVC420/AVC444 eGFX caps (H.264 "enhanced graphics"). When true the
+// server may send AVC, decoded by the browser WebCodecs path; when false the
+// server falls back to ClearCodec / RFX-Progressive. Maps to the web UI's
+// "Enhanced graphics" toggle. Defaults to true on the Rust side if unset.
+export function advertiseAvc(enable: boolean): Extension {
+    return new Extension('advertise_avc', enable);
+}
+
 export function kdcProxyUrl(url: string): Extension {
     return new Extension('kdc_proxy_url', url);
 }

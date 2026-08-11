@@ -159,7 +159,13 @@ impl WasmSoundMessageProxy {
 /// Advertises a single PCM format and forwards each received wave chunk verbatim;
 /// all decoding/resampling is delegated to the server (which transcodes to PCM)
 /// and the browser's Web Audio API (which resamples to the output device rate).
-#[derive(Debug)]
+///
+/// `Clone` is derived so one logical audio sink can back both the static
+/// "rdpsnd" SVC and the "AUDIO_PLAYBACK_DVC" DVC simultaneously: the clone shares
+/// the same `WasmSoundMessageProxy` (hence the same mpsc sender and the same
+/// `Arc<AtomicUsize>` queued-bytes budget), so whichever transport the server
+/// actually uses funnels PCM into the one event-loop `WasmSound`.
+#[derive(Debug, Clone)]
 pub(crate) struct WasmSoundBackend {
     /// Formats advertised to the server. A single PCM entry, so `wFormatNo` from
     /// the server's Wave2 PDU is always `0`.

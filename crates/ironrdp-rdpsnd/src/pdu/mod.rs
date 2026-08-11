@@ -1362,3 +1362,10 @@ impl<'de> Decode<'de> for ClientAudioOutputPdu {
 }
 
 impl SvcEncode for ClientAudioOutputPdu {}
+
+// The RDPSND client PDUs are transport-agnostic: MS-RDPEA sends the exact same
+// `SNDPROLOG`-prefixed PDUs whether audio rides the static "rdpsnd" SVC or the
+// "AUDIO_PLAYBACK_DVC" dynamic virtual channel. Marking the client PDU as
+// `DvcEncode` lets the DVC audio client ([`crate::client::RdpsndDvcClient`])
+// emit it directly, with no re-encoding.
+impl ironrdp_dvc::DvcEncode for ClientAudioOutputPdu {}

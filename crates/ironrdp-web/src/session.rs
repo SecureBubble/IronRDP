@@ -30,7 +30,7 @@ use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
 use ironrdp::rdperp::client::{RailChannel, RemoteApp};
 use ironrdp::rdperp::orders::WindowOrder;
-use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
+use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd, RdpsndDvcClient};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
@@ -118,6 +118,12 @@ struct SessionBuilderInner {
 
     use_display_control: bool,
     enable_credssp: bool,
+    // Advertise AVC420/AVC444 eGFX caps so the server sends H.264 (decoded by the
+    // browser WebCodecs path). Controlled per-connection via the `advertise_avc`
+    // extension so the web UI's "Enhanced graphics" toggle can turn it off (off =>
+    // server falls back to ClearCodec / RFX-Progressive). Defaults to true to
+    // preserve behavior for callers that don't set it.
+    advertise_avc: bool,
     outbound_message_size_limit: Option<usize>,
 }
 
@@ -167,6 +173,7 @@ impl Default for SessionBuilderInner {
 
             use_display_control: false,
             enable_credssp: true,
+            advertise_avc: true,
             outbound_message_size_limit: None,
         }
     }
@@ -287,6 +294,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |remote_app: JsValue| { self.0.borrow_mut().remote_app = parse_remote_app(&remote_app) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
+            |advertise_avc: bool| { self.0.borrow_mut().advertise_avc = advertise_avc };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -591,6 +599,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         }
 
         let use_display_control = self.0.borrow().use_display_control;
+        let advertise_avc = self.0.borrow().advertise_avc;
 
         // EGFX (MS-RDPEGFX) graphics pipeline is ENABLED (see `build_config`
         // support_graphics_pipeline = true). Attaching the handler makes the client
@@ -617,6 +626,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             sound_backend,
             computer_name: client_name.clone(),
             use_display_control,
+            advertise_avc,
             graphics_handler,
         })
         .await?;
@@ -2083,6 +2093,9 @@ struct ConnectParams {
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
     use_display_control: bool,
+    /// Advertise AVC eGFX caps (H.264). Gated by the web UI "Enhanced graphics"
+    /// toggle via the `advertise_avc` builder extension.
+    advertise_avc: bool,
     graphics_handler: Option<WasmGraphicsHandler>,
 }
 
@@ -2134,6 +2147,7 @@ async fn connect(
         sound_backend,
         computer_name,
         use_display_control,
+        advertise_avc,
         graphics_handler,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
@@ -2167,6 +2181,16 @@ async fn connect(
     // RDPSND is advertised too (MS-RDPEFS Appendix A<1>), so the printer path needs
     // the channel present even though it wants no sound. A real sound backend also
     // satisfies that dependency, so it takes priority when both are configured.
+    //
+    // Audio also rides a dynamic virtual channel: modern hosts (Windows 10/11,
+    // Azure Virtual Desktop) prefer `AUDIO_PLAYBACK_DVC` over the static channel.
+    // When real audio is enabled we register BOTH — the static "rdpsnd" SVC below
+    // and the `AUDIO_PLAYBACK_DVC` DVC further down — sharing one sound sink (a
+    // clone of the backend). The server opens whichever transport it prefers; the
+    // idle one simply never receives a Server Audio Formats PDU. This clone is
+    // taken before the match consumes `sound_backend` for the static channel.
+    let dvc_sound_backend = sound_backend.clone();
+
     match (sound_backend, printer_backend.is_some()) {
         (Some(sound_backend), _) => {
             connector.attach_static_channel(Rdpsnd::new(Box::new(sound_backend)));
@@ -2187,10 +2211,17 @@ async fn connect(
         );
     }
 
-    // Both DisplayControl and the EGFX graphics pipeline are dynamic virtual
-    // channels, so they ride the same single DRDYNVC static channel.
-    if use_display_control || graphics_handler.is_some() {
+    // DisplayControl, the EGFX graphics pipeline, and AUDIO_PLAYBACK_DVC audio are
+    // all dynamic virtual channels, so they ride the same single DRDYNVC static
+    // channel.
+    if use_display_control || graphics_handler.is_some() || dvc_sound_backend.is_some() {
         let mut drdynvc = DrdynvcClient::new();
+        if let Some(dvc_sound_backend) = dvc_sound_backend {
+            // AUDIO_PLAYBACK_DVC (MS-RDPEA over DVC). Same RDPSND PDU flow as the
+            // static "rdpsnd" channel registered above, different transport; AVD
+            // prefers this one. Shares the static backend's sound sink via clone.
+            drdynvc = drdynvc.with_dynamic_channel(RdpsndDvcClient::new(Box::new(dvc_sound_backend)));
+        }
         if use_display_control {
             drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
         }
@@ -2200,14 +2231,13 @@ async fn connect(
             // the browser WebCodecs decoder (see `AvcFrame`/`on_avc_frame` →
             // `avc_decode_callback`), giving full-color 4:2:0 desktop/video.
             //
-            // TEST-ONLY at this stage: keep this `advertise_avc(true)` for the AVC
-            // test build. PROD must revert to `.advertise_avc(false)` until the
-            // remaining gaps close (crisp 4:4:4 aux-stream recombination;
-            // SurfaceToSurface-over-AVC + RDPGFX frame-ack ordering). With AVC
-            // unadvertised the server falls back to ClearCodec / RFX-Progressive,
-            // which this client already decodes correctly.
+            // Now controlled per-connection by `advertise_avc` (set from the web UI
+            // "Enhanced graphics" toggle via the `advertise_avc` extension). When
+            // false the server falls back to ClearCodec / RFX-Progressive, which this
+            // client already decodes correctly — so a PROD build can ship AVC off by
+            // simply not enabling the toggle, without a code change.
             drdynvc = drdynvc.with_dynamic_channel(
-                GraphicsPipelineClient::new(Box::new(graphics_handler), None).advertise_avc(true),
+                GraphicsPipelineClient::new(Box::new(graphics_handler), None).advertise_avc(advertise_avc),
             );
         }
         connector.attach_static_channel(drdynvc);

@@ -2,13 +2,13 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 
 use ironrdp_core::{Decode as _, EncodeResult, ReadCursor, cast_length, impl_as_any};
+use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
 use ironrdp_pdu::gcc::ChannelName;
 use ironrdp_pdu::{PduResult, encode_err, pdu_other_err};
 use ironrdp_svc::{CompressionCondition, SvcClientProcessor, SvcMessage, SvcProcessor};
 use tracing::{debug, error};
 
-use crate::pdu::{self, AudioFormat, PitchPdu, ServerAudioFormatPdu, TrainingPdu, VolumePdu};
-use crate::server::RdpsndSvcMessages;
+use crate::pdu::{self, AudioFormat, ClientAudioOutputPdu, PitchPdu, ServerAudioFormatPdu, TrainingPdu, VolumePdu};
 
 pub trait RdpsndClientHandler: Send + core::fmt::Debug {
     fn get_flags(&self) -> pdu::AudioFormatFlags {
@@ -93,7 +93,7 @@ impl Rdpsnd {
         Ok(server_format.version)
     }
 
-    pub fn client_formats(&mut self) -> PduResult<RdpsndSvcMessages> {
+    pub fn client_formats(&mut self) -> PduResult<Vec<ClientAudioOutputPdu>> {
         // Windows seems to be confused if the client replies with more formats, or unknown formats (e.g.: opus).
         // We ensure to only send supported formats in common with the server.
         let server_format: HashSet<_> = self
@@ -115,52 +115,39 @@ impl Rdpsnd {
             pitch: 0x00010000,
             dgram_port: 0,
         };
-        Ok(RdpsndSvcMessages::new(vec![
-            pdu::ClientAudioOutputPdu::AudioFormat(pdu).into(),
-        ]))
+        Ok(vec![ClientAudioOutputPdu::AudioFormat(pdu)])
     }
 
-    pub fn quality_mode(&mut self) -> PduResult<RdpsndSvcMessages> {
+    pub fn quality_mode(&mut self) -> PduResult<Vec<ClientAudioOutputPdu>> {
         let pdu = pdu::QualityModePdu {
             quality_mode: pdu::QualityMode::High,
         };
-        Ok(RdpsndSvcMessages::new(vec![
-            pdu::ClientAudioOutputPdu::QualityMode(pdu).into(),
-        ]))
+        Ok(vec![ClientAudioOutputPdu::QualityMode(pdu)])
     }
 
-    pub fn training_confirm(&mut self, pdu: &TrainingPdu) -> PduResult<RdpsndSvcMessages> {
+    pub fn training_confirm(&mut self, pdu: &TrainingPdu) -> PduResult<Vec<ClientAudioOutputPdu>> {
         let pack_size: EncodeResult<_> = cast_length!("wPackSize", pdu.data.len());
         let pack_size = pack_size.map_err(|e| encode_err!(e))?;
         let pdu = pdu::TrainingConfirmPdu {
             timestamp: pdu.timestamp,
             pack_size,
         };
-        Ok(RdpsndSvcMessages::new(vec![
-            pdu::ClientAudioOutputPdu::TrainingConfirm(pdu).into(),
-        ]))
+        Ok(vec![ClientAudioOutputPdu::TrainingConfirm(pdu)])
     }
 
-    pub fn wave_confirm(&mut self, timestamp: u16, block_no: u8) -> PduResult<RdpsndSvcMessages> {
+    pub fn wave_confirm(&mut self, timestamp: u16, block_no: u8) -> PduResult<Vec<ClientAudioOutputPdu>> {
         let pdu = pdu::WaveConfirmPdu { timestamp, block_no };
-        Ok(RdpsndSvcMessages::new(vec![
-            pdu::ClientAudioOutputPdu::WaveConfirm(pdu).into(),
-        ]))
-    }
-}
-
-impl_as_any!(Rdpsnd);
-
-impl SvcProcessor for Rdpsnd {
-    fn channel_name(&self) -> ChannelName {
-        Self::NAME
+        Ok(vec![ClientAudioOutputPdu::WaveConfirm(pdu)])
     }
 
-    fn compression_condition(&self) -> CompressionCondition {
-        CompressionCondition::Never
-    }
-
-    fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
+    /// Transport-agnostic core of the RDPSND client state machine.
+    ///
+    /// Decodes one server→client [`pdu::ServerAudioOutputPdu`] and returns the
+    /// client PDUs to send back. The same PDUs flow over the static "rdpsnd" SVC
+    /// (see [`SvcProcessor`] impl) and the "AUDIO_PLAYBACK_DVC" dynamic virtual
+    /// channel (see [`RdpsndDvcClient`]); only the framing differs, so this logic
+    /// is shared verbatim between the two transports.
+    fn process_server_pdu(&mut self, payload: &[u8]) -> PduResult<Vec<ClientAudioOutputPdu>> {
         let pdu = match pdu::ServerAudioOutputPdu::decode(&mut ReadCursor::new(payload)) {
             Ok(pdu) => pdu,
             Err(error) => {
@@ -179,10 +166,9 @@ impl SvcProcessor for Rdpsnd {
                 };
                 self.server_format = Some(af);
                 self.state = RdpsndState::WaitingForTraining;
-                let mut msgs: Vec<SvcMessage> = self.client_formats()?.into();
+                let mut msgs = self.client_formats()?;
                 if self.version()? >= pdu::Version::V6 {
-                    let mut m = self.quality_mode()?.into();
-                    msgs.append(&mut m);
+                    msgs.append(&mut self.quality_mode()?);
                 }
                 msgs
             }
@@ -193,7 +179,7 @@ impl SvcProcessor for Rdpsnd {
                     return Ok(vec![]);
                 };
                 self.state = RdpsndState::Ready;
-                self.training_confirm(&pdu)?.into()
+                self.training_confirm(&pdu)?
             }
             RdpsndState::Ready => {
                 match pdu {
@@ -202,7 +188,7 @@ impl SvcProcessor for Rdpsnd {
                         let format_no = usize::from(pdu.format_no);
                         let ts = pdu.audio_timestamp;
                         self.handler.wave(format_no, ts, pdu.data);
-                        return Ok(self.wave_confirm(pdu.timestamp, pdu.block_no)?.into());
+                        return self.wave_confirm(pdu.timestamp, pdu.block_no);
                     }
                     pdu::ServerAudioOutputPdu::Volume(pdu) => {
                         self.handler.set_volume(pdu);
@@ -213,15 +199,14 @@ impl SvcProcessor for Rdpsnd {
                     pdu::ServerAudioOutputPdu::Close => {
                         self.handler.close();
                     }
-                    pdu::ServerAudioOutputPdu::Training(pdu) => return Ok(self.training_confirm(&pdu)?.into()),
+                    pdu::ServerAudioOutputPdu::Training(pdu) => return self.training_confirm(&pdu),
                     pdu::ServerAudioOutputPdu::AudioFormat(af) => {
                         self.handler.close();
                         self.server_format = Some(af);
                         self.state = RdpsndState::WaitingForTraining;
-                        let mut msgs: Vec<SvcMessage> = self.client_formats()?.into();
+                        let mut msgs = self.client_formats()?;
                         if self.version()? >= pdu::Version::V6 {
-                            let mut m = self.quality_mode()?.into();
-                            msgs.append(&mut m);
+                            msgs.append(&mut self.quality_mode()?);
                         }
                         return Ok(msgs);
                     }
@@ -243,6 +228,27 @@ impl SvcProcessor for Rdpsnd {
     }
 }
 
+impl_as_any!(Rdpsnd);
+
+impl SvcProcessor for Rdpsnd {
+    fn channel_name(&self) -> ChannelName {
+        Self::NAME
+    }
+
+    fn compression_condition(&self) -> CompressionCondition {
+        CompressionCondition::Never
+    }
+
+    fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
+        // Static "rdpsnd" SVC framing: wrap each client PDU in an SVC message.
+        Ok(self
+            .process_server_pdu(payload)?
+            .into_iter()
+            .map(SvcMessage::from)
+            .collect())
+    }
+}
+
 impl Drop for Rdpsnd {
     fn drop(&mut self) {
         self.handler.close();
@@ -250,3 +256,70 @@ impl Drop for Rdpsnd {
 }
 
 impl SvcClientProcessor for Rdpsnd {}
+
+/// RDPSND audio-output client over the `AUDIO_PLAYBACK_DVC` dynamic virtual
+/// channel (MS-RDPEA).
+///
+/// Modern hosts — Windows 10/11 and Azure Virtual Desktop in particular — prefer
+/// to carry server→client audio over a dynamic virtual channel named
+/// `AUDIO_PLAYBACK_DVC` rather than the legacy static "rdpsnd" channel. The
+/// protocol is otherwise identical: the exact same `SNDPROLOG`-prefixed PDUs
+/// (Server Audio Formats/Version, Training, Wave/Wave2, Volume, Pitch, Close)
+/// flow in the same order; only the transport framing differs (a DVC opened by
+/// the server via DRDYNVC instead of a preallocated MCS channel). FreeRDP models
+/// this the same way — one plugin, one PDU state machine, two transports
+/// (`rdpsnd_VirtualChannelEntryEx` vs `rdpsnd_DVCPluginEntry`).
+///
+/// This wraps the transport-agnostic [`Rdpsnd`] state machine and re-frames its
+/// client PDUs as [`DvcMessage`]s. Register it alongside the static [`Rdpsnd`]
+/// SVC (both share one [`RdpsndClientHandler`] sink or a clone of it) so the
+/// server can pick whichever transport it prefers; only one will actually carry
+/// audio in a given session.
+#[derive(Debug)]
+pub struct RdpsndDvcClient {
+    inner: Rdpsnd,
+}
+
+impl RdpsndDvcClient {
+    /// The MS-RDPEA dynamic virtual channel name for server→client audio output.
+    pub const NAME: &'static str = "AUDIO_PLAYBACK_DVC";
+
+    pub fn new(handler: Box<dyn RdpsndClientHandler>) -> Self {
+        Self {
+            inner: Rdpsnd::new(handler),
+        }
+    }
+}
+
+impl_as_any!(RdpsndDvcClient);
+
+impl DvcProcessor for RdpsndDvcClient {
+    fn channel_name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        // Per MS-RDPEA the server speaks first (Server Audio Formats and Version
+        // PDU), exactly as on the static channel, so there is nothing to send on
+        // channel creation. The state machine stays in `Start` until that PDU
+        // arrives via `process`.
+        Ok(Vec::new())
+    }
+
+    fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        // DVC framing: box each client PDU as a DvcMessage. The DRDYNVC layer
+        // splits it across DATA_FIRST/DATA PDUs as needed.
+        Ok(self
+            .inner
+            .process_server_pdu(payload)?
+            .into_iter()
+            .map(|pdu| Box::new(pdu) as DvcMessage)
+            .collect())
+    }
+
+    // `close` intentionally left as the default no-op: the wrapped `Rdpsnd`'s
+    // `Drop` invokes `handler.close()` exactly once when this processor is
+    // dropped (channel teardown), matching the static-channel lifecycle.
+}
+
+impl DvcClientProcessor for RdpsndDvcClient {}
