@@ -158,7 +158,8 @@ export {
     soundCallbacks,
     avcDecodeCallback,
     onAvcDecoded,
-    onAvcPresented,
+    onAvcAck,
     avcWatermarkCallback,
+    canvasUpdatedCallback,
 } from './extensions';
 export type { PrintJobStreamCallbacks, SoundCallbacks } from './extensions';

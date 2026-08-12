@@ -161,10 +161,25 @@ export function onAvcDecoded(params: {
     return new Extension('on_avc_decoded', params as unknown);
 }
 
-/** GPU direct-draw present signal: JS drew the frame to the canvas itself, so it
- *  returns only the frame_id for the deferred FrameAcknowledge (no pixels). */
-export function onAvcPresented(params: { frameId: number }): Extension {
-    return new Extension('on_avc_presented', params as unknown);
+/** Decode-complete ack signal: the WebCodecs decoder produced a frame, so send its
+ *  deferred eGFX FrameAcknowledge (frame_id only, no pixels). Fired at DECODE — not at
+ *  present — so the server is paced to real decode throughput instead of a present
+ *  round-trip (see AvcDecoder.onFrame). Presentation happens independently on the next
+ *  rAF; the bounded present FIFO caps display latency. */
+export function onAvcAck(params: { frameId: number }): Extension {
+    return new Extension('on_avc_ack', params as unknown);
+}
+
+/** Passive render-canvas update notification for an external multi-monitor presenter.
+ *  The run loop calls it once per drawn NON-AVC region (eGFX blit + CPU AVC readback)
+ *  with the updated rect in source-canvas pixel coords, so the presenter can redraw only
+ *  the affected area on a real pixel change instead of sampling on a blind timer. The AVC
+ *  GPU direct-draw path never re-enters the run loop, so it notifies separately via
+ *  `AvcDecoder.setCanvasUpdatedCallback`. It never touches frame-ack / present flow. */
+export function canvasUpdatedCallback(
+    cb: (x: number, y: number, width: number, height: number) => void,
+): Extension {
+    return new Extension('canvas_updated_callback', cb as unknown);
 }
 
 /** Session watermark forwarded to the GPU AVC draw path so it can overdraw the tile

@@ -111,6 +111,13 @@ struct SessionBuilderInner {
     /// it when the session watermark changes so the GPU direct-draw path can overdraw
     /// it onto each AVC frame (the CPU path re-blends it in Rust instead).
     avc_watermark_callback: Option<js_sys::Function>,
+    /// Render-canvas update notification (extension `canvas_updated_callback`). Fired
+    /// once per rendered NON-AVC region (eGFX blit + CPU AVC readback) with the updated
+    /// rect in source-canvas pixel coords, so an external multi-monitor presenter can
+    /// redraw only the affected area on a real pixel change instead of a blind timer.
+    /// Passive: it never touches frame-ack / present flow. (The AVC GPU direct-draw path
+    /// notifies JS-side from `AvcDecoder`, since it never re-enters this run loop.)
+    canvas_updated_callback: Option<js_sys::Function>,
 
     // Setting printer stream callbacks activates the virtual printer.
     invalid_print_job_stream_callbacks: bool,
@@ -169,6 +176,7 @@ impl Default for SessionBuilderInner {
             format_list_response_callback: None,
             avc_decode_callback: None,
             avc_watermark_callback: None,
+            canvas_updated_callback: None,
 
             invalid_print_job_stream_callbacks: false,
             print_job_stream_callbacks: None,
@@ -403,6 +411,12 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |avc_watermark_callback: JsValue| {
                 self.0.borrow_mut().avc_watermark_callback = avc_watermark_callback.dyn_into::<js_sys::Function>().ok();
             };
+            // Passive render-canvas update notification for the multi-monitor presenter
+            // (see field docs). Fires once per drawn NON-AVC region; the AVC GPU path
+            // notifies JS-side. Never affects protocol / frame-ack state.
+            |canvas_updated_callback: JsValue| {
+                self.0.borrow_mut().canvas_updated_callback = canvas_updated_callback.dyn_into::<js_sys::Function>().ok();
+            };
         }
 
         self.clone()
@@ -434,6 +448,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             format_list_response_callback,
             avc_decode_callback,
             avc_watermark_callback,
+            canvas_updated_callback,
             invalid_print_job_stream_callbacks,
             print_job_stream_callbacks,
             printer_name,
@@ -479,6 +494,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             format_list_response_callback = inner.format_list_response_callback.clone();
             avc_decode_callback = inner.avc_decode_callback.clone();
             avc_watermark_callback = inner.avc_watermark_callback.clone();
+            canvas_updated_callback = inner.canvas_updated_callback.clone();
             invalid_print_job_stream_callbacks = inner.invalid_print_job_stream_callbacks;
             print_job_stream_callbacks = inner.print_job_stream_callbacks.clone();
             printer_name = inner.printer_name.clone();
@@ -690,6 +706,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             set_cursor_style_callback_context,
             avc_decode_callback,
             avc_watermark_callback,
+            canvas_updated_callback,
 
             input_events_rx: RefCell::new(Some(input_events_rx)),
             rdp_reader: RefCell::new(Some(rdp_reader)),
@@ -725,14 +742,17 @@ pub(crate) enum RdpInputEvent {
     /// the JS decode callback, which later returns RGBA via [`RdpInputEvent::AvcRegion`].
     Avc(AvcFrameEvent),
     /// An out-of-band-decoded AVC region (RGBA), returned by the JS WebCodecs decoder,
-    /// with the eGFX `frame_id` it presents. Unlike [`RdpInputEvent::Graphics`], this
-    /// bypassed the handler's surface buffer, so the run loop re-blends the watermark
-    /// before drawing — and then sends the deferred FrameAcknowledge for `frame_id`.
+    /// with the eGFX `frame_id` its pixels belong to. Unlike [`RdpInputEvent::Graphics`],
+    /// this bypassed the handler's surface buffer, so the run loop re-blends the watermark
+    /// before drawing. This is the CPU-readback fallback's PIXEL-delivery path only; the
+    /// FrameAcknowledge for `frame_id` was already sent at decode via [`RdpInputEvent::AvcAck`].
     AvcRegion(GraphicsRegion, u32),
-    /// An AVC frame the JS decoder drew directly to the canvas on the GPU (no pixel
-    /// readback). Carries only the eGFX `frame_id` so the run loop sends its deferred
-    /// FrameAcknowledge — no drawing needed here (JS already presented it).
-    AvcPresented(u32),
+    /// The WebCodecs decoder produced a frame for eGFX `frame_id`: send its deferred
+    /// FrameAcknowledge. Fired at DECODE-completion (not present) so the server is paced to
+    /// real decode throughput rather than a present round-trip — the fix for the
+    /// two-monitor + AVC stutter. No drawing here; presentation happens independently on the
+    /// JS side (GPU direct-draw or the CPU [`RdpInputEvent::AvcRegion`] pixel path).
+    AvcAck(u32),
     /// The current session watermark, forwarded by the graphics handler so the run
     /// loop can re-blend it onto out-of-band AVC regions.
     Watermark(Watermark),
@@ -806,6 +826,8 @@ pub(crate) struct Session {
     avc_decode_callback: Option<js_sys::Function>,
     /// AVC watermark callback; forwards the session watermark to the GPU draw path.
     avc_watermark_callback: Option<js_sys::Function>,
+    /// Passive render-canvas update notification; `None` if no presenter registered.
+    canvas_updated_callback: Option<js_sys::Function>,
 
     // Consumed when `run` is called
     input_events_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpInputEvent>>>,
@@ -853,6 +875,24 @@ impl Session {
             .map_err(|e| anyhow::Error::msg(format!("set cursor style callback failed: {e:?}")))?;
 
         Ok(())
+    }
+
+    /// Passive notification that the render canvas changed in `(x, y, width, height)`
+    /// (source-canvas pixel coords), used by the multi-monitor presenter to redraw only
+    /// the affected area on a real pixel change. Best-effort: a throwing callback is
+    /// logged and ignored, and it never influences protocol / frame-ack state.
+    fn notify_canvas_updated(&self, x: u32, y: u32, width: u32, height: u32) {
+        if let Some(cb) = &self.canvas_updated_callback {
+            let args = js_sys::Array::from_iter([
+                JsValue::from_f64(f64::from(x)),
+                JsValue::from_f64(f64::from(y)),
+                JsValue::from_f64(f64::from(width)),
+                JsValue::from_f64(f64::from(height)),
+            ]);
+            if let Err(err) = cb.apply(&JsValue::NULL, &args) {
+                warn!(?err, "canvas_updated callback threw");
+            }
+        }
     }
 }
 
@@ -1123,6 +1163,8 @@ impl iron_remote_desktop::Session for Session {
                             if let Err(e) = gui.draw(&mut data, rect) {
                                 warn!(error = format!("{e:#}"), "failed to draw EGFX region");
                             }
+                            // Passive: tell an external presenter which area changed.
+                            self.notify_canvas_updated(rx, ry, rw, rh);
                             Vec::new()
                         }
                         RdpInputEvent::Watermark(wm) => {
@@ -1150,10 +1192,17 @@ impl iron_remote_desktop::Session for Session {
                             Vec::new()
                         }
                         RdpInputEvent::AvcRegion(region, frame_id) => {
-                            // Out-of-band AVC decode bypassed the handler's surface
-                            // buffer (and thus its flush-time watermark re-blend), so
-                            // re-blend the mark here before painting, then draw exactly
-                            // like a normal Graphics region.
+                            // CPU-readback fallback PIXEL-delivery path: JS read the decoded
+                            // frame back to RGBA and handed us the pixels to blit. Out-of-band
+                            // AVC decode bypassed the handler's surface buffer (and thus its
+                            // flush-time watermark re-blend), so re-blend the mark here before
+                            // painting, then draw exactly like a normal Graphics region.
+                            //
+                            // The FrameAcknowledge for `frame_id` was already sent at DECODE
+                            // (RdpInputEvent::AvcAck), so we do NOT ack here — flow control is
+                            // paced by decode throughput, not this present. (`frame_id` is
+                            // retained only for symmetry / potential future use.)
+                            let _ = frame_id;
                             let (rx, ry, rw, rh) = (region.x, region.y, region.width, region.height);
                             let mut data = region.data;
                             if let Some(wm) = &current_watermark {
@@ -1170,28 +1219,24 @@ impl iron_remote_desktop::Session for Session {
                             if let Err(e) = gui.draw(&mut data, rect) {
                                 warn!(error = format!("{e:#}"), "failed to draw AVC region");
                             }
-                            // The frame is now presented — send its DEFERRED
-                            // FrameAcknowledge so the server paces to our real display
-                            // rate instead of flooding the async decoder (the FreeRDP
-                            // flow-control model; the fix for both latency and A/V sync).
+                            // Passive: the CPU AVC readback path updated the canvas here
+                            // (the GPU direct-draw path notifies JS-side from AvcDecoder).
+                            self.notify_canvas_updated(rx, ry, rw, rh);
+                            Vec::new()
+                        }
+                        RdpInputEvent::AvcAck(frame_id) => {
+                            // The WebCodecs decoder produced a frame for `frame_id`. Send its
+                            // deferred FrameAcknowledge NOW (at decode-completion) so the server
+                            // is paced to our real decode throughput instead of a present
+                            // round-trip. Presentation (GPU direct-draw or the CPU AvcRegion
+                            // pixel path) happens independently; the bounded per-surface present
+                            // FIFO in JS caps display latency so early acking can't build an
+                            // unbounded backlog.
                             match encode_avc_frame_ack(&mut active_stage, frame_id) {
                                 Ok(Some(frame)) => vec![ActiveStageOutput::ResponseFrame(frame)],
                                 Ok(None) => Vec::new(),
                                 Err(e) => {
                                     warn!(error = format!("{e:#}"), "failed to send AVC frame-ack");
-                                    Vec::new()
-                                }
-                            }
-                        }
-                        RdpInputEvent::AvcPresented(frame_id) => {
-                            // GPU direct-draw path: JS already composited the VideoFrame
-                            // onto the canvas (no readback). Nothing to paint here — just
-                            // send the deferred FrameAcknowledge for the presented frame.
-                            match encode_avc_frame_ack(&mut active_stage, frame_id) {
-                                Ok(Some(frame)) => vec![ActiveStageOutput::ResponseFrame(frame)],
-                                Ok(None) => Vec::new(),
-                                Err(e) => {
-                                    warn!(error = format!("{e:#}"), "failed to send AVC frame-ack (gpu)");
                                     Vec::new()
                                 }
                             }
@@ -1341,9 +1386,18 @@ impl iron_remote_desktop::Session for Session {
                     }
                     ActiveStageOutput::GraphicsUpdate(region) => {
                         let region = extract_partial_image(&image, region, &mut draw_buffer);
+                        // Capture the updated rect before `region` is moved into draw().
+                        let (ux, uy, uw, uh) = (
+                            u32::from(region.left),
+                            u32::from(region.top),
+                            u32::from(region.right.saturating_sub(region.left)) + 1,
+                            u32::from(region.bottom.saturating_sub(region.top)) + 1,
+                        );
                         gui.draw(draw_buffer.filled_mut(), region)
                             .context("draw updated region")?;
                         draw_buffer.clear();
+                        // Passive: classic bitmap/Surface-Bits path updated the canvas.
+                        self.notify_canvas_updated(ux, uy, uw, uh);
                     }
                     ActiveStageOutput::PointerDefault => {
                         self.set_cursor_style(CursorStyle::Default)?;
@@ -1691,15 +1745,16 @@ impl iron_remote_desktop::Session for Session {
 
                 return Ok(JsValue::NULL);
             };
-            // GPU direct-draw present signal: JS drew the frame to the canvas itself,
-            // so it returns only the frame_id for the deferred FrameAcknowledge.
-            |on_avc_presented: JsValue| {
-                let obj = into_object(on_avc_presented)?;
+            // Decode-complete ack signal: the WebCodecs decoder produced a frame, so send
+            // the deferred FrameAcknowledge for its eGFX frame_id. Fired at DECODE (not
+            // present) so the server is paced to real decode throughput.
+            |on_avc_ack: JsValue| {
+                let obj = into_object(on_avc_ack)?;
                 let frame_id = get_u32(&obj, "frameId")?;
 
                 self.input_events_tx
-                    .unbounded_send(RdpInputEvent::AvcPresented(frame_id))
-                    .context("send AVC presented")
+                    .unbounded_send(RdpInputEvent::AvcAck(frame_id))
+                    .context("send AVC ack")
                     .map_err(IronError::from)?;
 
                 return Ok(JsValue::NULL);

@@ -25,7 +25,7 @@ use ironrdp_egfx::pdu::{
     CacheToSurfacePdu, MapSurfaceToScaledOutputPdu, ProtectSurfacePdu, SolidFillPdu, SurfaceToCachePdu,
     SurfaceToSurfacePdu, WatermarkPdu,
 };
-use tracing::{info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::session::{AvcFrameEvent, GraphicsRegion, RdpInputEvent};
 
@@ -400,7 +400,7 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         // -> (1280,0)). `mapped=false` means the surface was never MapSurfaceToOutput'd,
         // so its frames wrongly fall back to the primary origin (0,0).
         if self.avc_logged_surfaces.insert(frame.surface_id) {
-            info!(
+            debug!(
                 surface_id = frame.surface_id,
                 mapped = mapped_origin.is_some(),
                 origin_x = ox,
@@ -623,7 +623,7 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
             // Second-monitor flushes log at info! (visible at the default level) so a live
             // multimon session surfaces them without the per-frame primary-monitor flood.
             if ox > 0 {
-                info!(
+                trace!(
                     surface_id,
                     origin_x = ox,
                     origin_y = oy,

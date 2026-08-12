@@ -225,8 +225,8 @@ pub struct AvcFrame<'a> {
     /// Surface this frame targets.
     pub surface_id: u16,
     /// The eGFX frame this AVC picture belongs to. The out-of-band decoder echoes it
-    /// back on present so the client can send the deferred `FrameAcknowledge` for it
-    /// (flow control — see [`GraphicsPipelineClient::acknowledge_avc_frame`]).
+    /// back on decode-completion so the client can send the deferred `FrameAcknowledge` for
+    /// it (flow control — see [`GraphicsPipelineClient::build_frame_ack`]).
     pub frame_id: u32,
     /// Which AVC codec produced it (`Avc444` = 0x0E or `Avc444v2` = 0x0F).
     pub codec_id: Codec1Type,
@@ -469,17 +469,63 @@ pub struct GraphicsPipelineClient {
     /// True if the frame currently being assembled (StartFrame..EndFrame) carried an
     /// AVC (async-decoded) picture, so its `FrameAcknowledge` must be deferred.
     current_frame_has_avc: bool,
-    /// FrameAcknowledges deferred until the out-of-band AVC decoder signals present.
-    /// Maps `frame_id -> total_frames_decoded` snapshot taken at EndFrame. Flushing
-    /// happens in [`GraphicsPipelineClient::build_frame_ack`]; this is the FreeRDP
-    /// flow-control model (ack after present so the server paces to our display rate).
-    deferred_acks: BTreeMap<u32, u32>,
+    /// Pending FrameAcknowledges, keyed by `frame_id`. Each entry carries the
+    /// `total_frames_decoded` snapshot taken at EndFrame plus whether its ack is ready to
+    /// send yet (synchronous codecs: ready at EndFrame; AVC: ready only when the
+    /// out-of-band decoder presents, see [`GraphicsPipelineClient::build_frame_ack`]).
+    ///
+    /// Emission is a **non-blocking, monotonic high-water mark**
+    /// ([`GraphicsPipelineClient::flush_ready_acks`]): whenever frames become ready we emit
+    /// an ack for each ready frame whose `frame_id` exceeds the last one already sent
+    /// (`max_acked_frame_id`), in ascending order, and simply *retire* (drop without
+    /// emitting) any ready frame whose `frame_id` is below the high-water — an out-of-order
+    /// straggler already covered by the cumulative counter. Because both `frame_id` and
+    /// `total_frames_decoded` only ever advance, the wire stays monotonic as MS-RDPEGFX
+    /// 2.2.2.13 requires (the counter is cumulative; a decreasing value drives the server
+    /// encoder into its error state).
+    ///
+    /// Crucially this does NOT gate on the *lowest* un-decoded frame. With two monitors,
+    /// two independent browser VideoDecoders complete decode out of eGFX `frame_id` order; the
+    /// old "flush only the consecutive ready run from the front" scheme head-of-line-blocked
+    /// every ack behind the slowest surface's un-decoded frame, draining the server's
+    /// flow-control window and stalling the whole session. High-water emission lets a fast
+    /// surface's acks through while a slow surface catches up.
+    pending_acks: BTreeMap<u32, PendingAck>,
+    /// Lowest `frame_id` still pending (front of `pending_acks`). Cached for telemetry /
+    /// the live dual-monitor repro; exposed via [`GraphicsPipelineClient::next_unacked_frame_id`].
+    next_unacked_frame_id: Option<u32>,
+    /// Largest `total_frames_decoded` already emitted on the wire. Emitted acks are
+    /// clamped to this so the cumulative counter can never regress (MS-RDPEGFX 2.2.2.13),
+    /// even across a ResetGraphics.
+    max_total_acked: u32,
+    /// Largest `frame_id` already emitted on the wire. A ready frame is acked only if its
+    /// `frame_id` exceeds this (the high-water mark); lower-id stragglers are retired
+    /// silently so the wire `frameId` never regresses. Reset on ResetGraphics because the
+    /// server may restart its `frame_id` sequence for the new stream (unlike the cumulative
+    /// `total_frames_decoded`, which continues).
+    max_acked_frame_id: u32,
 }
 
-/// Safety cap on outstanding deferred AVC acks. If a decoded frame is never presented
-/// (decoder error / lost frame), acking it here keeps the server's flow-control window
-/// from stalling forever. Set generously so it only fires on genuine loss, not normal
-/// backpressure.
+/// One entry in the [`GraphicsPipelineClient::pending_acks`] reorder buffer.
+#[derive(Clone, Copy)]
+struct PendingAck {
+    /// `total_frames_decoded` snapshot at this frame's EndFrame.
+    total_frames_decoded: u32,
+    /// Ack is ready to send. Synchronous codecs set this at EndFrame; AVC frames set it
+    /// on decode-completion in [`GraphicsPipelineClient::build_frame_ack`].
+    ready: bool,
+    /// Frame carried AVC (its ack was deferred until decode-completion). Purely for logging.
+    avc: bool,
+}
+
+/// Memory bound on un-decoded (never-ready) entries retained in `pending_acks`. With
+/// high-water emission a never-decoded AVC frame (browser decoder error — a frame whose
+/// `EndFrame` registered a deferred ack but which the WebCodecs decoder never produced) no
+/// longer gates flow control — the cumulative counter advances past it via later frames
+/// that DO decode — but its `pending_acks` entry would otherwise linger forever. When the
+/// buffer exceeds this bound we evict the oldest such entries. Set generously so it only
+/// fires under genuine sustained loss. (Present-queue FIFO drops no longer leave un-acked
+/// entries: the ack fires at decode, before the frame reaches the present FIFO.)
 const MAX_DEFERRED_ACKS: usize = 64;
 
 impl GraphicsPipelineClient {
@@ -504,7 +550,10 @@ impl GraphicsPipelineClient {
             frames_queued: 0,
             total_frames_decoded: 0,
             current_frame_has_avc: false,
-            deferred_acks: BTreeMap::new(),
+            pending_acks: BTreeMap::new(),
+            next_unacked_frame_id: None,
+            max_total_acked: 0,
+            max_acked_frame_id: 0,
         }
     }
 
@@ -548,6 +597,14 @@ impl GraphicsPipelineClient {
     #[must_use]
     pub fn total_frames_decoded(&self) -> u32 {
         self.total_frames_decoded
+    }
+
+    /// Lowest `frame_id` whose `FrameAcknowledge` has not yet been sent (the front of the
+    /// reorder buffer), or `None` when no frame is pending. Useful for confirming the ack
+    /// sequence during a live dual-monitor repro.
+    #[must_use]
+    pub fn next_unacked_frame_id(&self) -> Option<u32> {
+        self.next_unacked_frame_id
     }
 
     // ========================================================================
@@ -775,9 +832,18 @@ impl GraphicsPipelineClient {
         self.current_frame_id = None;
         self.frames_queued = 0;
         self.current_frame_has_avc = false;
-        // Drop deferred acks: their frame_ids belong to the previous stream and will
+        // Drop pending acks: their frame_ids belong to the previous stream and will
         // never be presented now, so holding them would leak / stall flow control.
-        self.deferred_acks.clear();
+        // `max_total_acked` is intentionally NOT reset (matching `total_frames_decoded`):
+        // the cumulative counter must not regress across a ResetGraphics either.
+        self.pending_acks.clear();
+        self.next_unacked_frame_id = None;
+        // Reset the frame_id high-water: the server may restart its per-channel `frame_id`
+        // sequence for the new stream, and a stale high-water would suppress every ack of
+        // the restarted (lower-id) sequence and stall flow control. `max_total_acked` is
+        // deliberately NOT reset (its `total_frames_decoded` source keeps counting), so the
+        // cumulative counter still never regresses.
+        self.max_acked_frame_id = 0;
 
         // Reset decoder state for new stream
         if let Some(ref mut decoder) = self.h264_decoder {
@@ -813,7 +879,7 @@ impl GraphicsPipelineClient {
             output_origin_y: 0,
         };
 
-        info!(surface_id, width, height, ?pixel_format, "Surface created");
+        debug!(surface_id, width, height, ?pixel_format, "Surface created");
         self.handler.on_surface_created(&surface);
         self.surfaces.insert(surface_id, surface);
     }
@@ -837,7 +903,7 @@ impl GraphicsPipelineClient {
             surface.is_mapped = true;
             surface.output_origin_x = origin_x;
             surface.output_origin_y = origin_y;
-            info!(surface_id, origin_x, origin_y, "Surface mapped to output");
+            debug!(surface_id, origin_x, origin_y, "Surface mapped to output");
             self.handler.on_surface_mapped(surface_id, origin_x, origin_y);
         } else {
             warn!(surface_id, "MapSurfaceToOutput for unknown surface");
@@ -1201,32 +1267,122 @@ impl GraphicsPipelineClient {
         self.handler.on_frame_complete(frame_id);
 
         // Per [3.3.5.12] the client MUST send a FrameAcknowledge after EndFrame — but
-        // WHEN matters for flow control. Synchronous codecs (ClearCodec/Progressive/
-        // Planar) are already composited here, so we ack immediately. AVC decodes
-        // asynchronously in the browser, so acking now would tell the server we're
-        // keeping up when we're not — it would flood an async decoder and the picture
-        // would lag seconds behind. Instead we DEFER the ack until the decoder signals
-        // present (see `build_frame_ack`), which paces the server to our real display
-        // rate exactly as FreeRDP does with its synchronous decode+paint.
-        if self.current_frame_has_avc {
-            self.deferred_acks.insert(frame_id, self.total_frames_decoded);
+        // WHEN, and in what ORDER, matters for flow control. Synchronous codecs
+        // (ClearCodec/Progressive/Planar) are already composited here, so their ack is
+        // READY now. AVC decodes asynchronously in the browser, so acking at EndFrame (before
+        // the decoder has even run) would tell the server we're keeping up when we're not — it
+        // would flood the async decoder and the picture would lag seconds behind. Its ack
+        // becomes ready only when the decoder signals DECODE-completion (it produced a frame;
+        // see `build_frame_ack`), pacing the server to our real decode throughput — the actual
+        // bottleneck — exactly as the synchronous codecs pace to their Rust decode. Note the
+        // ack is decoupled from PRESENTATION (rAF-gated, per-surface): presenting drives the
+        // display, not flow control, so a slow present never starves delivery.
+        //
+        // Either way the frame is REGISTERED in the reorder buffer and actually emitted
+        // by `flush_ready_acks`, which sends only the consecutive ready run from the
+        // front. That keeps `frameId` / `totalFramesDecoded` monotonic on the wire even
+        // when two surfaces feed two out-of-order VideoDecoders (multi-monitor), the
+        // condition that otherwise trips the server's "graphics subsystem error state".
+        let ready = !self.current_frame_has_avc;
+        self.pending_acks.insert(
+            frame_id,
+            PendingAck {
+                total_frames_decoded: self.total_frames_decoded,
+                ready,
+                avc: self.current_frame_has_avc,
+            },
+        );
+        if self.next_unacked_frame_id.is_none() {
+            self.next_unacked_frame_id = Some(frame_id);
+        }
+        if ready {
+            trace!(frame_id, "Frame ready; flushing ready run");
+        } else {
             trace!(frame_id, "Deferring FrameAcknowledge until AVC present");
+        }
+        Ok(self.flush_ready_acks())
+    }
 
-            // Safety valve: never let a lost present stall the server's window forever.
-            let mut flush = Vec::new();
-            while self.deferred_acks.len() > MAX_DEFERRED_ACKS {
-                let Some((&oldest, &total)) = self.deferred_acks.iter().next() else {
-                    break;
-                };
-                self.deferred_acks.remove(&oldest);
-                warn!(frame_id = oldest, "Flushing stale deferred AVC ack (never presented)");
-                flush.push(self.make_frame_ack(oldest, total));
+    /// Emit the `FrameAcknowledge` DVC messages unblocked by the current state, as a
+    /// **non-blocking, monotonic high-water mark**.
+    ///
+    /// For every *ready* frame (ascending `frame_id`) we either emit its ack — if its
+    /// `frame_id` advances the high-water `max_acked_frame_id` — or retire it silently as
+    /// an out-of-order straggler already covered by the cumulative counter. Un-ready
+    /// (un-decoded AVC) frames are *skipped*, not blocked on: a slow surface can no
+    /// longer head-of-line-block a fast surface's acks, which was the multi-monitor stall.
+    /// Both wire counters (`frame_id`, `total_frames_decoded`) only advance, so the stream
+    /// stays monotonic (MS-RDPEGFX 2.2.2.13).
+    ///
+    /// Single-monitor / synchronous codecs are unchanged: frames become ready in ascending
+    /// `frame_id` order and each strictly advances the high-water, so exactly one ack is
+    /// emitted per frame, in order, with no added latency.
+    ///
+    /// Memory hygiene: never-decoded AVC frames (browser decoder error) leave dangling
+    /// un-ready entries. They no longer gate flow control, but once the buffer exceeds
+    /// `MAX_DEFERRED_ACKS` the oldest are evicted so it can't grow without bound.
+    fn flush_ready_acks(&mut self) -> Vec<DvcMessage> {
+        let mut out = Vec::new();
+
+        // Collect ready frame_ids up front (ascending — BTreeMap order) so we can mutate
+        // the map while iterating.
+        let ready_ids: Vec<u32> = self
+            .pending_acks
+            .iter()
+            .filter(|(_, p)| p.ready)
+            .map(|(&id, _)| id)
+            .collect();
+
+        for frame_id in ready_ids {
+            let pending = self.pending_acks.remove(&frame_id).expect("collected above");
+            if frame_id > self.max_acked_frame_id {
+                out.push(self.commit_ack(frame_id, pending));
+            } else {
+                // Out-of-order straggler: a lower-`frame_id` surface finished decode after the
+                // cumulative high-water already passed it. Retire without emitting — an
+                // earlier ack already advanced the server's window past this frame. This is
+                // exactly what keeps the other monitor flowing instead of stalling here.
+                trace!(
+                    frame_id,
+                    max_acked = self.max_acked_frame_id,
+                    "AVC straggler retired (ack coalesced into high-water)"
+                );
             }
-            return Ok(flush);
         }
 
-        trace!(frame_id, "Sending FrameAcknowledge");
-        Ok(vec![self.make_frame_ack(frame_id, self.total_frames_decoded)])
+        // Evict never-presented entries over the safety bound (oldest first). They are
+        // un-ready and no longer gate flow control; this only bounds memory under loss.
+        while self.pending_acks.len() > MAX_DEFERRED_ACKS {
+            let Some((&stale_id, _)) = self.pending_acks.iter().next() else {
+                break;
+            };
+            warn!(
+                stale_id,
+                backlog = self.pending_acks.len(),
+                "Evicting un-presented AVC ack (over MAX_DEFERRED_ACKS)"
+            );
+            self.pending_acks.remove(&stale_id);
+        }
+
+        self.next_unacked_frame_id = self.pending_acks.keys().next().copied();
+        out
+    }
+
+    /// Advance the wire high-water marks (`frame_id`, clamped `total_frames_decoded`),
+    /// log the (now monotonic) ack, and build the DVC message. Only called for a frame
+    /// whose `frame_id` already exceeds `max_acked_frame_id`.
+    fn commit_ack(&mut self, frame_id: u32, pending: PendingAck) -> DvcMessage {
+        let total = pending.total_frames_decoded.max(self.max_total_acked);
+        self.max_total_acked = total;
+        self.max_acked_frame_id = frame_id;
+        debug!(
+            frame_id,
+            total_frames_decoded = total,
+            kind = if pending.avc { "deferred" } else { "sync" },
+            pending_depth = self.pending_acks.len(),
+            "Sending FrameAcknowledge"
+        );
+        self.make_frame_ack(frame_id, total)
     }
 
     /// Build a `FrameAcknowledge` DVC message. `queue_depth` reports the count still
@@ -1234,11 +1390,11 @@ impl GraphicsPipelineClient {
     #[expect(
         clippy::as_conversions,
         clippy::cast_possible_truncation,
-        reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion; deferred_acks.len() bounded by MAX_DEFERRED_ACKS"
+        reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion; pending_acks.len() bounded by MAX_DEFERRED_ACKS"
     )]
     fn make_frame_ack(&self, frame_id: u32, total_frames_decoded: u32) -> DvcMessage {
         let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
-            queue_depth: QueueDepth::from_u32(self.deferred_acks.len() as u32),
+            queue_depth: QueueDepth::from_u32(self.pending_acks.len() as u32),
             frame_id,
             total_frames_decoded,
         });
@@ -1246,18 +1402,28 @@ impl GraphicsPipelineClient {
     }
 
     /// Emit the deferred `FrameAcknowledge` for an AVC frame the out-of-band decoder
-    /// has now presented. Called by the session run loop when the browser signals
-    /// present. Returns the ack DVC message(s) to encode+write, or empty if `frame_id`
-    /// is unknown (already acked, never deferred, or a non-AVC frame).
+    /// has now DECODED (produced a frame). Called by the session run loop when the browser
+    /// signals decode-completion — NOT present. Acking at decode paces the server to the
+    /// client's real decode throughput (the actual bottleneck; presentation is rAF-gated and
+    /// decoupled), matching how the synchronous codecs ack right after their Rust decode.
+    /// Returns the ack DVC message(s) to encode+write, or empty if `frame_id` is unknown
+    /// (already acked, never deferred, or a non-AVC frame).
     #[must_use]
     pub fn build_frame_ack(&mut self, frame_id: u32) -> Vec<DvcMessage> {
-        match self.deferred_acks.remove(&frame_id) {
-            Some(total) => {
-                trace!(frame_id, "Sending deferred FrameAcknowledge (AVC presented)");
-                vec![self.make_frame_ack(frame_id, total)]
+        // Mark the decoded AVC frame ready, then flush whatever high-water run this unblocks.
+        // The ack is emitted only if `frame_id` advances the wire high-water; a lower-id
+        // straggler (e.g. the other monitor's surface decoding out of frame_id order) is
+        // retired silently, already covered by the cumulative counter, so a slow surface can't
+        // head-of-line-block a fast one. If `frame_id` isn't pending (already flushed, never
+        // deferred, or unknown) this is a no-op.
+        match self.pending_acks.get_mut(&frame_id) {
+            Some(entry) => {
+                entry.ready = true;
+                trace!(frame_id, "AVC decoded; marking ack ready");
             }
-            None => Vec::new(),
+            None => return Vec::new(),
         }
+        self.flush_ready_acks()
     }
 }
 
