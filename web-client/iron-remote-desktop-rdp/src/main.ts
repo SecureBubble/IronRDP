@@ -78,6 +78,35 @@ export function outboundMessageSizeLimit(limit: number): Extension {
     return new Extension('outbound_message_size_limit', limit);
 }
 
+// Multi-monitor layout (Phase 0 — PROTOCOL ENABLEMENT ONLY).
+//
+// Advertises more than one monitor at connect time (GCC Client Monitor Data) so
+// the remote host produces a single spanning virtual desktop equal to the
+// bounding box of all monitors. In Phase 0 that spanning desktop is rendered into
+// the existing single canvas (scroll/fit); the per-monitor browser window UI is
+// Phase 1 and out of scope here.
+//
+// Each entry is in virtual-desktop pixel coordinates. The primary monitor MUST be
+// at (0,0); set `primary: true` on exactly one entry (if none/several do, the
+// first is used). Widths must be even (odd widths are adjusted down on the host).
+//
+// Example — two 1280x720 monitors side by side (2560x720 virtual desktop):
+//   monitors([
+//     { left: 0,    top: 0, width: 1280, height: 720, primary: true },
+//     { left: 1280, top: 0, width: 1280, height: 720 },
+//   ])
+export interface MonitorLayoutEntry {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    primary?: boolean;
+}
+
+export function monitors(layout: MonitorLayoutEntry[]): Extension {
+    return new Extension('monitors', layout);
+}
+
 export function enableCredssp(enable: boolean): Extension {
     return new Extension('enable_credssp', enable);
 }

@@ -671,7 +671,14 @@ impl GraphicsPipelineClient {
                 Ok(vec![])
             }
             GfxPdu::MapSurfaceToScaledOutput(pdu) => {
-                trace!(surface_id = pdu.surface_id, "MapSurfaceToScaledOutput");
+                debug!(
+                    surface_id = pdu.surface_id,
+                    output_origin_x = pdu.output_origin_x,
+                    output_origin_y = pdu.output_origin_y,
+                    target_width = pdu.target_width,
+                    target_height = pdu.target_height,
+                    "MapSurfaceToScaledOutput"
+                );
                 self.handler.on_map_surface_to_scaled_output(&pdu);
                 Ok(vec![])
             }
@@ -806,7 +813,7 @@ impl GraphicsPipelineClient {
             output_origin_y: 0,
         };
 
-        debug!(surface_id, width, height, ?pixel_format, "Surface created");
+        info!(surface_id, width, height, ?pixel_format, "Surface created");
         self.handler.on_surface_created(&surface);
         self.surfaces.insert(surface_id, surface);
     }
@@ -830,7 +837,7 @@ impl GraphicsPipelineClient {
             surface.is_mapped = true;
             surface.output_origin_x = origin_x;
             surface.output_origin_y = origin_y;
-            debug!(surface_id, origin_x, origin_y, "Surface mapped to output");
+            info!(surface_id, origin_x, origin_y, "Surface mapped to output");
             self.handler.on_surface_mapped(surface_id, origin_x, origin_y);
         } else {
             warn!(surface_id, "MapSurfaceToOutput for unknown surface");

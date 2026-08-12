@@ -5,7 +5,7 @@ use ironrdp_svc::{ChannelFlags, SvcMessage};
 use tracing::debug;
 
 use crate::CHANNEL_NAME;
-use crate::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout, DisplayControlPdu};
+use crate::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout, DisplayControlPdu, MonitorLayoutEntry};
 
 /// A client for the Display Control Virtual Channel.
 pub struct DisplayControlClient {
@@ -60,6 +60,24 @@ impl DisplayControlClient {
         let pdu: DisplayControlPdu =
             DisplayControlMonitorLayout::new_single_primary_monitor(width, height, scale_factor, physical_dims)?.into();
         debug!(?pdu, "Sending monitor layout");
+        encode_dvc_messages(channel_id, vec![Box::new(pdu)], ChannelFlags::empty())
+    }
+
+    /// Builds a [`DisplayControlPdu::MonitorLayout`] carrying an arbitrary
+    /// multi-monitor layout and wraps it as an [`SvcMessage`].
+    ///
+    /// Unlike [`Self::encode_single_primary_monitor`], this sends the full
+    /// `DISPLAYCONTROL_MONITOR_LAYOUT_PDU` array verbatim, so a client can span the
+    /// remote desktop across several monitors at runtime. Exactly one entry MUST be
+    /// primary (enforced by [`DisplayControlMonitorLayout::new`]); the primary's
+    /// position MUST be `(0, 0)` and every `width`/`height` MUST be in range (use
+    /// [`MonitorLayoutEntry::adjust_display_size`] beforehand).
+    ///
+    /// [2.2.2.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedisp/22741217-12a0-4fb8-b5a0-df43905aaf06
+    pub fn encode_monitors(&self, channel_id: u32, monitors: &[MonitorLayoutEntry]) -> EncodeResult<Vec<SvcMessage>> {
+        // TODO: prevent resolutions with values greater than max monitor area received in caps.
+        let pdu: DisplayControlPdu = DisplayControlMonitorLayout::new(monitors)?.into();
+        debug!(?pdu, "Sending multi-monitor layout");
         encode_dvc_messages(channel_id, vec![Box::new(pdu)], ChannelFlags::empty())
     }
 }

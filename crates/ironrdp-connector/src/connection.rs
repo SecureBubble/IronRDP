@@ -1450,7 +1450,17 @@ fn create_gcc_blocks<'a>(
         },
         // TODO(#139): support for Some(ClientClusterData { flags: RedirectionFlags::REDIRECTION_SUPPORTED, redirection_version: RedirectionVersion::V4, redirected_session_id: 0, }),
         cluster: None,
-        monitor: None,
+        // Multi-monitor: when the caller supplied an explicit monitor layout, emit a
+        // GCC Client Monitor Data block (TS_UD_CS_MONITOR) so the server produces one
+        // spanning virtual desktop (the bounding box of all monitors). Empty layout
+        // preserves the legacy single implicit-monitor behavior (`None`).
+        monitor: if config.monitors.is_empty() {
+            None
+        } else {
+            Some(gcc::ClientMonitorData {
+                monitors: config.monitors.iter().take(16).cloned().collect(),
+            })
+        },
         // Request the MCS message channel, which carries network auto-detect
         // ([MS-RDPBCGR] 2.2.14) and the multitransport / heartbeat PDUs. The
         // server assigns its ID in Server Message Channel Data.

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use ironrdp_bulk::{BulkCompressor, CompressionType as BulkCompressionType};
 use ironrdp_core::{ReadCursor, WriteBuf};
 use ironrdp_displaycontrol::client::DisplayControlClient;
+use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
 use ironrdp_dvc::{DrdynvcClient, DvcClientProcessor, DynamicChannelRef};
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::gcc::ChannelName;
@@ -455,6 +456,36 @@ impl ActiveStage {
             return Some(self.process_svc_processor_messages(SvcProcessorMessages::<DrdynvcClient>::new(svc_messages)));
         } else {
             debug!("Could not encode a resize: Display Control Virtual Channel is not available");
+        }
+
+        None
+    }
+
+    /// Fully encodes a multi-monitor layout for sending over the Display Control Virtual Channel.
+    ///
+    /// Like [`Self::encode_resize`], but sends an arbitrary `DISPLAYCONTROL_MONITOR_LAYOUT_PDU`
+    /// array so the remote desktop can span several monitors at runtime (as opposed to the
+    /// single-primary-monitor resize path). Returns `None` when the Display Control Virtual
+    /// Channel is unavailable, not yet connected, or has not received its server capabilities PDU.
+    ///
+    /// Exactly one entry MUST be primary and each `width`/`height` MUST be in range; use
+    /// [`MonitorLayoutEntry::adjust_display_size`] to clamp dimensions beforehand.
+    pub fn encode_monitor_layout(&mut self, monitors: &[MonitorLayoutEntry]) -> Option<SessionResult<Vec<u8>>> {
+        if let Some(dvc) = self.get_dvc::<DisplayControlClient>() {
+            let channel_id = dvc.channel_id();
+            let display_control = dvc.processor();
+            if !display_control.ready() {
+                debug!("Could not encode a monitor layout: Display Control capabilities have not been received");
+                return None;
+            }
+            let svc_messages = match display_control.encode_monitors(channel_id, monitors) {
+                Ok(messages) => messages,
+                Err(e) => return Some(Err(SessionError::encode(e))),
+            };
+
+            return Some(self.process_svc_processor_messages(SvcProcessorMessages::<DrdynvcClient>::new(svc_messages)));
+        } else {
+            debug!("Could not encode a monitor layout: Display Control Virtual Channel is not available");
         }
 
         None

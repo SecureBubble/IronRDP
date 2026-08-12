@@ -1444,6 +1444,8 @@ impl ConfigBuilder {
                 width: self.desktop_width.unwrap_or(DEFAULT_WIDTH),
                 height: self.desktop_height.unwrap_or(DEFAULT_HEIGHT),
             },
+            // Single implicit monitor; the native client has no multi-monitor CLI yet.
+            monitors: Vec::new(),
             desktop_scale_factor: self.desktop_scale_factor.unwrap_or(0),
             bitmap: Some(bitmap),
             client_build: self.client_build.unwrap_or_default(),

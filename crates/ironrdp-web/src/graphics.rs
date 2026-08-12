@@ -17,7 +17,7 @@
 //! `input_events_tx` channel the clipboard uses. The run loop blits it to the
 //! canvas (see [`crate::session::RdpInputEvent::Graphics`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use futures_channel::mpsc;
 use ironrdp_egfx::client::{AvcFrame, BitmapUpdate, GraphicsPipelineHandler, Surface};
@@ -25,7 +25,7 @@ use ironrdp_egfx::pdu::{
     CacheToSurfacePdu, MapSurfaceToScaledOutputPdu, ProtectSurfacePdu, SolidFillPdu, SurfaceToCachePdu,
     SurfaceToSurfacePdu, WatermarkPdu,
 };
-use tracing::warn;
+use tracing::{info, trace, warn};
 
 use crate::session::{AvcFrameEvent, GraphicsRegion, RdpInputEvent};
 
@@ -269,6 +269,9 @@ pub(crate) struct WasmGraphicsHandler {
     /// fail-closed refusal is signalled exactly once (the proxy re-sends the
     /// PROTECT_SURFACE PDU after every surface map).
     capture_protected: bool,
+    /// Multi-monitor AVC diagnostics: surface_ids already logged in `on_avc_frame`,
+    /// so the per-surface output-origin resolution is reported once (not per frame).
+    avc_logged_surfaces: HashSet<u16>,
 }
 
 impl WasmGraphicsHandler {
@@ -283,6 +286,7 @@ impl WasmGraphicsHandler {
             output_height: 0,
             watermark: None,
             capture_protected: false,
+            avc_logged_surfaces: HashSet::new(),
         }
     }
 
@@ -389,7 +393,23 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         // (the AVD desktop) is normally mapped at (0,0); if a frame arrives before the
         // surface is mapped, fall back to that origin.
         let dr = &frame.destination_rectangle;
-        let (ox, oy) = self.mapped.get(&frame.surface_id).copied().unwrap_or((0, 0));
+        let mapped_origin = self.mapped.get(&frame.surface_id).copied();
+        let (ox, oy) = mapped_origin.unwrap_or((0, 0));
+        // Multi-monitor AVC diagnostics (once per surface): confirms a second-monitor
+        // surface's AVC frames resolve to the correct output origin (e.g. surface_id=1
+        // -> (1280,0)). `mapped=false` means the surface was never MapSurfaceToOutput'd,
+        // so its frames wrongly fall back to the primary origin (0,0).
+        if self.avc_logged_surfaces.insert(frame.surface_id) {
+            info!(
+                surface_id = frame.surface_id,
+                mapped = mapped_origin.is_some(),
+                origin_x = ox,
+                origin_y = oy,
+                dst_left = dr.left,
+                out_x = ox + u32::from(dr.left),
+                "eGFX AVC frame -> output origin"
+            );
+        }
         let x = ox + u32::from(dr.left);
         let y = oy + u32::from(dr.top);
         let width = u32::from(dr.right.saturating_sub(dr.left));
@@ -595,6 +615,37 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
                 continue;
             }
             let mut data = surface.extract(x, y, w, h);
+            // Multi-monitor diagnostics: reveals whether a second output-mapped surface
+            // (origin ox>0, e.g. 1280 for a side-by-side layout) actually flushes its
+            // decoded region to the canvas, and at which virtual-desktop x-range. If a
+            // monitor-2 window shows white, either no line appears here for that origin
+            // (surface never mapped/dirtied) or one does but its source is unfilled.
+            // Second-monitor flushes log at info! (visible at the default level) so a live
+            // multimon session surfaces them without the per-frame primary-monitor flood.
+            if ox > 0 {
+                info!(
+                    surface_id,
+                    origin_x = ox,
+                    origin_y = oy,
+                    out_x = ox + x,
+                    out_y = oy + y,
+                    w,
+                    h,
+                    surface_w = surface.width,
+                    surface_h = surface.height,
+                    "eGFX flush region to canvas (monitor 2)"
+                );
+            } else {
+                trace!(
+                    surface_id,
+                    origin_x = ox,
+                    out_x = ox + x,
+                    w,
+                    h,
+                    surface_w = surface.width,
+                    "eGFX flush region to canvas"
+                );
+            }
             // Re-blend the persistent watermark on top so it survives this region's
             // overwrite of the canvas.
             self.blend_watermark(&mut data, ox + x, oy + y, w, h);

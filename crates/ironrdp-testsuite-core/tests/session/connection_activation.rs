@@ -29,6 +29,7 @@ fn test_config() -> ironrdp_connector::Config {
             width: 1024,
             height: 768,
         },
+        monitors: Vec::new(),
         desktop_scale_factor: 0,
         enable_tls: true,
         enable_credssp: false,

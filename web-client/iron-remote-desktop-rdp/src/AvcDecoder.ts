@@ -38,6 +38,25 @@ interface FrameInfo {
     sps: Uint8Array | null;
 }
 
+/**
+ * Decode state for ONE eGFX surface. MS-RDPEGFX carries an independent H.264
+ * bitstream per surface_id — its own SPS/PPS, its own IDR and reference-frame
+ * chain. A multi-monitor session has one surface per monitor, so each needs its
+ * own `VideoDecoder`: multiplexing two independent streams through a single
+ * decoder pollutes the reference-picture buffer and renders the second monitor as
+ * white / stale / ghosted frames. Present geometry stays per-frame (see `Geom`),
+ * so the shared present queue can still blit each surface at its output origin.
+ */
+interface SurfaceDecoder {
+    decoder: VideoDecoder | null;
+    codec: string | null;
+    sawKeyframe: boolean;
+    /** Monotonic per-surface chunk timestamp; also the `geom` map key. */
+    timestamp: number;
+    /** decode-time geometry keyed by chunk timestamp (matched on output). */
+    geom: Map<number, Geom>;
+}
+
 function toHex2(n: number): string {
     return n.toString(16).padStart(2, '0');
 }
@@ -104,13 +123,13 @@ function analyzeAnnexB(data: Uint8Array): FrameInfo {
 const MAX_QUEUE = 8;
 
 export class AvcDecoder {
-    private decoder: VideoDecoder | null = null;
     private session: SessionLike | null = null;
-    private codec: string | null = null;
-    private sawKeyframe = false;
-    private timestamp = 0;
-    /** decode-time geometry keyed by chunk timestamp (matched on output). */
-    private readonly geom = new Map<number, Geom>();
+    /**
+     * Per-surface decode state, keyed by eGFX surface_id. One `VideoDecoder` per
+     * surface (see {@link SurfaceDecoder}) so a multi-monitor session's independent
+     * per-monitor H.264 streams do not corrupt one another.
+     */
+    private readonly surfaces = new Map<number, SurfaceDecoder>();
     private canvas: OffscreenCanvas | null = null;
     private ctx: OffscreenCanvasRenderingContext2D | null = null;
     private warnedUnsupported = false;
@@ -144,8 +163,8 @@ export class AvcDecoder {
     /** Extensions registered on the SessionBuilder so the run loop can call us. */
     getBuilderExtensions(): Extension[] {
         return [
-            avcDecodeCallback((_surfaceId, frameId, x, y, width, height, data) => {
-                this.decode(frameId, x, y, width, height, data);
+            avcDecodeCallback((surfaceId, frameId, x, y, width, height, data) => {
+                this.decode(surfaceId, frameId, x, y, width, height, data);
             }),
             avcWatermarkCallback((rgba, width, height, cellW, cellH, offX, offY, opacity) => {
                 this.setWatermark(rgba, width, height, cellW, cellH, offX, offY, opacity);
@@ -225,21 +244,40 @@ export class AvcDecoder {
     }
 
     dispose(): void {
-        try {
-            this.decoder?.close();
-        } catch {
-            /* already closed */
+        for (const sd of this.surfaces.values()) {
+            try {
+                sd.decoder?.close();
+            } catch {
+                /* already closed */
+            }
+            sd.geom.clear();
         }
-        this.decoder = null;
-        this.geom.clear();
+        this.surfaces.clear();
         for (const q of this.queue) {
             q.frame.close();
         }
         this.queue.length = 0;
-        this.sawKeyframe = false;
     }
 
-    private decode(frameId: number, x: number, y: number, width: number, height: number, data: Uint8Array): void {
+    /** Get (or lazily create) the decode state for an eGFX surface. */
+    private getSurface(surfaceId: number): SurfaceDecoder {
+        let sd = this.surfaces.get(surfaceId);
+        if (sd === undefined) {
+            sd = { decoder: null, codec: null, sawKeyframe: false, timestamp: 0, geom: new Map<number, Geom>() };
+            this.surfaces.set(surfaceId, sd);
+        }
+        return sd;
+    }
+
+    private decode(
+        surfaceId: number,
+        frameId: number,
+        x: number,
+        y: number,
+        width: number,
+        height: number,
+        data: Uint8Array,
+    ): void {
         if (typeof VideoDecoder === 'undefined') {
             if (!this.warnedUnsupported) {
                 console.error('[AVC] WebCodecs VideoDecoder unavailable in this browser; AVC frames dropped');
@@ -248,42 +286,47 @@ export class AvcDecoder {
             return;
         }
 
+        // Each surface_id is an INDEPENDENT H.264 stream (its own SPS/PPS + reference
+        // chain), so it gets its own decoder and keyframe/timestamp state.
+        const sd = this.getSurface(surfaceId);
+
         // The AVD/MS-RDPEGFX main sub-stream is already Annex B (start-code prefixed);
         // feed it to WebCodecs unchanged, just scanning for the keyframe + SPS.
         const { hasKey, sps } = analyzeAnnexB(data);
 
-        // Configure lazily from the first keyframe — we need its SPS for the codec
-        // string, and WebCodecs requires the first decoded chunk to be a keyframe.
-        if (this.decoder === null) {
+        // Configure this surface's decoder lazily from its first keyframe — we need its
+        // SPS for the codec string, and WebCodecs requires the first decoded chunk to be
+        // a keyframe.
+        if (sd.decoder === null) {
             if (!hasKey || sps === null) {
-                return; // wait for the first keyframe
+                return; // wait for this surface's first keyframe
             }
-            this.codec = codecStringFromSps(sps);
+            sd.codec = codecStringFromSps(sps);
             const decoder = new VideoDecoder({
-                output: (frame) => this.onFrame(frame),
-                error: (e) => console.error('[AVC] VideoDecoder error', e),
+                output: (frame) => this.onFrame(surfaceId, frame),
+                error: (e) => console.error('[AVC] VideoDecoder error (surface', surfaceId, ')', e),
             });
             try {
-                decoder.configure({ codec: this.codec, optimizeForLatency: true });
+                decoder.configure({ codec: sd.codec, optimizeForLatency: true });
             } catch (e) {
-                console.error('[AVC] configure failed for', this.codec, e);
+                console.error('[AVC] configure failed for', sd.codec, '(surface', surfaceId, ')', e);
                 return;
             }
-            this.decoder = decoder;
-            console.info('[AVC] VideoDecoder configured:', this.codec);
+            sd.decoder = decoder;
+            console.info('[AVC] VideoDecoder configured:', sd.codec, '(surface', surfaceId, ')');
         }
 
-        if (!this.sawKeyframe && !hasKey) {
-            return; // never feed a delta frame before the first keyframe
+        if (!sd.sawKeyframe && !hasKey) {
+            return; // never feed a delta frame before this surface's first keyframe
         }
         if (hasKey) {
-            this.sawKeyframe = true;
+            sd.sawKeyframe = true;
         }
 
-        const ts = this.timestamp++;
-        this.geom.set(ts, { frameId, x, y, width, height });
+        const ts = sd.timestamp++;
+        sd.geom.set(ts, { frameId, x, y, width, height });
         try {
-            this.decoder.decode(
+            sd.decoder.decode(
                 new EncodedVideoChunk({
                     type: hasKey ? 'key' : 'delta',
                     timestamp: ts,
@@ -291,14 +334,15 @@ export class AvcDecoder {
                 }),
             );
         } catch (e) {
-            console.error('[AVC] decode() threw', e);
-            this.geom.delete(ts);
+            console.error('[AVC] decode() threw (surface', surfaceId, ')', e);
+            sd.geom.delete(ts);
         }
     }
 
-    private onFrame(frame: VideoFrame): void {
-        const g = this.geom.get(frame.timestamp);
-        this.geom.delete(frame.timestamp);
+    private onFrame(surfaceId: number, frame: VideoFrame): void {
+        const sd = this.surfaces.get(surfaceId);
+        const g = sd?.geom.get(frame.timestamp);
+        sd?.geom.delete(frame.timestamp);
         if (!g) {
             frame.close();
             return;

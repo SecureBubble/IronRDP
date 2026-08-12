@@ -23,6 +23,7 @@ use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::pdu::gcc::{Monitor as GccMonitor, MonitorFlags};
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
@@ -81,6 +82,12 @@ struct SessionBuilderInner {
     remote_app: Option<connector::RailConfig>,
     client_name: String,
     desktop_size: DesktopSize,
+    /// Multi-monitor layout (Phase 0) parsed from the `monitors` extension. Empty
+    /// means a single implicit monitor (legacy behavior). When non-empty, it is
+    /// advertised at connect time as GCC Client Monitor Data and `desktop_size` is
+    /// overridden with the bounding box of all monitors (the spanning virtual
+    /// desktop). Rectangles use inclusive right/bottom (`right = left + width - 1`).
+    monitors: Vec<GccMonitor>,
 
     render_canvas: Option<HtmlCanvasElement>,
     set_cursor_style_callback: Option<js_sys::Function>,
@@ -146,6 +153,7 @@ impl Default for SessionBuilderInner {
                 width: DEFAULT_WIDTH,
                 height: DEFAULT_HEIGHT,
             },
+            monitors: Vec::new(),
 
             render_canvas: None,
             set_cursor_style_callback: None,
@@ -295,6 +303,13 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |advertise_avc: bool| { self.0.borrow_mut().advertise_avc = advertise_avc };
+            // Multi-monitor layout (Phase 0). Accepts a JSON array of
+            // `{ left, top, width, height, primary? }` in virtual-desktop pixel
+            // coordinates; the primary should be at (0,0). When set, the client
+            // advertises >1 monitor at connect time (GCC Client Monitor Data) so the
+            // remote host produces one spanning desktop (bounding box), rendered into
+            // the single canvas. An empty/invalid layout falls back to single-monitor.
+            |monitors: JsValue| { self.0.borrow_mut().monitors = parse_monitors(&monitors) };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -480,6 +495,31 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let enable_credssp = self.0.borrow().enable_credssp;
         config.enable_credssp = enable_credssp;
+
+        // Multi-monitor (Phase 0): if the caller supplied a monitor layout via the
+        // `monitors` extension, advertise it as GCC Client Monitor Data and size the
+        // requested desktop to the bounding box of all monitors. The server then
+        // produces one spanning virtual desktop; the negotiated size flows back as
+        // `connection_result.desktop_size`, which already drives the canvas /
+        // DecodedImage sizing, and the eGFX compositor blits each output-mapped
+        // surface at its virtual-desktop origin into that single framebuffer.
+        let monitors = self.0.borrow().monitors.clone();
+        if !monitors.is_empty() {
+            if let Some((bbox_width, bbox_height)) = monitors_bounding_box(&monitors) {
+                config.desktop_size = connector::DesktopSize {
+                    width: bbox_width,
+                    height: bbox_height,
+                };
+                info!(
+                    monitor_count = monitors.len(),
+                    bounding_box = format!("{bbox_width}x{bbox_height}"),
+                    "Advertising multi-monitor layout (spanning virtual desktop)"
+                );
+                config.monitors = monitors;
+            } else {
+                warn!("Ignoring multi-monitor layout: could not compute a valid bounding box");
+            }
+        }
 
         // RemoteApp-style published app: run a single program as the session shell
         // (RDP "alternate shell") instead of the full desktop. The API supplies the
@@ -1893,6 +1933,108 @@ fn parse_file_metadata_array(files: JsValue) -> Result<Vec<FileMetadata>, IronEr
 /// Parse the `remote_app` extension value — a JS object
 /// `{ program, args?, workingDir? }` — into a RAIL config. Returns `None` when
 /// `program` is missing/empty (so RAIL stays disabled).
+/// Parses the `monitors` extension payload — a JS array of
+/// `{ left, top, width, height, primary? }` objects (virtual-desktop pixel
+/// coordinates) — into GCC [`Monitor`](GccMonitor) rectangles.
+///
+/// `right`/`bottom` are inclusive (`right = left + width - 1`). Entries with a
+/// non-positive width or height are skipped. Exactly one monitor must be primary:
+/// if none is flagged, the first entry is promoted; if several are, only the first
+/// primary is kept. A non-array or empty payload yields an empty vec (single-monitor
+/// fallback).
+fn parse_monitors(value: &JsValue) -> Vec<GccMonitor> {
+    let Some(array) = value.dyn_ref::<js_sys::Array>() else {
+        warn!("`monitors` extension: expected a JSON array of monitor rectangles");
+        return Vec::new();
+    };
+
+    let read_f64 = |entry: &JsValue, key: &str| -> Option<f64> {
+        js_sys::Reflect::get(entry, &JsValue::from_str(key))
+            .ok()
+            .and_then(|v| v.as_f64())
+    };
+
+    #[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
+    let to_i32 = |v: f64| v.round() as i32;
+
+    let mut monitors = Vec::new();
+    for entry in array.iter() {
+        let left = read_f64(&entry, "left").map(to_i32).unwrap_or(0);
+        let top = read_f64(&entry, "top").map(to_i32).unwrap_or(0);
+        let width = read_f64(&entry, "width").map(to_i32).unwrap_or(0);
+        let height = read_f64(&entry, "height").map(to_i32).unwrap_or(0);
+
+        if width <= 0 || height <= 0 {
+            warn!(width, height, "`monitors` extension: skipping monitor with non-positive size");
+            continue;
+        }
+
+        let primary = js_sys::Reflect::get(&entry, &JsValue::from_str("primary"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        monitors.push(GccMonitor {
+            left,
+            top,
+            // Inclusive far edges, matching FreeRDP's TS_MONITOR_DEF convention.
+            right: left.saturating_add(width).saturating_sub(1),
+            bottom: top.saturating_add(height).saturating_sub(1),
+            flags: if primary {
+                MonitorFlags::PRIMARY
+            } else {
+                MonitorFlags::empty()
+            },
+        });
+    }
+
+    // Enforce exactly one primary: promote the first when none is set, and clear
+    // extra primaries so the GCC block (and the server) sees a single primary.
+    let primary_count = monitors
+        .iter()
+        .filter(|m| m.flags.contains(MonitorFlags::PRIMARY))
+        .count();
+    if !monitors.is_empty() && primary_count == 0 {
+        monitors[0].flags |= MonitorFlags::PRIMARY;
+    } else if primary_count > 1 {
+        let mut seen_primary = false;
+        for monitor in &mut monitors {
+            if monitor.flags.contains(MonitorFlags::PRIMARY) {
+                if seen_primary {
+                    monitor.flags.remove(MonitorFlags::PRIMARY);
+                } else {
+                    seen_primary = true;
+                }
+            }
+        }
+    }
+
+    monitors
+}
+
+/// Computes the bounding-box size (width, height) spanning every monitor rectangle,
+/// clamped to the `u16` desktop-size range. `right`/`bottom` are inclusive, so the
+/// span is `max_right - min_left + 1` by `max_bottom - min_top + 1`. Returns `None`
+/// for an empty list or a degenerate box.
+fn monitors_bounding_box(monitors: &[GccMonitor]) -> Option<(u16, u16)> {
+    let min_left = monitors.iter().map(|m| m.left).min()?;
+    let min_top = monitors.iter().map(|m| m.top).min()?;
+    let max_right = monitors.iter().map(|m| m.right).max()?;
+    let max_bottom = monitors.iter().map(|m| m.bottom).max()?;
+
+    let width = i64::from(max_right) - i64::from(min_left) + 1;
+    let height = i64::from(max_bottom) - i64::from(min_top) + 1;
+
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let width = u16::try_from(width).unwrap_or(u16::MAX);
+    let height = u16::try_from(height).unwrap_or(u16::MAX);
+
+    Some((width, height))
+}
+
 fn parse_remote_app(value: &JsValue) -> Option<connector::RailConfig> {
     let get = |key: &str| {
         js_sys::Reflect::get(value, &JsValue::from_str(key))
@@ -1980,6 +2122,9 @@ fn build_config(
             width: desktop_size.width,
             height: desktop_size.height,
         },
+        // Multi-monitor layout is populated after build (from the `monitors`
+        // extension); empty means a single implicit monitor (legacy behavior).
+        monitors: Vec::new(),
         bitmap: Some(connector::BitmapConfig {
             // Request a 32bpp session: with 32 the connector emits highColorDepth=24
             // + WANT_32_BPP_SESSION in the GCC client core data. Advertising 16 here

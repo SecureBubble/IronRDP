@@ -143,6 +143,21 @@ impl Credentials {
 pub struct Config {
     /// The initial desktop size to request
     pub desktop_size: DesktopSize,
+    /// Explicit multi-monitor layout advertised at connection time as GCC Client
+    /// Monitor Data ([MS-RDPBCGR] 2.2.1.3.6, `TS_UD_CS_MONITOR`).
+    ///
+    /// - Empty (default): legacy single implicit-monitor behavior — no Client
+    ///   Monitor Data block is emitted and the server derives a single monitor
+    ///   from [`desktop_size`](Self::desktop_size).
+    /// - Non-empty: a Client Monitor Data block is emitted (up to 16 entries).
+    ///   Exactly one entry MUST carry [`gcc::MonitorFlags::PRIMARY`], the primary's
+    ///   top-left SHOULD be `(0, 0)`, and [`desktop_size`](Self::desktop_size)
+    ///   SHOULD equal the bounding box of every monitor rectangle (the spanning
+    ///   virtual-desktop size the server will produce).
+    ///
+    /// `gcc::Monitor` rectangles use inclusive `right`/`bottom` coordinates
+    /// (i.e. `right = left + width - 1`).
+    pub monitors: Vec<gcc::Monitor>,
     /// The initial desktop scale factor to request.
     ///
     /// This becomes the `desktop_scale_factor` in the [`TS_UD_CS_CORE`](gcc::ClientCoreOptionalData) structure.
