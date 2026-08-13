@@ -31,7 +31,7 @@ use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
 use ironrdp::rdperp::client::{RailChannel, RemoteApp};
 use ironrdp::rdperp::orders::WindowOrder;
-use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd, RdpsndDvcClient};
+use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd, RdpsndClientHandler, RdpsndDvcListener};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
@@ -2420,7 +2420,17 @@ async fn connect(
             // AUDIO_PLAYBACK_DVC (MS-RDPEA over DVC). Same RDPSND PDU flow as the
             // static "rdpsnd" channel registered above, different transport; AVD
             // prefers this one. Shares the static backend's sound sink via clone.
-            drdynvc = drdynvc.with_dynamic_channel(RdpsndDvcClient::new(Box::new(dvc_sound_backend)));
+            //
+            // Registered as a re-createable LISTENER, not a one-shot channel:
+            // Windows/AVD open AUDIO_PLAYBACK_DVC, close it during early-session
+            // renegotiation (~1s in), then re-open it. A one-shot registration is
+            // consumed on the first open and then NO_LISTENER-rejects (0xC0000001)
+            // every reopen, so audio never plays. The listener rebuilds a fresh
+            // RdpsndDvcClient per create, each cloning the shared sink (same mpsc
+            // sender / JS callback), so playback resumes after the reopen.
+            drdynvc = drdynvc.with_listener(RdpsndDvcListener::new(move || {
+                Box::new(dvc_sound_backend.clone()) as Box<dyn RdpsndClientHandler>
+            }));
         }
         if use_display_control {
             drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));

@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 
 use ironrdp_core::{Decode as _, EncodeResult, ReadCursor, cast_length, impl_as_any};
-use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
+use ironrdp_dvc::{DvcChannelListener, DvcClientProcessor, DvcMessage, DvcProcessor, DynamicChannelId};
 use ironrdp_pdu::gcc::ChannelName;
 use ironrdp_pdu::{PduResult, encode_err, pdu_other_err};
 use ironrdp_svc::{CompressionCondition, SvcClientProcessor, SvcMessage, SvcProcessor};
@@ -323,3 +323,48 @@ impl DvcProcessor for RdpsndDvcClient {
 }
 
 impl DvcClientProcessor for RdpsndDvcClient {}
+
+/// A re-createable listener for the `AUDIO_PLAYBACK_DVC` dynamic virtual channel.
+///
+/// Register this (via [`ironrdp_dvc::DrdynvcClient::with_listener`]) instead of a
+/// single [`RdpsndDvcClient`] instance so audio survives the host's normal
+/// early-session close→reopen renegotiation. Windows and Azure Virtual Desktop
+/// routinely open `AUDIO_PLAYBACK_DVC`, close it within the first second, then
+/// re-open it. A channel registered as a one-shot processor is consumed on the
+/// first open and answers every subsequent `DYNVC_CREATE_REQ` with `NO_LISTENER`
+/// (0xC0000001), so no audio ever plays after that first close.
+///
+/// This listener instead builds a fresh [`RdpsndDvcClient`] — and thus a fresh
+/// [`Rdpsnd`] state machine — on each create, via the supplied handler factory.
+/// Point the factory at a cloneable sink (e.g. one that shares an mpsc sender) so
+/// every re-created channel funnels audio to the same place.
+pub struct RdpsndDvcListener<F> {
+    make_handler: F,
+}
+
+impl<F> RdpsndDvcListener<F>
+where
+    F: FnMut() -> Box<dyn RdpsndClientHandler> + Send,
+{
+    /// `make_handler` is invoked once per channel create to produce the audio sink
+    /// for that incarnation of the channel.
+    pub fn new(make_handler: F) -> Self {
+        Self { make_handler }
+    }
+}
+
+impl<F> DvcChannelListener for RdpsndDvcListener<F>
+where
+    F: FnMut() -> Box<dyn RdpsndClientHandler> + Send,
+{
+    fn channel_name(&self) -> &str {
+        RdpsndDvcClient::NAME
+    }
+
+    fn create(&mut self, _channel_id: DynamicChannelId) -> Option<Box<dyn DvcClientProcessor>> {
+        Some(Box::new(RdpsndDvcClient::new((self.make_handler)())))
+    }
+
+    // `is_available` defaults to `true`: the listener stays re-createable for the
+    // life of the session, so a close→reopen of AUDIO_PLAYBACK_DVC always succeeds.
+}
