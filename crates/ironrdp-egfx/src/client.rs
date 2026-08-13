@@ -63,7 +63,7 @@ use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_graphics::zgfx;
 use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::CHANNEL_NAME;
 use crate::decode::H264Decoder;
@@ -973,7 +973,7 @@ impl GraphicsPipelineClient {
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
 
         let Some(ref mut decoder) = self.h264_decoder else {
-            info!(
+            trace!(
                 surface_id,
                 width = dest_rect.width(),
                 height = dest_rect.height(),
