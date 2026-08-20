@@ -608,7 +608,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     "Advertising multi-monitor layout (spanning virtual desktop)"
                 );
                 rail_desktop_origin = monitors_desktop_origin(&monitors);
-                config.monitors = monitors;
+                config.monitor_layout = Some(ironrdp::pdu::gcc::ClientMonitorData { monitors });
             } else {
                 warn!("Ignoring multi-monitor layout: could not compute a valid bounding box");
             }
@@ -2080,6 +2080,7 @@ impl iron_remote_desktop::Session for Session {
                                 input_flags: _,
                                 enable_server_pointer,
                                 pointer_software_rendering,
+                                static_channel_chunk_size,
                                 ..
                             } = connection_activation.connection_activation_state()
                             {
@@ -2091,10 +2092,21 @@ impl iron_remote_desktop::Session for Session {
                                     share_id,
                                     enable_server_pointer,
                                     pointer_software_rendering,
+                                    static_channel_chunk_size,
                                 );
                                 break 'activation_seq;
                             }
                         }
+                    }
+                    // Upstream additions we deliberately do not consume:
+                    //  - WindowingOrders is upstream's parallel RAIL path; we decode Window List
+                    //    orders ourselves through `ironrdp-rdperp` off the fast-path Orders update,
+                    //    which yields typed geometry rather than raw bytes.
+                    //  - MonitorLayout arrives on server-driven layout changes; our layout is
+                    //    client-driven via DisplayControl.
+                    ActiveStageOutput::WindowingOrders(_) | ActiveStageOutput::MonitorLayout(_) => {}
+                    ActiveStageOutput::AutoReconnectFailed => {
+                        warn!("Auto-reconnect failed");
                     }
                     ActiveStageOutput::MultitransportRequest(pdu) => {
                         debug!(
@@ -2970,7 +2982,7 @@ fn build_config(
         enable_tls: true,
         enable_credssp: true,
         enable_standard_rdp_security: false,
-        keyboard_type: ironrdp::pdu::gcc::KeyboardType::IbmEnhanced,
+        keyboard_type: ironrdp::pdu::gcc::KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
         keyboard_layout: 0, // the server SHOULD use the default active input locale identifier
         keyboard_functional_keys_count: 12,
@@ -2981,9 +2993,16 @@ fn build_config(
             width: desktop_size.width,
             height: desktop_size.height,
         },
-        // Multi-monitor layout is populated after build (from the `monitors`
-        // extension); empty means a single implicit monitor (legacy behavior).
-        monitors: Vec::new(),
+        // Multi-monitor layout is populated after build (from the `monitors` extension);
+        // `None` means a single implicit monitor (legacy behavior).
+        monitor_layout: None,
+        // Upstream's RAIL negotiation flags. We drive RAIL through our fork's `rail` launch
+        // config instead (see `ironrdp-rdperp`), and the connector honours either, so this stays
+        // false and the support level is only meaningful when it is set.
+        remote_application_mode: false,
+        rail_support_level: ironrdp::pdu::rdp::capability_sets::RailSupportLevel::SUPPORTED,
+        // Client-side audio capture (microphone) is not implemented in the web client.
+        enable_audio_capture: false,
         bitmap: Some(connector::BitmapConfig {
             // Request a 32bpp session: with 32 the connector emits highColorDepth=24
             // + WANT_32_BPP_SESSION in the GCC client core data. Advertising 16 here
@@ -3412,7 +3431,7 @@ where
         debug_assert!(connector.next_pdu_hint().is_some());
 
         buf.clear();
-        let written = connector.step(x224_connection_response.as_bytes(), &mut buf)?;
+        let written = connector.step(x224_connection_response.as_bytes(), None, &mut buf)?;
 
         debug_assert!(written.is_nothing());
 

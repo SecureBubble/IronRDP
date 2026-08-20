@@ -16,10 +16,13 @@ use ironrdp_core::{decode, encode_vec, impl_as_any};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_displaycontrol::server::{DisplayControlHandler, DisplayControlServer};
 use ironrdp_dvc as dvc;
+use ironrdp_pdu::codecs::rfx::Quant;
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
-use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags};
+use ironrdp_pdu::rdp::capability_sets::{
+    BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, EntropyBits, GeneralExtraFlags,
+};
 pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
@@ -73,14 +76,54 @@ pub enum PostConnectionAction {
     Stop,
 }
 
-/// Hooks for connection lifecycle events in [`RdpServer::run`].
+/// Per-connection metadata captured during connection setup, made available to
+/// [`ConnectionHandler::on_connection_info`] once the connection is established.
+///
+/// These are GCC Client Core Data fields (MS-RDPBCGR 2.2.1.3.2) that the acceptor
+/// captures but has no use for itself; embedders that want to act on them (for
+/// example, selecting a server-side keyboard layout matching the client) can do
+/// so here without reaching into the acceptor's internals.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ConnectionInfo {
+    /// See [`ironrdp_acceptor::AcceptorResult::keyboard_layout`].
+    pub keyboard_layout: u32,
+    /// See [`ironrdp_acceptor::AcceptorResult::keyboard_type`].
+    pub keyboard_type: ironrdp_pdu::gcc::KeyboardType,
+    /// See [`ironrdp_acceptor::AcceptorResult::ime_file_name`].
+    pub ime_file_name: String,
+}
+
+impl ConnectionInfo {
+    /// Builds a `ConnectionInfo` directly, for downstream `ConnectionHandler` implementations
+    /// that want to exercise [`ConnectionHandler::on_connection_info`] in their own unit tests
+    /// without going through a live connection. `#[non_exhaustive]` blocks struct-literal
+    /// construction outside this crate, so a constructor is the only way to do that.
+    pub fn new(keyboard_layout: u32, keyboard_type: ironrdp_pdu::gcc::KeyboardType, ime_file_name: String) -> Self {
+        Self {
+            keyboard_layout,
+            keyboard_type,
+            ime_file_name,
+        }
+    }
+}
+
+/// Hooks for connection lifecycle events.
 ///
 /// Implement this trait to add pre-accept filtering (rate limiting,
-/// IP allowlists) and post-disconnect logic (cleanup, session validity
-/// checks, metrics).
+/// IP allowlists), post-disconnect logic (cleanup, session validity
+/// checks, metrics), and to observe per-connection metadata once a
+/// connection is established.
 ///
 /// All methods have default implementations that accept all connections
 /// and continue unconditionally.
+///
+/// [`Self::on_accept`] and [`Self::on_disconnected`] are called only from
+/// [`RdpServer::run`]'s own accept loop. [`Self::on_connection_info`] is
+/// called from every code path that completes connection setup, including
+/// [`RdpServer::run_connection`] and [`RdpServer::run_connection_with`], so it
+/// is the hook to use for embedders (such as those with their own
+/// multi-transport accept loop) that do not call `run`.
 pub trait ConnectionHandler: Send {
     /// Called after `accept()` returns but before `run_connection()`.
     ///
@@ -88,6 +131,12 @@ pub trait ConnectionHandler: Send {
     fn on_accept(&mut self, peer: SocketAddr) -> bool {
         let _ = peer;
         true
+    }
+
+    /// Called once per connection, after credential and auto-reconnect
+    /// validation succeed and before the session loop starts.
+    fn on_connection_info(&mut self, info: &ConnectionInfo) {
+        let _ = info;
     }
 
     /// Called after `run_connection()` completes (successfully or with error).
@@ -247,6 +296,22 @@ pub struct RdpServerOptions {
     /// server-provided size. Set via
     /// [`RdpServerBuilder::with_honor_client_desktop_size`](crate::RdpServerBuilder::with_honor_client_desktop_size).
     pub honor_client_desktop_size: Option<DesktopSize>,
+    /// Quantization values the RemoteFX encoder uses once selected. Defaults
+    /// to [`Quant::default`], the same values Windows RDP servers send. Set
+    /// via
+    /// [`RdpServerBuilder::with_remotefx_quant`](crate::RdpServerBuilder::with_remotefx_quant).
+    pub remotefx_quant: Quant,
+    /// Preferred RemoteFX entropy coder. If the client's advertised
+    /// TS_RFX_ICAP array includes it, the server uses it; otherwise the
+    /// server falls back to whichever coder the client offered first.
+    /// `None` (the default) always uses whichever coder is offered first,
+    /// since [MS-RDPRFX] 3.1.5.1 has the server arbitrarily pick one
+    /// supported TS_RFX_ICAP element rather than rank the array as a
+    /// preference order. Set via
+    /// [`RdpServerBuilder::with_remotefx_entropy_coder`](crate::RdpServerBuilder::with_remotefx_entropy_coder).
+    ///
+    /// [MS-RDPRFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/
+    pub remotefx_entropy_coder: Option<EntropyBits>,
 }
 
 impl RdpServerOptions {
@@ -297,6 +362,28 @@ impl RdpServerOptions {
             .iter()
             .any(|codec| matches!(codec.property, CodecProperty::NsCodec(_)))
     }
+}
+
+/// Picks a RemoteFX entropy coder out of the client's advertised TS_RFX_ICAP
+/// array. Returns `preferred` if the client offered it, otherwise the first
+/// coder the client offered. Returns `None` if `offered` is empty.
+pub fn pick_remotefx_entropy_coder(
+    preferred: Option<EntropyBits>,
+    offered: impl Iterator<Item = EntropyBits>,
+) -> Option<EntropyBits> {
+    let mut first = None;
+
+    for entropy_bits in offered {
+        if first.is_none() {
+            first = Some(entropy_bits);
+        }
+
+        if preferred == Some(entropy_bits) {
+            return Some(entropy_bits);
+        }
+    }
+
+    first
 }
 
 #[derive(Clone)]
@@ -454,6 +541,7 @@ pub struct RdpServer {
     handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     static_channels: StaticChannelSet,
+    static_channel_factories: Vec<Box<dyn StaticChannelFactory>>,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
     echo_handle: EchoServerHandle,
@@ -545,6 +633,15 @@ pub enum ServerEvent {
     AutoDetectRttRequest,
 }
 
+/// Creates a fresh static-channel processor for each accepted RDP connection.
+///
+/// Factories are invoked before the Basic Settings Exchange so their channels
+/// participate in GCC static-channel negotiation.
+pub trait StaticChannelFactory: Send {
+    /// Attaches the connection-local static-channel processor to `acceptor`.
+    fn attach(&self, acceptor: &mut Acceptor);
+}
+
 impl fmt::Debug for ServerEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -589,6 +686,7 @@ impl RdpServer {
         opts: RdpServerOptions,
         handler: Box<dyn RdpServerInputHandler>,
         display: Box<dyn RdpServerDisplay>,
+        static_channel_factories: Vec<Box<dyn StaticChannelFactory>>,
         mut sound_factory: Option<Box<dyn SoundServerFactory>>,
         mut cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
         connection_handler: Option<Box<dyn ConnectionHandler>>,
@@ -612,6 +710,7 @@ impl RdpServer {
             handler: Arc::new(Mutex::new(handler)),
             display: Arc::new(Mutex::new(display)),
             static_channels: StaticChannelSet::new(),
+            static_channel_factories,
             sound_factory,
             cliprdr_factory,
             echo_handle: EchoServerHandle::new(ev_sender.clone()),
@@ -957,6 +1056,10 @@ impl RdpServer {
         };
 
         acceptor.attach_static_channel(dvc);
+
+        for factory in &self.static_channel_factories {
+            factory.attach(acceptor);
+        }
     }
 
     /// Run a single RDP connection over `stream`, performing the
@@ -1468,6 +1571,25 @@ impl RdpServer {
                         let request = ad.send_rtt_request(now_ms);
                         let data = encode_autodetect_request(request, message_channel_id, user_channel_id)?;
                         writer.write_all(&data).await?;
+
+                        // Report the measured characteristics to the client
+                        // ([MS-RDPBCGR] 2.2.14.1.5). The client does not reply. Sent only
+                        // once both RTT and bandwidth are known, and paced independently
+                        // of this probe cadence, so a fast caller does not turn into a
+                        // fast stream of unsolicited PDUs.
+                        if let Some(result) = ad.build_netchar_result(now_ms) {
+                            let data = encode_autodetect_request(result, message_channel_id, user_channel_id)?;
+                            writer.write_all(&data).await?;
+                        }
+
+                        // Periodically measure bandwidth: Start on one tick, Stop several
+                        // ticks later, with ordinary traffic in between counted by the
+                        // client, then a Bandwidth Measure Results PDU in reply. Until one
+                        // has completed there is no characteristics result to send at all.
+                        if let Some(pdu) = ad.build_bandwidth_measure() {
+                            let data = encode_autodetect_request(pdu, message_channel_id, user_channel_id)?;
+                            writer.write_all(&data).await?;
+                        }
                     }
                 }
             }
@@ -1660,6 +1782,16 @@ impl RdpServer {
             }
         }
 
+        if !result.reactivation
+            && let Some(ref mut handler) = self.connection_handler
+        {
+            handler.on_connection_info(&ConnectionInfo {
+                keyboard_layout: result.keyboard_layout,
+                keyboard_type: result.keyboard_type,
+                ime_file_name: result.ime_file_name.clone(),
+            });
+        }
+
         if !result.input_events.is_empty() {
             debug!("Handling input event backlog from acceptor sequence");
             self.handle_input_backlog(
@@ -1729,21 +1861,25 @@ impl RdpServer {
                             // implementation of the video mode. which allows to
                             // skip sending Header for each image.
                             //
-                            // We should distinguish parameters for both modes,
-                            // and somehow choose the "best", instead of picking
-                            // the last parsed here.
+                            // We should distinguish parameters for both modes.
                             CodecProperty::RemoteFx(rdp::capability_sets::RemoteFxContainer::ClientContainer(c))
                                 if self.opts.has_remote_fx() =>
                             {
-                                for caps in c.caps_data.0.0 {
-                                    update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
+                                let offered = c.caps_data.0.0.iter().map(|caps| caps.entropy_bits);
+                                let preferred = self.opts.remotefx_entropy_coder;
+                                if let Some(entropy_bits) = pick_remotefx_entropy_coder(preferred, offered) {
+                                    update_codecs.set_remotefx(Some((entropy_bits, codec.id)));
+                                    update_codecs.set_remotefx_quant(self.opts.remotefx_quant.clone());
                                 }
                             }
                             CodecProperty::ImageRemoteFx(rdp::capability_sets::RemoteFxContainer::ClientContainer(
                                 c,
                             )) if self.opts.has_image_remote_fx() => {
-                                for caps in c.caps_data.0.0 {
-                                    update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
+                                let offered = c.caps_data.0.0.iter().map(|caps| caps.entropy_bits);
+                                let preferred = self.opts.remotefx_entropy_coder;
+                                if let Some(entropy_bits) = pick_remotefx_entropy_coder(preferred, offered) {
+                                    update_codecs.set_remotefx(Some((entropy_bits, codec.id)));
+                                    update_codecs.set_remotefx_quant(self.opts.remotefx_quant.clone());
                                 }
                             }
                             #[cfg(feature = "nscodec")]

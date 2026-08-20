@@ -1,7 +1,10 @@
 //! Windows RDPDR backend configuration.
 
 use core::fmt;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use ironrdp_rdpdr::{RdpdrBackendFactory, RdpdrBackendFactoryResult, RdpdrBackendProduct, RdpdrDrive};
 
 use super::backend::WindowsRdpdrBackend;
 
@@ -91,22 +94,67 @@ impl core::error::Error for RedirectedDriveError {}
 /// The returned initial-drive list is intentionally shaped for
 /// [`ironrdp_rdpdr::Rdpdr::with_drives`], keeping platform configuration out of
 /// the portable RDPDR crate.
+///
+/// Smartcard redirection is optional and independent of drives: an empty drive
+/// list is valid for smartcard-only sessions.
 #[derive(Clone, Debug)]
 pub struct WindowsRdpdrBackendFactory {
-    drive: RedirectedDrive,
+    drives: Vec<RedirectedDrive>,
+    smartcard: bool,
 }
 
 impl WindowsRdpdrBackendFactory {
     /// Configures the single logical-volume root supported by this baseline.
     #[must_use]
     pub fn new(drive: RedirectedDrive) -> Self {
-        Self { drive }
+        Self {
+            drives: vec![drive],
+            smartcard: false,
+        }
+    }
+
+    /// Configures the logical-volume roots selected for one connection.
+    pub fn from_drives(drives: Vec<RedirectedDrive>) -> Result<Self, RedirectedDriveFactoryError> {
+        let mut device_ids = HashSet::with_capacity(drives.len());
+        for drive in &drives {
+            if !device_ids.insert(drive.device_id()) {
+                return Err(RedirectedDriveFactoryError::DuplicateDeviceId(drive.device_id()));
+            }
+        }
+
+        Ok(Self {
+            drives,
+            smartcard: false,
+        })
+    }
+
+    /// Records whether products intend WinSCard smartcard redirection with this factory.
+    ///
+    /// This is product configuration state used when cloning or resolving factories (for example
+    /// smartcard-only sessions with an empty drive list). The Windows backend always includes a
+    /// `ScardSession`; MS-RDPESC IRPs only arrive after the portable channel announces the device
+    /// via [`ironrdp_rdpdr::Rdpdr::with_smartcard`] / the client builder. Products must keep that
+    /// announcement aligned with this flag and must not attach an empty-drive factory when the flag
+    /// is `false`.
+    #[must_use]
+    pub fn with_smartcard(mut self, enabled: bool) -> Self {
+        self.smartcard = enabled;
+        self
+    }
+
+    /// Returns whether products requested WinSCard smartcard redirection on this factory.
+    #[must_use]
+    pub fn smartcard(&self) -> bool {
+        self.smartcard
     }
 
     /// Returns the initial `(device_id, name)` pair for `Rdpdr::with_drives`.
     #[must_use]
     pub fn initial_drives(&self) -> Vec<(u32, String)> {
-        vec![(self.drive.device_id, self.drive.display_name.clone())]
+        self.drives
+            .iter()
+            .map(|drive| (drive.device_id, drive.display_name.clone()))
+            .collect()
     }
 
     /// Builds a backend with no active root handles.
@@ -116,9 +164,38 @@ impl WindowsRdpdrBackendFactory {
     /// sequence.
     #[must_use]
     pub fn build(&self) -> WindowsRdpdrBackend {
-        WindowsRdpdrBackend::from_drive(self.drive.clone())
+        WindowsRdpdrBackend::from_drives(self.drives.clone())
     }
 }
+
+impl RdpdrBackendFactory for WindowsRdpdrBackendFactory {
+    fn build_rdpdr_backend(&self) -> RdpdrBackendFactoryResult<RdpdrBackendProduct> {
+        Ok(RdpdrBackendProduct::new(
+            Box::new(self.build()),
+            self.initial_drives()
+                .into_iter()
+                .map(|(device_id, name)| RdpdrDrive::new(device_id, name))
+                .collect(),
+        ))
+    }
+}
+
+/// Invalid selected-drive factory configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedirectedDriveFactoryError {
+    /// More than one selected drive used the same RDPDR device ID.
+    DuplicateDeviceId(u32),
+}
+
+impl fmt::Display for RedirectedDriveFactoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateDeviceId(device_id) => write!(f, "duplicate RDPDR device ID {device_id}"),
+        }
+    }
+}
+
+impl core::error::Error for RedirectedDriveFactoryError {}
 
 #[cfg(test)]
 mod tests {
@@ -131,5 +208,56 @@ mod tests {
         );
 
         assert_eq!(factory.initial_drives(), vec![(1, "System".to_owned())]);
+    }
+
+    #[test]
+    fn factory_builds_a_portable_rdpdr_product() {
+        let factory = WindowsRdpdrBackendFactory::new(
+            RedirectedDrive::new(1, "System", r"C:\", false).expect("valid system drive"),
+        );
+
+        let product = factory.build_rdpdr_backend().expect("build RDPDR product");
+        assert_eq!(
+            product
+                .initial_drives()
+                .iter()
+                .map(|drive| (drive.device_id(), drive.name()))
+                .collect::<Vec<_>>(),
+            vec![(1, "System")]
+        );
+    }
+
+    #[test]
+    fn factory_preserves_multiple_selected_drives() {
+        let factory = WindowsRdpdrBackendFactory::from_drives(vec![
+            RedirectedDrive::new(1, "System", r"C:\", false).expect("valid system drive"),
+            RedirectedDrive::new(2, "Data", r"D:\", false).expect("valid data drive"),
+        ])
+        .expect("unique device IDs");
+
+        assert_eq!(
+            factory.initial_drives(),
+            vec![(1, "System".to_owned()), (2, "Data".to_owned())]
+        );
+    }
+
+    #[test]
+    fn factory_tracks_smartcard_enablement() {
+        let factory = WindowsRdpdrBackendFactory::from_drives(Vec::new())
+            .expect("empty drive list is valid")
+            .with_smartcard(true);
+        assert!(factory.smartcard());
+        assert!(factory.initial_drives().is_empty());
+        assert!(!factory.with_smartcard(false).smartcard());
+    }
+
+    #[test]
+    fn factory_rejects_duplicate_device_ids() {
+        let result = WindowsRdpdrBackendFactory::from_drives(vec![
+            RedirectedDrive::new(1, "System", r"C:\", false).expect("valid system drive"),
+            RedirectedDrive::new(1, "Data", r"D:\", false).expect("valid data drive"),
+        ]);
+
+        assert!(matches!(result, Err(RedirectedDriveFactoryError::DuplicateDeviceId(1))));
     }
 }

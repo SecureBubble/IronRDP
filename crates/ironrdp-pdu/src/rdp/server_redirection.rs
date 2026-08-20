@@ -9,9 +9,7 @@
 //! So this type is decoded/encoded starting at the packet `Length` field — the
 //! `pad2Octets`/`Flags` live in the enclosing header's `shareId`.
 
-use ironrdp_core::{
-    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_size,
-};
+use ironrdp_core::{Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_size};
 
 // Redirection flags (`RedirectionFlags`, MS-RDPBCGR 2.2.13.1).
 const LB_TARGET_NET_ADDRESS: u32 = 0x0000_0001;
@@ -97,7 +95,10 @@ fn read_data(src: &mut ReadCursor<'_>) -> DecodeResult<Vec<u8>> {
 /// Trailing NUL code units are trimmed.
 fn read_unicode_string(src: &mut ReadCursor<'_>) -> DecodeResult<String> {
     let bytes = read_data(src)?;
-    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
     let trimmed = units.split(|&u| u == 0).next().unwrap_or(&units);
     Ok(String::from_utf16_lossy(trimmed))
 }

@@ -163,8 +163,10 @@ fn vmconnect_basic_flag_selects_basic_mode() {
 }
 
 #[test]
-fn vmconnect_rejects_rds_gateway() {
-    let err = parse_config_from_rdp_result(
+fn vmconnect_accepts_rds_gateway() {
+    // The gateway channel-create now forwards the destination port, so
+    // VMConnect (port 2179) can be tunneled through an RD Gateway.
+    let config = parse_config_from_rdp(
         "full address:s:hyperv.example.com:2179\nusername:s:test-user\nClearTextPassword:s:test-pass\n",
         &[
             "--vmconnect",
@@ -176,10 +178,10 @@ fn vmconnect_rejects_rds_gateway() {
             "--gw-pass",
             "gw-pass",
         ],
-    )
-    .expect_err("vmconnect + RDS gateway must fail");
+    );
 
-    assert!(err.to_string().contains("gateway"), "unexpected error: {err:#}");
+    assert!(matches!(config.transport(), Transport::Gateway(_)));
+    assert_eq!(config.destination().port(), 2179);
 }
 
 #[test]
@@ -231,6 +233,26 @@ fn audiomode_two_disables_audio_playback() {
     );
 
     assert!(!config.connector().enable_audio_playback);
+}
+
+#[test]
+fn audiomode_one_play_on_server_disables_local_playback() {
+    let config = parse_config_from_rdp(
+        "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\naudiomode:i:1\n",
+        &[],
+    );
+
+    assert!(!config.connector().enable_audio_playback);
+}
+
+#[test]
+fn audiomode_zero_enables_client_redirection() {
+    let config = parse_config_from_rdp(
+        "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\naudiomode:i:0\n",
+        &[],
+    );
+
+    assert!(config.connector().enable_audio_playback);
 }
 
 #[test]

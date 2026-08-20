@@ -36,6 +36,15 @@ export function preConnectionBlob(pcb: string): Extension {
 // may pass either the bare value or the full cookie form.
 export function loadBalanceInfo(info: string): Extension {
     return new Extension('load_balance_info', info);
+export type VmConnectMode = 'enhanced' | 'basic';
+
+export function vmConnect(vmId: string, mode: VmConnectMode = 'enhanced'): Extension {
+    if (vmId.trim() === '') {
+        throw new Error('vmconnect requires a VM ID');
+    }
+
+    const payload = mode === 'enhanced' ? `${vmId};EnhancedMode=1` : vmId;
+    return new Extension('vmconnect', payload);
 }
 
 export function displayControl(enable: boolean): Extension {

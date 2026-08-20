@@ -143,21 +143,11 @@ impl Credentials {
 pub struct Config {
     /// The initial desktop size to request
     pub desktop_size: DesktopSize,
-    /// Explicit multi-monitor layout advertised at connection time as GCC Client
-    /// Monitor Data ([MS-RDPBCGR] 2.2.1.3.6, `TS_UD_CS_MONITOR`).
+    /// The optional client monitor layout advertised in the GCC Client Monitor Data block.
     ///
-    /// - Empty (default): legacy single implicit-monitor behavior — no Client
-    ///   Monitor Data block is emitted and the server derives a single monitor
-    ///   from [`desktop_size`](Self::desktop_size).
-    /// - Non-empty: a Client Monitor Data block is emitted (up to 16 entries).
-    ///   Exactly one entry MUST carry [`gcc::MonitorFlags::PRIMARY`], the primary's
-    ///   top-left SHOULD be `(0, 0)`, and [`desktop_size`](Self::desktop_size)
-    ///   SHOULD equal the bounding box of every monitor rectangle (the spanning
-    ///   virtual-desktop size the server will produce).
-    ///
-    /// `gcc::Monitor` rectangles use inclusive `right`/`bottom` coordinates
-    /// (i.e. `right = left + width - 1`).
-    pub monitors: Vec<gcc::Monitor>,
+    /// When present, [`desktop_size`](Self::desktop_size) must describe the virtual desktop
+    /// containing these monitors.
+    pub monitor_layout: Option<gcc::ClientMonitorData>,
     /// The initial desktop scale factor to request.
     ///
     /// This becomes the `desktop_scale_factor` in the [`TS_UD_CS_CORE`](gcc::ClientCoreOptionalData) structure.
@@ -243,6 +233,15 @@ pub struct Config {
     pub alternate_shell: String,
     /// Working directory for the alternate shell
     pub work_dir: String,
+    /// Whether the connection uses the RemoteApp/RAIL connection model.
+    ///
+    /// RemoteApp launch information travels over the `rail` static virtual channel.
+    pub remote_application_mode: bool,
+    /// RAIL extensions implemented by the client.
+    ///
+    /// This must include [`capability_sets::RailSupportLevel::SUPPORTED`] when
+    /// [`Self::remote_application_mode`] is enabled.
+    pub rail_support_level: capability_sets::RailSupportLevel,
     pub platform: capability_sets::MajorPlatformType,
     /// Unique identifier for the computer
     ///
@@ -257,8 +256,12 @@ pub struct Config {
     pub request_data: Option<NegoRequestData>,
     /// If true, the INFO_AUTOLOGON flag is set in the [`ClientInfoPdu`](ironrdp_pdu::rdp::ClientInfoPdu)
     pub autologon: bool,
-    /// If true, the INFO_NOAUDIOPLAYBACK flag is set in the [`ClientInfoPdu`](ironrdp_pdu::rdp::ClientInfoPdu)
+    /// If true, local audio playback is enabled and `INFO_NOAUDIOPLAYBACK` is left clear
+    /// in the [`ClientInfoPdu`](ironrdp_pdu::rdp::ClientInfoPdu).
     pub enable_audio_playback: bool,
+    /// If true, client microphone capture is enabled and `INFO_AUDIOCAPTURE` is set
+    /// in the [`ClientInfoPdu`](ironrdp_pdu::rdp::ClientInfoPdu).
+    pub enable_audio_capture: bool,
     pub performance_flags: PerformanceFlags,
 
     pub license_cache: Option<Arc<dyn LicenseCache>>,
@@ -290,25 +293,25 @@ pub struct Config {
     /// [`MultiTransportChannelData`]: ironrdp_pdu::gcc::MultiTransportChannelData
     pub multitransport_flags: Option<gcc::MultiTransportFlags>,
 
-    /// Advertise support for the RDPEGFX graphics pipeline
-    /// ([`ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL`]).
+    /// FORK-ONLY. Advertise `SUPPORT_DYN_VC_GFX_PROTOCOL` in the early capability flags.
     ///
-    /// Only set this when the client actually attaches a graphics-pipeline
-    /// dynamic virtual channel handler (`ironrdp-egfx`'s `GraphicsPipelineClient`).
-    /// Without the handler, the server may open the graphics DVC and the client
-    /// would reject it, forcing a bitmap fallback.
+    /// Only set this when the client actually attaches a graphics-pipeline dynamic virtual
+    /// channel handler (`ironrdp-egfx`'s `GraphicsPipelineClient`). Without the handler the
+    /// server may open the graphics DVC and the client would reject it, forcing a bitmap
+    /// fallback. Upstream has no equivalent gate.
     pub support_graphics_pipeline: bool,
 
-    /// RAIL (Remote Programs) mode. When set, the client advertises RAIL and
-    /// Window List capabilities, sets the `INFO_RAIL` client-info flag, and is
-    /// expected to attach the `rail` static channel (see `ironrdp-rdperp`) to
-    /// launch the application. `None` means a normal desktop/shell session.
+    /// FORK-ONLY. RAIL (Remote Programs) launch config for the `ironrdp-rdperp` crate: when set,
+    /// the client attaches the `rail` static channel and sends a Client Execute PDU for this
+    /// application. `None` means a normal desktop/shell session.
+    ///
+    /// Distinct from upstream's `remote_application_mode`/`rail_support_level`, which only carry
+    /// the negotiation flags -- upstream keeps the launch parameters in `ironrdp-client`'s own
+    /// config, which we do not ship. Both are honoured when setting `ClientInfoFlags::RAIL`.
     pub rail: Option<RailConfig>,
 }
 
-ironrdp_core::assert_impl!(Config: Send, Sync);
-
-/// RAIL (Remote Programs) configuration — the application to launch, whose
+/// FORK-ONLY. RAIL (Remote Programs) configuration -- the application to launch, whose
 /// command line travels natively in the RAIL Client Execute PDU.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RailConfig {
@@ -319,6 +322,8 @@ pub struct RailConfig {
     /// Command-line argument(s); empty for none.
     pub arguments: String,
 }
+
+ironrdp_core::assert_impl!(Config: Send, Sync);
 
 pub trait State: Send + fmt::Debug + 'static {
     fn name(&self) -> &'static str;
@@ -379,15 +384,52 @@ impl Written {
     }
 }
 
+/// A point on a monotonic millisecond clock owned by the I/O driver.
+///
+/// Lives in `ironrdp-core`, shared with `ironrdp-rdpeudp`, and re-exported
+/// here. The epoch is arbitrary and carries no meaning; only differences
+/// between two instants do. All instants passed to one connector across its
+/// lifetime must come from the same clock: comparing instants from two
+/// different epochs produces a meaningless delta rather than an error, either
+/// saturating to zero or landing on a huge value with no diagnostic.
+///
+/// The clock deliberately lives outside the sans-I/O sequences, because a
+/// sequence reading a clock itself would measure how quickly it drained an
+/// already-filled buffer rather than how long the bytes took to arrive. Only
+/// the driver that performed the read knows the latter, which is what the
+/// `None` in [`Sequence::step`] is for: a driver with no reading to pass on.
+/// `ironrdp-blocking` and `ironrdp-async` each stamp with their own
+/// driver-owned epoch; the FFI connector, which has no read loop of its own to
+/// time, stamps on entry to its `step` binding instead.
+pub use ironrdp_core::MonotonicInstant;
+
 pub trait Sequence: Send {
     fn next_pdu_hint(&self) -> Option<&dyn PduHint>;
 
     fn state(&self) -> &dyn State;
 
-    fn step(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written>;
+    /// Advances the sequence.
+    ///
+    /// `received_at` is when `input` arrived on the wire, as observed by the I/O
+    /// driver, or `None` from a driver that does not observe arrival times. The
+    /// absence of a reading is deliberately not expressible as an instant: a
+    /// driver that cannot measure has taken no measurement, which is a different
+    /// thing from one that measured no elapsed time, and only the sequence
+    /// knows which of the two its reply may be derived from.
+    ///
+    /// A driver that always passes `None` never opens a connect-time bandwidth
+    /// window, so the Bandwidth Measure Results it sends report only the Stop's
+    /// own payload against the untimed floor. See `connection::counted_len`'s doc
+    /// for why the byte count is measurement-gated rather than reported in full.
+    fn step(
+        &mut self,
+        input: &[u8],
+        received_at: Option<MonotonicInstant>,
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<Written>;
 
     fn step_no_input(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
-        self.step(&[], output)
+        self.step(&[], None, output)
     }
 }
 
