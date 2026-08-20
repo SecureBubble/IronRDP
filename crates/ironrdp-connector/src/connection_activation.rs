@@ -440,7 +440,7 @@ fn server_window_list(capability_sets: &[CapabilitySet]) -> Option<WindowList> {
 
 fn negotiated_window_support_level(window_list: Option<&WindowList>) -> Option<WindowSupportLevel> {
     window_list.and_then(|window_list| {
-        (window_list.support_level != WindowSupportLevel::NotSupported).then_some(window_list.support_level)
+        (window_list.support_level != WindowSupportLevel::NOT_SUPPORTED).then_some(window_list.support_level)
     })
 }
 
@@ -467,7 +467,7 @@ fn remote_app_rail_capability(
         )
     });
     let window_list_supported =
-        window_list.is_some_and(|window_list| window_list.support_level != WindowSupportLevel::NotSupported);
+        window_list.is_some_and(|window_list| window_list.support_level != WindowSupportLevel::NOT_SUPPORTED);
     if !rail_supported || !window_list_supported {
         return Err(reason_err!(
             "Capabilities Exchange",
@@ -630,7 +630,7 @@ fn create_client_confirm_active(
             support_level: RailSupportLevel::SUPPORTED,
         }));
         server_capability_sets.push(CapabilitySet::WindowList(WindowList {
-            support_level: WindowSupportLevel::SupportedEx,
+            support_level: WindowSupportLevel::SUPPORTED_EX,
             num_icon_caches: 3,
             num_icon_cache_entries: 12,
         }));
@@ -694,7 +694,7 @@ mod tests {
     #[test]
     fn window_list_capability_preserves_supported_level() {
         let window_list = WindowList {
-            support_level: WindowSupportLevel::SupportedEx,
+            support_level: WindowSupportLevel::SUPPORTED_EX,
             num_icon_caches: 3,
             num_icon_cache_entries: 12,
         };
@@ -703,12 +703,12 @@ mod tests {
         assert_eq!(server_window_list(&capabilities), Some(window_list));
         assert_eq!(
             negotiated_window_support_level(server_window_list(&capabilities).as_ref()),
-            Some(WindowSupportLevel::SupportedEx)
+            Some(WindowSupportLevel::SUPPORTED_EX)
         );
         assert_eq!(negotiated_window_support_level(None), None);
         assert_eq!(
             negotiated_window_support_level(Some(&WindowList {
-                support_level: WindowSupportLevel::NotSupported,
+                support_level: WindowSupportLevel::NOT_SUPPORTED,
                 num_icon_caches: 0,
                 num_icon_cache_entries: 0,
             })),
@@ -720,7 +720,7 @@ mod tests {
     fn remote_app_capabilities_require_server_rail_and_window_list() {
         let rail_support_level = RailSupportLevel::SUPPORTED;
         let window_list = WindowList {
-            support_level: WindowSupportLevel::SupportedEx,
+            support_level: WindowSupportLevel::SUPPORTED_EX,
             num_icon_caches: 3,
             num_icon_cache_entries: 12,
         };
@@ -747,7 +747,7 @@ mod tests {
     #[test]
     fn remote_app_capabilities_require_client_rail_support() {
         let window_list = WindowList {
-            support_level: WindowSupportLevel::Supported,
+            support_level: WindowSupportLevel::SUPPORTED,
             num_icon_caches: 0,
             num_icon_cache_entries: 0,
         };

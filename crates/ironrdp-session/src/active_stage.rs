@@ -837,7 +837,7 @@ fn validate_windowing_orders_support(
     orders: &WindowingOrdersUpdate<'_>,
     window_support_level: WindowSupportLevel,
 ) -> SessionResult<()> {
-    if window_support_level == WindowSupportLevel::SupportedEx
+    if window_support_level == WindowSupportLevel::SUPPORTED_EX
         || !orders.orders.iter().any(|order| order.requires_extended_support())
     {
         return Ok(());
@@ -1040,7 +1040,7 @@ mod tests {
         assert!(orders.is_none());
 
         let (_, orders) =
-            process_slow_path_graphics(&mut processor, &mut image, Some(WindowSupportLevel::Supported), &update)
+            process_slow_path_graphics(&mut processor, &mut image, Some(WindowSupportLevel::SUPPORTED), &update)
                 .unwrap();
         assert_eq!(orders.as_deref(), Some(update.as_slice()));
     }
@@ -1052,7 +1052,7 @@ mod tests {
         update.extend_from_slice(&1u16.to_le_bytes());
         update.extend_from_slice(&order);
 
-        let normalized = process_fast_path_windowing_orders(Some(WindowSupportLevel::Supported), &update)
+        let normalized = process_fast_path_windowing_orders(Some(WindowSupportLevel::SUPPORTED), &update)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1081,14 +1081,14 @@ mod tests {
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
 
         assert!(
-            process_slow_path_graphics(&mut processor, &mut image, Some(WindowSupportLevel::Supported), &update)
+            process_slow_path_graphics(&mut processor, &mut image, Some(WindowSupportLevel::SUPPORTED), &update)
                 .is_err()
         );
         assert!(
             process_slow_path_graphics(
                 &mut processor,
                 &mut image,
-                Some(WindowSupportLevel::SupportedEx),
+                Some(WindowSupportLevel::SUPPORTED_EX),
                 &update
             )
             .is_ok()

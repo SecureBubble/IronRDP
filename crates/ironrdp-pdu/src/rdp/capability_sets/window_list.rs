@@ -57,31 +57,28 @@ impl<'de> Decode<'de> for WindowList {
     }
 }
 
-#[repr(u32)]
+/// `WndSupportLevel` ([MS-RDPERP] 2.2.1.1.2).
+///
+/// Deliberately a NEWTYPE, not an enum: this was an enum whose decode REJECTED any value outside
+/// {0, 1, 2}, and a real Windows host sends a value outside that set, which aborted the whole
+/// connection at Capabilities Exchange with "invalid `wndSupportLevel`". A capability level we do
+/// not recognise must never be fatal -- we only need to know whether windowing is supported at
+/// all. This mirrors the same remedy applied to `KeyboardType`, which had the identical problem.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-pub enum WindowSupportLevel {
-    NotSupported = 0,
-    Supported = 1,
-    SupportedEx = 2,
-}
+pub struct WindowSupportLevel(pub u32);
 
 impl WindowSupportLevel {
+    pub const NOT_SUPPORTED: Self = Self(0x0000_0000);
+    pub const SUPPORTED: Self = Self(0x0000_0001);
+    pub const SUPPORTED_EX: Self = Self(0x0000_0002);
+
     fn from_u32(value: u32) -> Option<Self> {
-        match value {
-            0 => Some(Self::NotSupported),
-            1 => Some(Self::Supported),
-            2 => Some(Self::SupportedEx),
-            _ => None,
-        }
+        Some(Self(value))
     }
 
-    #[expect(
-        clippy::as_conversions,
-        reason = "guarantees discriminant layout, and as is the only way to cast enum -> primitive"
-    )]
     fn as_u32(self) -> u32 {
-        self as u32
+        self.0
     }
 }
 
@@ -94,7 +91,7 @@ mod tests {
 
     const WINDOW_LIST_BUFFER: [u8; 7] = [0x02, 0x00, 0x00, 0x00, 0x03, 0x0c, 0x00];
     const WINDOW_LIST: WindowList = WindowList {
-        support_level: WindowSupportLevel::SupportedEx,
+        support_level: WindowSupportLevel::SUPPORTED_EX,
         num_icon_caches: 3,
         num_icon_cache_entries: 12,
     };
@@ -105,9 +102,16 @@ mod tests {
         assert_eq!(WINDOW_LIST_BUFFER, encode_vec(&WINDOW_LIST).unwrap().as_slice());
     }
 
+    /// Was `rejects_invalid_window_support_level`, asserting that anything outside {0,1,2} is an
+    /// error. That contract aborted the whole connection at Capabilities Exchange against a real
+    /// Windows host, so it is inverted deliberately: an unrecognised level must decode, not fail.
+    /// Note the value this test originally called invalid is 3 -- i.e. SUPPORTED | SUPPORTED_EX.
     #[test]
-    fn rejects_invalid_window_support_level() {
-        assert!(decode::<WindowList>(&[3, 0, 0, 0, 0, 0, 0]).is_err());
+    fn unknown_window_support_level_is_accepted_not_rejected() {
+        let decoded: WindowList = decode(&[3, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(decoded.support_level, WindowSupportLevel(3));
+        // And it still round-trips, so we never silently drop what the server told us.
+        assert_eq!(encode_vec(&decoded).unwrap().as_slice(), &[3, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]

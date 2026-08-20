@@ -52,18 +52,17 @@ impl<'de> Decode<'de> for Rail {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         ensure_fixed_part_size!(in: src);
 
-        let support_level = RailSupportLevel::from_bits(src.read_u32())
-            .ok_or_else(|| invalid_field_err!("railSupportLevel", "invalid RAIL support level"))?;
-        let rail = Self { support_level };
+        // Be STRICT when encoding (see `Encode`, which still rejects a malformed value we build
+        // ourselves) but LIBERAL when decoding a server's capability set.
+        //
+        // This used to `from_bits` -- rejecting any bit IronRDP does not model -- and then also
+        // reject anything failing `is_valid()`, which rejects unknown bits a second time. Either
+        // one aborts the ENTIRE connection at Capabilities Exchange. The sibling `wndSupportLevel`
+        // had exactly this bug and a real Windows host tripped it, so do not leave the same
+        // landmine here: an unrecognised RAIL support bit tells us nothing we need at decode time.
+        let support_level = RailSupportLevel::from_bits_retain(src.read_u32());
 
-        if !rail.is_valid() {
-            return Err(invalid_field_err!(
-                "railSupportLevel",
-                "RAIL extension support requires remote programs support"
-            ));
-        }
-
-        Ok(rail)
+        Ok(Self { support_level })
     }
 }
 
@@ -119,10 +118,18 @@ mod tests {
         assert_eq!(RAIL_PDU_BUFFER.len(), rail().size());
     }
 
+    /// Strict on the way OUT, liberal on the way IN.
+    ///
+    /// Encoding a malformed value we constructed ourselves is still an error. DECODING a server's
+    /// capability set is not: rejecting an unmodelled bit there kills the entire connection at
+    /// Capabilities Exchange, which is precisely what the sibling `wndSupportLevel` did against a
+    /// real Windows host.
     #[test]
-    fn invalid_rail_support_level_is_rejected() {
-        assert!(decode::<Rail>(&[0x00, 0x01, 0x00, 0x00]).is_err());
-        assert!(decode::<Rail>(&[0x02, 0x00, 0x00, 0x00]).is_err());
+    fn unknown_rail_support_level_decodes_but_does_not_encode() {
+        // Unknown bit, and an extension bit without the base SUPPORTED bit: both decode fine now.
+        assert!(decode::<Rail>(&[0x00, 0x01, 0x00, 0x00]).is_ok());
+        assert!(decode::<Rail>(&[0x02, 0x00, 0x00, 0x00]).is_ok());
+        // Encoding still refuses to emit something malformed of our own making.
         assert!(
             encode_vec(&Rail {
                 support_level: RailSupportLevel::from_bits_retain(0x0000_0100),
