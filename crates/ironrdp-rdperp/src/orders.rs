@@ -53,6 +53,12 @@ bitflags! {
         // consumed: skipping them desyncs every later field, not just one.
         const RESIZE_MARGIN_X = 0x0000_0080;
         const RESIZE_MARGIN_Y = 0x0800_0000;
+        // Tail fields, AFTER VISIBILITY. Each carries body bytes, so reaching TASKBAR_BUTTON
+        // means consuming everything before it.
+        const OVERLAY_DESCRIPTION = 0x0040_0000;
+        const ICON_OVERLAY_NULL = 0x0020_0000;
+        const TASKBAR_BUTTON = 0x0080_0000;
+        const ENFORCE_SERVER_ZORDER = 0x0008_0000;
         // Class / state bits.
         const TYPE_WINDOW = 0x0100_0000;
         const TYPE_NOTIFY = 0x0200_0000;
@@ -101,6 +107,11 @@ pub struct WindowState {
     pub window_client_delta: Option<Point>,
     pub window_size: Option<Size>,
     pub visible_offset: Option<Point>,
+    /// `TaskbarButton` ([MS-RDPERP] 2.2.1.3.1.2.1): the host's own answer to "should this window
+    /// get a taskbar button". 0 = yes/normal, non-zero = no. Far better than guessing from size
+    /// and style: a live session carries ~16 windows of which only 2 are real apps, and the
+    /// impostors (`Rdptray`, `Proxy Desktop`, `PopupHost`) have titles and non-zero sizes.
+    pub taskbar_button: Option<u8>,
 }
 
 /// A decoded Window List order.
@@ -298,8 +309,24 @@ impl WindowOrder {
         if flags.contains(WindowFieldFlags::VIS_OFFSET) {
             state.visible_offset = read_point(cursor, end);
         }
-        // VISIBILITY (numVisibilityRects u16 + n x RECT_16) is the last field; nothing follows
-        // it that we read, and the caller re-syncs on orderSize, so it needs no explicit skip.
+        // Everything below is the field TAIL, in FreeRDP's canonical order (`window.c`
+        // ~448-520). Each carries body bytes, so they must be consumed in sequence to reach
+        // `TASKBAR_BUTTON` -- skipping one shifts every later field.
+        if flags.contains(WindowFieldFlags::VISIBILITY) {
+            skip_rect16_array(cursor, end);
+        }
+        if flags.contains(WindowFieldFlags::OVERLAY_DESCRIPTION) {
+            read_rail_unicode_string(cursor, end);
+        }
+        // ICON_OVERLAY_NULL is genuinely flag-only: no body bytes.
+        if flags.contains(WindowFieldFlags::TASKBAR_BUTTON) {
+            state.taskbar_button = read_u8_bounded(cursor, end);
+        }
+        // ENFORCE_SERVER_ZORDER DOES carry a byte (an earlier comment here claimed otherwise).
+        // Nothing reads it yet, but consume it so a future field added below stays aligned.
+        if flags.contains(WindowFieldFlags::ENFORCE_SERVER_ZORDER) {
+            read_u8_bounded(cursor, end);
+        }
 
         state
     }
@@ -495,8 +522,10 @@ mod tests {
         assert!(f.contains(WindowFieldFlags::WND_OFFSET | WindowFieldFlags::WND_SIZE));
         assert!(f.contains(WindowFieldFlags::WND_RECTS | WindowFieldFlags::VISIBILITY | WindowFieldFlags::VIS_OFFSET));
         // 0x1108df1e sets neither CLIENT_AREA_SIZE (0x10000), RP_CONTENT (0x20000), ROOT_PARENT
-        // (0x40000) nor RESIZE_MARGIN (0x80/0x08000000). Bit 19 (0x80000) is ENFORCE_SERVER_ZORDER,
-        // which is a flag-only field carrying no body bytes (FreeRDP window.c never reads it).
+        // (0x40000) nor RESIZE_MARGIN (0x80/0x08000000). Bit 19 (0x80000) IS set:
+        // ENFORCE_SERVER_ZORDER, which carries ONE body byte -- an earlier version of this comment
+        // claimed it was flag-only, which was wrong (FreeRDP window.c:513 reads a UINT8). It sits
+        // after VISIBILITY, so the body below must include it.
         assert!(!f.contains(WindowFieldFlags::CLIENT_AREA_SIZE));
 
         // Body in MS-RDPERP 2.2.1.3.1.2.1 spec field order.
@@ -528,6 +557,7 @@ mod tests {
         for v in [292u16, 241, 1322, 728] {
             body.extend_from_slice(&v.to_le_bytes());
         }
+        body.push(0); // ENFORCE_SERVER_ZORDER: one byte (bit 0x80000 is set in these flags)
 
         let update = orders_update(&[window_order(FIELD_FLAGS, &body)]);
         let orders = WindowOrder::decode_orders_update(&update);
@@ -680,6 +710,56 @@ mod tests {
             state.visible_offset,
             Some(Point { x: 70, y: 90 }),
             "a multi-rect WND_RECTS array must be skipped by count, not by a fixed size"
+        );
+    }
+
+    /// The field TAIL after VISIBILITY. `TASKBAR_BUTTON` is the host's own answer to "does this
+    /// window belong in a taskbar", so reaching it correctly is what lets the taskbar stop
+    /// guessing from size and style. Every field between VISIBILITY and it carries body bytes.
+    #[test]
+    fn taskbar_button_is_read_from_the_field_tail() {
+        const FIELD_FLAGS: u32 = 0x1000_0000 // STATE_NEW
+            | 0x0100_0000 // TYPE_WINDOW
+            | 0x0000_0800 // WND_OFFSET
+            | 0x0000_0100 // WND_RECTS
+            | 0x0000_1000 // VIS_OFFSET
+            | 0x0000_0200 // VISIBILITY
+            | 0x0040_0000 // OVERLAY_DESCRIPTION
+            | 0x0020_0000 // ICON_OVERLAY_NULL (flag-only, no bytes)
+            | 0x0080_0000 // TASKBAR_BUTTON
+            | 0x0008_0000; // ENFORCE_SERVER_ZORDER
+
+        let overlay: Vec<u8> = "ov".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x77u32.to_le_bytes()); // windowId
+        body.extend_from_slice(&40i32.to_le_bytes()); // WND_OFFSET: X
+        body.extend_from_slice(&50i32.to_le_bytes()); // WND_OFFSET: Y
+        body.extend_from_slice(&2u16.to_le_bytes()); // WND_RECTS: two rects
+        for v in [40u16, 50, 640, 300, 40, 300, 640, 530] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(&40i32.to_le_bytes()); // VIS_OFFSET: X
+        body.extend_from_slice(&50i32.to_le_bytes()); // VIS_OFFSET: Y
+        body.extend_from_slice(&1u16.to_le_bytes()); // VISIBILITY: one rect
+        for v in [40u16, 50, 640, 530] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(&u16::try_from(overlay.len()).unwrap().to_le_bytes()); // OVERLAY_DESCRIPTION
+        body.extend_from_slice(&overlay);
+        body.push(0x01); // TASKBAR_BUTTON  <-- the target
+        body.push(0x00); // ENFORCE_SERVER_ZORDER
+
+        let update = orders_update(&[window_order(FIELD_FLAGS, &body)]);
+        let orders = WindowOrder::decode_orders_update(&update);
+        let WindowOrder::CreateWindow { state, .. } = &orders[0] else {
+            panic!("expected CreateWindow, got {:?}", orders[0]);
+        };
+        assert_eq!(state.window_offset, Some(Point { x: 40, y: 50 }));
+        assert_eq!(state.visible_offset, Some(Point { x: 40, y: 50 }));
+        assert_eq!(
+            state.taskbar_button,
+            Some(0x01),
+            "TASKBAR_BUTTON must be read after VISIBILITY + OVERLAY_DESCRIPTION, not off one of them"
         );
     }
 

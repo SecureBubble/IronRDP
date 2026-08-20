@@ -131,6 +131,11 @@ struct SessionBuilderInner {
     /// window layout (or present mode) changes so the JS renderer knows what to clip the
     /// surface-0 texture to. Only meaningful alongside `surface_present_callback`.
     surface_layout_callback: Option<js_sys::Function>,
+    /// RAIL taskbar window list (extension `rail_windows_callback`). Fired when the set of
+    /// taskbar-listed windows, their titles/rects, or the active window changes -- never per
+    /// frame. Payload is an array of `{ id, title, x, y, width, height, active }`, top-most
+    /// first when the host supplies a z-order.
+    rail_windows_callback: Option<js_sys::Function>,
     /// WebGL GPU copy callback (extension `surface_copy_callback`). Executes eGFX
     /// SurfaceToSurface copies inside the GPU surface texture.
     surface_copy_callback: Option<js_sys::Function>,
@@ -211,6 +216,7 @@ impl Default for SessionBuilderInner {
             canvas_updated_callback: None,
             surface_present_callback: None,
             surface_layout_callback: None,
+            rail_windows_callback: None,
             surface_copy_callback: None,
             rail_window_callback: None,
             canvas_resized_callback: None,
@@ -464,6 +470,11 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |surface_present_callback: JsValue| {
                 self.0.borrow_mut().surface_present_callback = surface_present_callback.dyn_into::<js_sys::Function>().ok();
             };
+            // RAIL taskbar: registering it makes the run loop push the taskbar-listed window set
+            // (id/title/rect/active) whenever it changes. Independent of the present path.
+            |rail_windows_callback: JsValue| {
+                self.0.borrow_mut().rail_windows_callback = rail_windows_callback.dyn_into::<js_sys::Function>().ok();
+            };
             // WebGL present layout: registering it lets the run loop tell the JS renderer which
             // RemoteApp window rects to clip the surface-0 texture to (and when to blank or
             // present full-screen). Inert without `surface_present_callback`.
@@ -515,6 +526,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             canvas_updated_callback,
             surface_present_callback,
             surface_layout_callback,
+            rail_windows_callback,
             surface_copy_callback,
             rail_window_callback,
             canvas_resized_callback,
@@ -566,6 +578,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             canvas_updated_callback = inner.canvas_updated_callback.clone();
             surface_present_callback = inner.surface_present_callback.clone();
             surface_layout_callback = inner.surface_layout_callback.clone();
+            rail_windows_callback = inner.rail_windows_callback.clone();
             surface_copy_callback = inner.surface_copy_callback.clone();
             rail_window_callback = inner.rail_window_callback.clone();
             canvas_resized_callback = inner.canvas_resized_callback.clone();
@@ -799,6 +812,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             canvas_updated_callback,
             surface_present_callback,
             surface_layout_callback,
+            rail_windows_callback,
             surface_copy_callback,
             rail_window_callback,
             canvas_resized_callback,
@@ -911,6 +925,14 @@ pub(crate) enum RdpInputEvent {
         right: i16,
         bottom: i16,
     },
+    /// Bring a RAIL window to the foreground: `TS_RAIL_ORDER_ACTIVATE` (§2.2.2.6.1).
+    ///
+    /// This is what a taskbar's click-to-switch sends. Note the host may legitimately ignore it
+    /// for a MINIMISED window -- restoring one needs `TS_RAIL_ORDER_SYSCOMMAND`/SC_RESTORE, which
+    /// is not modelled yet.
+    RailActivate {
+        window_id: u32,
+    },
     /// The server marked a surface capture-protected (proxy `PROTECT_SURFACE`).
     /// A browser cannot enforce capture protection, so the session is refused
     /// fail-closed rather than shown unprotected. See [`PROTECTED_SESSION_REFUSAL`].
@@ -998,6 +1020,7 @@ pub(crate) struct Session {
     /// WebGL present layout callback; `None` if the JS renderer registered none. Carries the
     /// present mode + RemoteApp window rects the JS renderer clips the surface-0 texture to.
     surface_layout_callback: Option<js_sys::Function>,
+    rail_windows_callback: Option<js_sys::Function>,
     /// WebGL GPU copy callback; executes eGFX SurfaceToSurface inside the GPU surface texture.
     surface_copy_callback: Option<js_sys::Function>,
     /// RAIL active-window rect notification; `None` if the webapp registered none.
@@ -1099,6 +1122,29 @@ impl Session {
     /// flattened as `[x, y, w, h, ...]`. JS clips the presented surface-0 texture to them, which is
     /// what keeps a dragged window from leaving a ghost. Best-effort: a throwing callback is logged
     /// and never influences protocol / frame-ack state.
+    /// Push the taskbar-listed RAIL windows to JS. Called only when the set actually changes,
+    /// never per frame — a RemoteApp emits window orders constantly (position, style, show-state
+    /// noise) and re-rendering a React list on each one would be wasteful and jittery.
+    fn notify_rail_windows(&self, windows: &[RailTaskbarWindow]) {
+        let Some(cb) = &self.rail_windows_callback else {
+            return;
+        };
+        let arr = js_sys::Array::new();
+        for w in windows {
+            let obj = js_sys::Object::new();
+            let set = |k: &str, v: JsValue| {
+                let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(k), &v);
+            };
+            set("id", JsValue::from_f64(f64::from(w.id)));
+            set("title", JsValue::from_str(&w.title));
+            set("active", JsValue::from_bool(w.active));
+            arr.push(&obj);
+        }
+        if let Err(err) = cb.apply(&JsValue::NULL, &js_sys::Array::from_iter([JsValue::from(arr)])) {
+            warn!(?err, "rail_windows callback threw");
+        }
+    }
+
     fn notify_surface_layout(&self, mode: u8, surface_w: u32, surface_h: u32, rects: &[(i32, i32, u32, u32)]) {
         let Some(cb) = &self.surface_layout_callback else {
             return;
@@ -1246,6 +1292,11 @@ impl iron_remote_desktop::Session for Session {
         // real change. All inert for a full desktop session (no window orders arrive).
         let mut rail_windows: HashMap<u32, RailWindowGeom> = HashMap::new();
         let mut rail_active: Option<u32> = None;
+        // The server's z-ordered window list from the Actively Monitored Desktop order,
+        // top-most first. Empty until the host sends one.
+        let mut rail_server_zorder: Vec<u32> = Vec::new();
+        // Last list pushed to JS, so the taskbar only re-renders on a REAL change.
+        let mut rail_last_taskbar: Vec<RailTaskbarWindow> = Vec::new();
         let mut rail_last_reported: Option<(i32, i32, u32, u32)> = None;
         // Monotonic z-order counter for HiDef RAIL compositing: each Window List Create/Update
         // stamps the touched window with the next value, so the most-recently-touched window
@@ -1654,6 +1705,27 @@ impl iron_remote_desktop::Session for Session {
                             force_gfx_present(&mut active_stage);
                             Vec::new()
                         }
+                        RdpInputEvent::RailActivate { window_id } => {
+                            let msg = active_stage
+                                .get_svc_processor::<RailChannel>()
+                                .map(|r| r.activate(window_id, true));
+                            let mut outs = Vec::new();
+                            if let Some(msg) = msg {
+                                match active_stage.process_svc_processor_messages(
+                                    SvcProcessorMessages::<RailChannel>::from(vec![msg]),
+                                ) {
+                                    Ok(frame) if !frame.is_empty() => {
+                                        info!(target: "rail_diag", window_id = format!("{window_id:#x}"), "RAIL: sent client Activate");
+                                        outs.push(ActiveStageOutput::ResponseFrame(frame));
+                                    }
+                                    Ok(_) => warn!(window_id = format!("{window_id:#x}"), "RAIL Activate produced no frame"),
+                                    Err(e) => warn!(error = %e, "RAIL Activate send failed"),
+                                }
+                            } else {
+                                warn!("RAIL Activate: no RailChannel processor attached");
+                            }
+                            outs
+                        }
                         RdpInputEvent::RailWindowMove { window_id, left, top, right, bottom } => {
                             // Local drag ended: report the final rect so the host snaps to it.
                             let msg = active_stage
@@ -1820,7 +1892,25 @@ impl iron_remote_desktop::Session for Session {
                                 rail_active = None;
                             }
                         }
-                        WindowOrder::Desktop { non_monitored, .. } => {
+                        WindowOrder::Desktop {
+                            non_monitored,
+                            active_window_id,
+                            window_ids,
+                        } => {
+                            // The server's OWN active window and z-order, which we previously
+                            // decoded and discarded while guessing both from "last window we
+                            // touched". Proven authoritative: after a client Activate the host
+                            // echoes that exact id back here.
+                            //
+                            // Filter 0xFFFFFFFF as well as 0 -- the wire carries it as a
+                            // "nothing is active" sentinel and it would otherwise be treated as
+                            // a real window id.
+                            if let Some(id) = active_window_id.filter(|&id| id != u32::MAX) {
+                                rail_active = Some(id);
+                            }
+                            if !window_ids.is_empty() {
+                                rail_server_zorder = window_ids.clone();
+                            }
                             // Non-Monitored Desktop = the input desktop switched to one RAIL isn't
                             // tracking (Ctrl+Alt+Del / lock / UAC secure desktop). The host paints
                             // it full-screen on the primary surface with no RAIL window, so tell the
@@ -1830,6 +1920,42 @@ impl iron_remote_desktop::Session for Session {
                             rail_position_changed = true;
                         }
                         _ => {}
+                    }
+
+                    // Rebuild the taskbar list and push it ONLY if it changed. A RemoteApp emits
+                    // window orders continuously (position, style, show-state noise), so pushing
+                    // per order would re-render the React list dozens of times a second.
+                    if self.rail_windows_callback.is_some() {
+                        let mut listed: Vec<RailTaskbarWindow> = rail_windows
+                            .iter()
+                            .filter(|(_, g)| g.is_taskbar_listed())
+                            .filter_map(|(id, g)| {
+                                // Require a usable rect as a liveness check, but do NOT carry it in
+                                // the payload: the taskbar shows id/title/active only, and including
+                                // the rect made every window MOVE differ from the last push, so a
+                                // drag re-rendered the React list on every position update.
+                                g.rect()?;
+                                Some(RailTaskbarWindow {
+                                    id: *id,
+                                    title: g.title.clone().unwrap_or_default(),
+                                    active: rail_active == Some(*id),
+                                })
+                            })
+                            .collect();
+                        // Order by the SERVER's z-order (top-most first) when it gave us one, so
+                        // the buttons match what the user sees. Windows the z-order omits keep a
+                        // stable tail ordered by id rather than jumping around.
+                        listed.sort_by_key(|w| {
+                            (
+                                rail_server_zorder.iter().position(|&z| z == w.id).unwrap_or(usize::MAX),
+                                w.id,
+                            )
+                        });
+                        if listed != rail_last_taskbar {
+                            debug!(target: "rail_diag", count = listed.len(), "RAIL: taskbar list -> JS");
+                            self.notify_rail_windows(&listed);
+                            rail_last_taskbar = listed;
+                        }
                     }
 
                     // Recompute the active window's rect; fire only on a real change.
@@ -2288,6 +2414,15 @@ impl iron_remote_desktop::Session for Session {
         // to keep the iron-remote-desktop trait surface protocol-agnostic.
         iron_remote_desktop::extension_match! {
             match ext;
+            |rail_activate: JsValue| {
+                let obj = into_object(rail_activate)?;
+                let window_id = get_u32(&obj, "window_id")?;
+                self.input_events_tx
+                    .unbounded_send(RdpInputEvent::RailActivate { window_id })
+                    .context("send RAIL activate")
+                    .map_err(IronError::from)?;
+                return Ok(JsValue::NULL);
+            };
             |request_file_contents: JsValue| {
                 let obj = into_object(request_file_contents)?;
                 let stream_id = get_u32(&obj, "stream_id")?;
@@ -2805,6 +2940,14 @@ fn parse_remote_app(value: &JsValue) -> Option<connector::RailConfig> {
     })
 }
 
+/// One entry in the RAIL taskbar window list pushed to JS.
+#[derive(Clone, PartialEq, Eq)]
+struct RailTaskbarWindow {
+    id: u32,
+    title: String,
+    active: bool,
+}
+
 /// Log a decoded RAIL Window List order at INFO so the RemoteApp window
 /// lifecycle is observable in the browser console. This is the seam a future
 /// local-window renderer would hook to composite real windows.
@@ -2828,7 +2971,7 @@ const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 /// Accumulated geometry of one RAIL window, merged across partial Window List updates (each
 /// order carries only the fields whose bit is set). Coordinates are virtual-desktop pixels and
 /// may be negative in RAIL, hence `i32`.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct RailWindowGeom {
     /// `windowOffset`: top-left of the whole window (incl. non-client frame).
     window_offset: Option<(i32, i32)>,
@@ -2843,6 +2986,17 @@ struct RailWindowGeom {
     /// `style`: win32 `WS_*` bits — checked for `WS_POPUP` (shell/helper class). NOT gated on
     /// `WS_VISIBLE`: the wire toggles it as noise on live windows (see `is_presentable`).
     style: Option<u32>,
+    /// `titleInfo`: the window caption, for the taskbar. Wire-confirmed populated on this
+    /// deployment ("File Explorer", "Windows Terminal"); the impostor windows carry titles too
+    /// (`Rdptray`, `Proxy Desktop`, `PopupHost`), so a title is NOT a listing criterion.
+    title: Option<String>,
+    /// `showState`, retained but NOT used for presentation gating — the wire toggles it as noise.
+    show_state: Option<u8>,
+    /// `ownerWindowId`: lets a dialog be attributed to its owner rather than listed separately.
+    owner_window_id: Option<u32>,
+    /// `TaskbarButton`: the host's own answer to whether this window belongs in a taskbar.
+    /// 0 = give it a button. This is what `is_taskbar_listed` gates on.
+    taskbar_button: Option<u8>,
 }
 
 impl RailWindowGeom {
@@ -2864,6 +3018,18 @@ impl RailWindowGeom {
         if let Some(ex) = state.extended_style {
             self.extended_style = Some(ex);
         }
+        if let Some(t) = state.title.as_ref() {
+            self.title = Some(t.clone());
+        }
+        if let Some(sh) = state.show_state {
+            self.show_state = Some(sh);
+        }
+        if let Some(o) = state.owner_window_id {
+            self.owner_window_id = Some(o);
+        }
+        if let Some(tb) = state.taskbar_button {
+            self.taskbar_button = Some(tb);
+        }
         if let Some(st) = state.style {
             self.style = Some(st);
         }
@@ -2873,6 +3039,28 @@ impl RailWindowGeom {
     /// 0x0 phantom): it must have a non-zero size AND not be `WS_EX_NOACTIVATE`. Interactive
     /// tool-window popups (e.g. dropdowns) are NOT NOACTIVATE, so they pass. Both the compositor
     /// feed and (future) hit-testing gate on this — the proxy's deterministic ghost filter.
+    /// Should this window get a TASKBAR BUTTON?
+    ///
+    /// Deliberately NOT `is_presentable`, which answers a different question. That filter decides
+    /// what to CLIP the surface to and is intentionally permissive — a live session showed it
+    /// admitting a 2x16 px window, which would have earned its own taskbar button.
+    ///
+    /// The host tells us directly via `TaskbarButton` (0 = give it a button), so prefer that over
+    /// any heuristic. It is the only signal that separates the two real apps in a session from the
+    /// ~14 impostors, several of which have titles AND non-zero sizes (`Rdptray`, `Proxy Desktop`,
+    /// `PopupHost`). Fall back to the structural filter plus a title only when the host omits the
+    /// field entirely, and never list a window owned by another (a dialog belongs to its owner).
+    fn is_taskbar_listed(&self) -> bool {
+        if self.owner_window_id.is_some_and(|o| o != 0) {
+            return false;
+        }
+        match self.taskbar_button {
+            Some(0) => self.is_presentable(),
+            Some(_) => false,
+            None => self.is_presentable() && self.title.as_ref().is_some_and(|t| !t.is_empty()),
+        }
+    }
+
     fn is_presentable(&self) -> bool {
         // DELIBERATELY does NOT gate on WS_VISIBLE or showState. The proxy proved on the wire
         // (session 73890406) that a live RemoteApp window's WS_VISIBLE toggles constantly as noise
@@ -2922,6 +3110,7 @@ fn log_rail_window_order(order: &WindowOrder) {
             info!(
                 window_id = format!("{window_id:#x}"),
                 title = state.title.as_deref().unwrap_or(""),
+                taskbar_button = format!("{:?}", state.taskbar_button),
                 offset = ?state.window_offset,
                 size = ?state.window_size,
                 show = ?state.show_state,

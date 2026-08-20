@@ -170,6 +170,41 @@ export function onAvcDecoded(params: {
  *  present — so the server is paced to real decode throughput instead of a present
  *  round-trip (see AvcDecoder.onFrame). Presentation happens independently on the next
  *  rAF; the bounded present FIFO caps display latency. */
+/** One taskbar-listed RemoteApp window, as reported by {@link railWindowsCallback}. */
+export interface RailWindow {
+    /** RAIL window id — pass this to {@link railActivate}. */
+    id: number;
+    title: string;
+    /** True for the window the HOST reports as active (not a client-side guess). */
+    active: boolean;
+}
+
+/**
+ * The set of RemoteApp windows that belong in a taskbar, top-most first.
+ *
+ * Fired only when the set, a title/rect, or the active window actually CHANGES — a RemoteApp
+ * emits window orders continuously, so this is deliberately not a per-frame feed. Windows are
+ * filtered by the host's own `TaskbarButton` field rather than a heuristic: a live session
+ * carries ~16 windows of which only a couple are real apps, and several impostors have titles
+ * and non-zero sizes.
+ */
+export function railWindowsCallback(cb: (windows: RailWindow[]) => void): Extension {
+    return new Extension('rail_windows_callback', cb as unknown);
+}
+
+/**
+ * Bring a RAIL (RemoteApp) window to the foreground -- `TS_RAIL_ORDER_ACTIVATE`.
+ *
+ * This is the click-to-switch action behind an application taskbar. `window_id` is the RAIL
+ * window id the client reports for a window (the same value logged as `window_id=0x...`).
+ *
+ * A MINIMISED window may not come back from Activate alone: restoring one needs
+ * `TS_RAIL_ORDER_SYSCOMMAND` with SC_RESTORE, which is not implemented yet.
+ */
+export function railActivate(params: { window_id: number }): Extension {
+    return new Extension('rail_activate', params as unknown);
+}
+
 export function onAvcAck(params: { frameId: number }): Extension {
     return new Extension('on_avc_ack', params as unknown);
 }

@@ -172,6 +172,8 @@ export {
     onAvcAck,
     avcWatermarkCallback,
     canvasUpdatedCallback,
+    railActivate,
+    railWindowsCallback,
     railWindowCallback,
 } from './extensions';
-export type { PrintJobStreamCallbacks, SoundCallbacks } from './extensions';
+export type { PrintJobStreamCallbacks, RailWindow, SoundCallbacks } from './extensions';
