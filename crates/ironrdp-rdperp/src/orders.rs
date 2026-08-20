@@ -114,6 +114,81 @@ pub struct WindowState {
     pub taskbar_button: Option<u8>,
 }
 
+/// `ICON_INFO` ([MS-RDPERP] 2.2.1.2.3): one window icon, as a raw DIB plus its AND mask.
+///
+/// Kept as raw bytes here — turning it into RGBA needs bottom-up row order, 4-byte row padding,
+/// the 1-bpp AND mask for transparency and (for bpp <= 8) the palette, which is presentation
+/// work rather than parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IconInfo {
+    /// Slot this icon occupies in the client's icon cache; a later `CACHED_ICON` order refers
+    /// back to (`cache_id`, `cache_entry`) instead of resending the bits.
+    pub cache_entry: u16,
+    pub cache_id: u8,
+    /// Bits per pixel of `bits_color`: 1, 4, 8, 16, 24 or 32. A palette is present only for <= 8.
+    pub bpp: u8,
+    pub width: u16,
+    pub height: u16,
+    /// 1-bpp AND mask: set bit = TRANSPARENT pixel. May be empty when the colour data carries
+    /// its own alpha.
+    pub bits_mask: Vec<u8>,
+    /// Palette, present only for `bpp` <= 8.
+    pub color_table: Vec<u8>,
+    /// The colour bits themselves, bottom-up with 4-byte-aligned rows.
+    pub bits_color: Vec<u8>,
+}
+
+impl IconInfo {
+    /// Decode to top-down RGBA8. `None` if the payload is too short for the stated geometry.
+    ///
+    /// Deliberately 32-bpp ONLY. Every icon observed on the wire here is bpp=32 with an empty
+    /// palette, so a <= 8-bpp palette path would be untestable code written blind. Other depths
+    /// return `None` and the caller falls back to a letter chip.
+    ///
+    /// TWO possible alpha sources, and which is authoritative varies by icon: modern Windows icons
+    /// carry a real alpha channel in the colour bits, while older ones leave it zero and express
+    /// transparency ONLY through the 1-bpp AND mask (set bit = transparent). Trusting the colour
+    /// alpha blindly would render those completely invisible, so use it only when some pixel is
+    /// actually non-zero and otherwise derive alpha from the mask.
+    pub fn to_rgba(&self) -> Option<Vec<u8>> {
+        if self.bpp != 32 {
+            return None;
+        }
+        let w = usize::from(self.width);
+        let h = usize::from(self.height);
+        if w == 0 || h == 0 || self.bits_color.len() < w * h * 4 {
+            return None;
+        }
+        let has_alpha = self.bits_color.chunks_exact(4).any(|px| px[3] != 0);
+        // AND-mask rows are 1 bit per pixel, padded to a 4-byte boundary.
+        let mask_stride = w.div_ceil(8).div_ceil(4) * 4;
+        let mask_usable = !self.bits_mask.is_empty() && self.bits_mask.len() >= mask_stride * h;
+
+        let mut out = vec![0u8; w * h * 4];
+        for y in 0..h {
+            // DIB rows are bottom-up; the output is top-down.
+            let src_row = h - 1 - y;
+            for x in 0..w {
+                let src = (src_row * w + x) * 4;
+                let dst = (y * w + x) * 4;
+                // Colour bits are BGRA.
+                out[dst] = self.bits_color[src + 2];
+                out[dst + 1] = self.bits_color[src + 1];
+                out[dst + 2] = self.bits_color[src];
+                out[dst + 3] = if has_alpha {
+                    self.bits_color[src + 3]
+                } else if mask_usable {
+                    let byte = self.bits_mask[src_row * mask_stride + x / 8];
+                    if byte & (0x80 >> (x % 8)) != 0 { 0 } else { 0xFF }
+                } else {
+                    0xFF
+                };
+            }
+        }
+        Some(out)
+    }
+}
+
 /// A decoded Window List order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowOrder {
@@ -124,7 +199,15 @@ pub enum WindowOrder {
     /// The window was destroyed (`WINDOW_ORDER_STATE_DELETED`).
     DeleteWindow { window_id: u32 },
     /// A window icon order (big/small); the icon payload is not decoded here.
-    WindowIcon { window_id: u32, cached: bool },
+    /// A window icon order. `icon` carries the bits for a full `ICON` order; for a
+    /// `CACHED_ICON` reference it is `None` and `cache_ref` names the slot to reuse.
+    WindowIcon {
+        window_id: u32,
+        cached: bool,
+        icon: Option<IconInfo>,
+        /// `(cache_id, cache_entry)` for a `CACHED_ICON` reference.
+        cache_ref: Option<(u8, u16)>,
+    },
     /// A taskbar notification (tray) icon order.
     NotifyIcon {
         window_id: u32,
@@ -236,9 +319,24 @@ impl WindowOrder {
             return Some(WindowOrder::DeleteWindow { window_id });
         }
         if flags.intersects(WindowFieldFlags::ICON | WindowFieldFlags::CACHED_ICON) {
+            let cached = flags.contains(WindowFieldFlags::CACHED_ICON);
+            let mut icon = None;
+            let mut cache_ref = None;
+            if cached {
+                // CACHED_ICON_INFO: cacheEntry (u16) then cacheId (u8).
+                let entry = read_u16_bounded(cursor, order_body_end);
+                let id = read_u8_bounded(cursor, order_body_end);
+                if let (Some(entry), Some(id)) = (entry, id) {
+                    cache_ref = Some((id, entry));
+                }
+            } else {
+                icon = read_icon_info(cursor, order_body_end);
+            }
             return Some(WindowOrder::WindowIcon {
                 window_id,
-                cached: flags.contains(WindowFieldFlags::CACHED_ICON),
+                cached,
+                icon,
+                cache_ref,
             });
         }
 
@@ -372,6 +470,53 @@ fn read_u8_bounded(cursor: &mut ReadCursor<'_>, end: usize) -> Option<u8> {
         return None;
     }
     Some(cursor.read_u8())
+}
+
+/// Read an `ICON_INFO` body ([MS-RDPERP] 2.2.1.2.3), field order per FreeRDP
+/// `update_read_icon_info` (`window.c` ~159-265): header, then bitsMask, colorTable, bitsColor.
+/// `cbColorTable` is present ONLY for bpp 1/4/8 — reading it unconditionally would shift the
+/// two size fields and corrupt every payload length.
+fn read_icon_info(cursor: &mut ReadCursor<'_>, end: usize) -> Option<IconInfo> {
+    let cache_entry = read_u16_bounded(cursor, end)?;
+    let cache_id = read_u8_bounded(cursor, end)?;
+    let bpp = read_u8_bounded(cursor, end)?;
+    if !matches!(bpp, 1 | 4 | 8 | 16 | 24 | 32) {
+        return None;
+    }
+    let width = read_u16_bounded(cursor, end)?;
+    let height = read_u16_bounded(cursor, end)?;
+    let cb_color_table = if matches!(bpp, 1 | 4 | 8) {
+        read_u16_bounded(cursor, end)?
+    } else {
+        0
+    };
+    let cb_bits_mask = read_u16_bounded(cursor, end)?;
+    let cb_bits_color = read_u16_bounded(cursor, end)?;
+
+    let take = |cursor: &mut ReadCursor<'_>, n: u16| -> Option<Vec<u8>> {
+        let n = usize::from(n);
+        if n == 0 {
+            return Some(Vec::new());
+        }
+        if cursor.len().checked_sub(n)? < end {
+            return None;
+        }
+        Some(cursor.read_slice(n).to_vec())
+    };
+    let bits_mask = take(cursor, cb_bits_mask)?;
+    let color_table = take(cursor, cb_color_table)?;
+    let bits_color = take(cursor, cb_bits_color)?;
+
+    Some(IconInfo {
+        cache_entry,
+        cache_id,
+        bpp,
+        width,
+        height,
+        bits_mask,
+        color_table,
+        bits_color,
+    })
 }
 
 fn read_u16_bounded(cursor: &mut ReadCursor<'_>, end: usize) -> Option<u16> {
@@ -761,6 +906,62 @@ mod tests {
             Some(0x01),
             "TASKBAR_BUTTON must be read after VISIBILITY + OVERLAY_DESCRIPTION, not off one of them"
         );
+    }
+
+    /// 2x2 32-bpp icon. Pins the two things that fail SILENTLY: the bottom-up row flip (a
+    /// vertically mirrored icon still looks like an icon) and the alpha source.
+    #[test]
+    fn icon_decodes_bottom_up_with_colour_alpha() {
+        // BGRA, bottom-up: wire row 0 is the BOTTOM of the image.
+        let icon = IconInfo {
+            cache_entry: 0,
+            cache_id: 0,
+            bpp: 32,
+            width: 2,
+            height: 2,
+            bits_mask: Vec::new(),
+            color_table: Vec::new(),
+            bits_color: vec![
+                // bottom row: blue, green
+                255, 0, 0, 255, 0, 255, 0, 255, //
+                // top row: red, transparent
+                0, 0, 255, 255, 0, 0, 0, 0,
+            ],
+        };
+        let rgba = icon.to_rgba().expect("32-bpp decodes");
+        // Top-left must be RED (the wire's LAST row), not blue.
+        assert_eq!(&rgba[0..4], &[255, 0, 0, 255], "row order must be flipped to top-down");
+        // Top-right keeps its zero alpha.
+        assert_eq!(&rgba[4..8], &[0, 0, 0, 0]);
+        // Bottom-left is blue.
+        assert_eq!(&rgba[8..12], &[0, 0, 255, 255]);
+    }
+
+    /// When the colour bits carry NO alpha at all, transparency lives only in the 1-bpp AND mask
+    /// (set bit = transparent). Trusting the zero colour alpha here would make the icon invisible.
+    #[test]
+    fn icon_falls_back_to_the_and_mask_when_colour_alpha_is_absent() {
+        let icon = IconInfo {
+            cache_entry: 0,
+            cache_id: 0,
+            bpp: 32,
+            width: 2,
+            height: 2,
+            // One 4-byte-padded row per line; top bit set => leftmost pixel transparent.
+            bits_mask: vec![0b1000_0000, 0, 0, 0, 0b0100_0000, 0, 0, 0],
+            color_table: Vec::new(),
+            bits_color: vec![
+                10, 20, 30, 0, 40, 50, 60, 0, //
+                70, 80, 90, 0, 100, 110, 120, 0,
+            ],
+        };
+        let rgba = icon.to_rgba().expect("32-bpp decodes");
+        // Output row 0 comes from wire row 1, whose mask byte is 0b0100_0000 -> pixel 1 transparent.
+        assert_eq!(rgba[3], 255, "row0 px0 opaque");
+        assert_eq!(rgba[7], 0, "row0 px1 transparent via mask");
+        // Output row 1 comes from wire row 0, mask 0b1000_0000 -> pixel 0 transparent.
+        assert_eq!(rgba[11], 0, "row1 px0 transparent via mask");
+        assert_eq!(rgba[15], 255, "row1 px1 opaque");
     }
 
     #[test]

@@ -177,6 +177,17 @@ export interface RailWindow {
     title: string;
     /** True for the window the HOST reports as active (not a client-side guess). */
     active: boolean;
+    /** Key into the icon cache (`"cacheId:cacheEntry"`), or null while the window has no icon. */
+    iconKey: string | null;
+}
+
+/** A window icon, delivered ONCE per cache slot. Convert and cache it by `key`. */
+export interface RailIcon {
+    key: string;
+    width: number;
+    height: number;
+    /** Top-down RGBA8, ready for `ImageData`. */
+    rgba: Uint8Array;
 }
 
 /**
@@ -188,7 +199,7 @@ export interface RailWindow {
  * carries ~16 windows of which only a couple are real apps, and several impostors have titles
  * and non-zero sizes.
  */
-export function railWindowsCallback(cb: (windows: RailWindow[]) => void): Extension {
+export function railWindowsCallback(cb: (windows: RailWindow[], newIcons: RailIcon[]) => void): Extension {
     return new Extension('rail_windows_callback', cb as unknown);
 }
 

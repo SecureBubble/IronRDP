@@ -3,7 +3,7 @@ use core::net::{Ipv4Addr, SocketAddrV4};
 use core::num::NonZeroU32;
 use core::time::Duration;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use anyhow::Context as _;
@@ -1125,7 +1125,7 @@ impl Session {
     /// Push the taskbar-listed RAIL windows to JS. Called only when the set actually changes,
     /// never per frame — a RemoteApp emits window orders constantly (position, style, show-state
     /// noise) and re-rendering a React list on each one would be wasteful and jittery.
-    fn notify_rail_windows(&self, windows: &[RailTaskbarWindow]) {
+    fn notify_rail_windows(&self, windows: &[RailTaskbarWindow], new_icons: &[RailIcon]) {
         let Some(cb) = &self.rail_windows_callback else {
             return;
         };
@@ -1138,9 +1138,28 @@ impl Session {
             set("id", JsValue::from_f64(f64::from(w.id)));
             set("title", JsValue::from_str(&w.title));
             set("active", JsValue::from_bool(w.active));
+            set(
+                "iconKey",
+                w.icon_key.as_ref().map_or(JsValue::NULL, |k| JsValue::from_str(k)),
+            );
             arr.push(&obj);
         }
-        if let Err(err) = cb.apply(&JsValue::NULL, &js_sys::Array::from_iter([JsValue::from(arr)])) {
+        let icons = js_sys::Array::new();
+        for i in new_icons {
+            let obj = js_sys::Object::new();
+            let set = |k: &str, v: JsValue| {
+                let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(k), &v);
+            };
+            set("key", JsValue::from_str(&i.key));
+            set("width", JsValue::from_f64(f64::from(i.width)));
+            set("height", JsValue::from_f64(f64::from(i.height)));
+            set("rgba", JsValue::from(js_sys::Uint8Array::from(i.rgba.as_slice())));
+            icons.push(&obj);
+        }
+        if let Err(err) = cb.apply(
+            &JsValue::NULL,
+            &js_sys::Array::from_iter([JsValue::from(arr), JsValue::from(icons)]),
+        ) {
             warn!(?err, "rail_windows callback threw");
         }
     }
@@ -1297,6 +1316,14 @@ impl iron_remote_desktop::Session for Session {
         let mut rail_server_zorder: Vec<u32> = Vec::new();
         // Last list pushed to JS, so the taskbar only re-renders on a REAL change.
         let mut rail_last_taskbar: Vec<RailTaskbarWindow> = Vec::new();
+        // Icon cache keyed by (cacheId, cacheEntry). The host sends the bits ONCE per slot and
+        // then refers back to it with CACHED_ICON orders, so without this the later windows in a
+        // session would have no icon at all. We advertise 3 caches x 12 entries.
+        let mut rail_icon_cache: HashMap<(u8, u16), (u16, u16, Vec<u8>)> = HashMap::new();
+        // window -> the cache slot its icon lives in.
+        let mut rail_window_icon: HashMap<u32, (u8, u16)> = HashMap::new();
+        // Slots already pushed to JS, so each icon's pixels cross the boundary exactly once.
+        let mut rail_icons_sent: HashSet<(u8, u16)> = HashSet::new();
         let mut rail_last_reported: Option<(i32, i32, u32, u32)> = None;
         // Monotonic z-order counter for HiDef RAIL compositing: each Window List Create/Update
         // stamps the touched window with the next value, so the most-recently-touched window
@@ -1881,6 +1908,39 @@ impl iron_remote_desktop::Session for Session {
                                 }
                             }
                         }
+                        WindowOrder::WindowIcon {
+                            window_id,
+                            icon,
+                            cache_ref,
+                            ..
+                        } => {
+                            // A full ICON order carries the bits AND names the slot to cache them
+                            // in; a CACHED_ICON order only names a slot filled earlier.
+                            let slot = if let Some(i) = icon {
+                                let key = (i.cache_id, i.cache_entry);
+                                if let Some(rgba) = i.to_rgba() {
+                                    rail_icon_cache.insert(key, (i.width, i.height, rgba));
+                                }
+                                Some(key)
+                            } else {
+                                *cache_ref
+                            };
+                            if let Some(slot) = slot.filter(|s| rail_icon_cache.contains_key(s)) {
+                                // Each window sends a 32x32 AND a 16x16. Prefer the smaller: a
+                                // taskbar button renders at ~16px, and downscaling 32x32 in CSS
+                                // looks worse than the icon Windows already tuned for this size.
+                                let better = match rail_window_icon.get(window_id) {
+                                    Some(cur) => rail_icon_cache
+                                        .get(&slot)
+                                        .zip(rail_icon_cache.get(cur))
+                                        .is_none_or(|(new, old)| new.0 <= old.0),
+                                    None => true,
+                                };
+                                if better {
+                                    rail_window_icon.insert(*window_id, slot);
+                                }
+                            }
+                        }
                         WindowOrder::DeleteWindow { window_id } => {
                             rail_windows.remove(window_id);
                             // HiDef RAIL: drop the window from the compositor too.
@@ -1888,6 +1948,7 @@ impl iron_remote_desktop::Session for Session {
                             rail_position_changed = true;
                             // If the active window went away, stop reporting but keep the
                             // last rect shown (the app may be closing the whole session).
+                            rail_window_icon.remove(window_id);
                             if rail_active == Some(*window_id) {
                                 rail_active = None;
                             }
@@ -1939,6 +2000,7 @@ impl iron_remote_desktop::Session for Session {
                                     id: *id,
                                     title: g.title.clone().unwrap_or_default(),
                                     active: rail_active == Some(*id),
+                                    icon_key: rail_window_icon.get(id).map(|(c, e)| format!("{c}:{e}")),
                                 })
                             })
                             .collect();
@@ -1952,8 +2014,30 @@ impl iron_remote_desktop::Session for Session {
                             )
                         });
                         if listed != rail_last_taskbar {
-                            debug!(target: "rail_diag", count = listed.len(), "RAIL: taskbar list -> JS");
-                            self.notify_rail_windows(&listed);
+                            // Ship the pixels for any icon these windows reference that JS has not
+                            // seen yet — once per cache slot, not once per push.
+                            let mut new_icons: Vec<RailIcon> = Vec::new();
+                            for key in listed.iter().filter_map(|w| w.icon_key.as_ref()) {
+                                let Some((c, e)) = key.split_once(':') else { continue };
+                                let (Ok(c), Ok(e)) = (c.parse::<u8>(), e.parse::<u16>()) else {
+                                    continue;
+                                };
+                                let slot = (c, e);
+                                if rail_icons_sent.contains(&slot) {
+                                    continue;
+                                }
+                                if let Some((w, h, rgba)) = rail_icon_cache.get(&slot) {
+                                    rail_icons_sent.insert(slot);
+                                    new_icons.push(RailIcon {
+                                        key: key.clone(),
+                                        width: *w,
+                                        height: *h,
+                                        rgba: rgba.clone(),
+                                    });
+                                }
+                            }
+                            debug!(target: "rail_diag", count = listed.len(), new_icons = new_icons.len(), "RAIL: taskbar list -> JS");
+                            self.notify_rail_windows(&listed, &new_icons);
                             rail_last_taskbar = listed;
                         }
                     }
@@ -2946,6 +3030,18 @@ struct RailTaskbarWindow {
     id: u32,
     title: String,
     active: bool,
+    /// `"cacheId:cacheEntry"` of this window's icon, or `None` while it has none. A KEY rather
+    /// than the pixels: the list is diffed on every RAIL order pass, and comparing icon buffers
+    /// there would be wasteful. The bits travel once, in `new_icons`.
+    icon_key: Option<String>,
+}
+
+/// A decoded window icon, pushed to JS once and cached there by `key`.
+struct RailIcon {
+    key: String,
+    width: u16,
+    height: u16,
+    rgba: Vec<u8>,
 }
 
 /// Log a decoded RAIL Window List order at INFO so the RemoteApp window
@@ -3128,8 +3224,33 @@ fn log_rail_window_order(order: &WindowOrder) {
         WindowOrder::DeleteWindow { window_id } => {
             info!(window_id = format!("{window_id:#x}"), "RAIL: window deleted");
         }
-        WindowOrder::WindowIcon { window_id, cached } => {
-            info!(window_id = format!("{window_id:#x}"), cached, "RAIL: window icon");
+        WindowOrder::WindowIcon {
+            window_id,
+            cached,
+            icon,
+            ..
+        } => {
+            // Log the ICON_INFO header before building any DIB decoder: bpp decides whether a
+            // palette and the 1-bpp AND mask are needed at all (32-bpp icons usually carry their
+            // own alpha), so measure real icons rather than implementing every branch blind.
+            match icon {
+                Some(i) => info!(
+                    window_id = format!("{window_id:#x}"),
+                    cached,
+                    bpp = i.bpp,
+                    w = i.width,
+                    h = i.height,
+                    cache = format!("{}:{}", i.cache_id, i.cache_entry),
+                    mask_len = i.bits_mask.len(),
+                    palette_len = i.color_table.len(),
+                    color_len = i.bits_color.len(),
+                    "RAIL: window icon"
+                ),
+                None => info!(
+                    window_id = format!("{window_id:#x}"),
+                    cached, "RAIL: window icon (cached ref)"
+                ),
+            }
         }
         WindowOrder::NotifyIcon {
             window_id,

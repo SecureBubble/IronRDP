@@ -176,4 +176,4 @@ export {
     railWindowsCallback,
     railWindowCallback,
 } from './extensions';
-export type { PrintJobStreamCallbacks, RailWindow, SoundCallbacks } from './extensions';
+export type { PrintJobStreamCallbacks, RailIcon, RailWindow, SoundCallbacks } from './extensions';
