@@ -267,10 +267,6 @@ impl Processor {
         let update = FastPathUpdate::decode_with_code(data.as_slice(), attributes.update_code);
 
         match update {
-            Ok(FastPathUpdate::Orders(orders)) => {
-                trace!("Received Fast-Path Orders update");
-                processor_updates.push(UpdateKind::Orders(orders.to_vec()));
-            }
             Ok(FastPathUpdate::SurfaceCommands(surface_commands)) => {
                 trace!("Received Surface Commands: {} pieces", surface_commands.len());
                 let update_region = self.process_surface_commands(image, output, surface_commands)?;
@@ -291,6 +287,17 @@ impl Processor {
             }
             Ok(FastPathUpdate::Orders(orders)) => {
                 trace!(len = orders.len(), "Received drawing-order update");
+                // Queue for `take_orders()`, which the web client drains to decode RAIL Window
+                // List orders through `ironrdp-rdperp` into typed geometry.
+                //
+                // Upstream instead emits `UpdateKind::Orders`, which ActiveStage turns into
+                // `ActiveStageOutput::WindowingOrders` (raw bytes) after running
+                // `validate_windowing_orders_support`. We deliberately do NOT do that as well:
+                // nothing here consumes the raw variant, it costs an extra copy of every orders
+                // update, and that validation can ERROR the session out on a support level it
+                // does not recognise. After the upstream merge BOTH arms existed in this match --
+                // upstream's first -- which made this one unreachable and silently starved the
+                // RemoteApp of every window order.
                 self.pending_orders.push(orders.to_vec());
             }
             Err(e) => {

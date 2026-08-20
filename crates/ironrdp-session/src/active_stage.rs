@@ -837,7 +837,11 @@ fn validate_windowing_orders_support(
     orders: &WindowingOrdersUpdate<'_>,
     window_support_level: WindowSupportLevel,
 ) -> SessionResult<()> {
-    if window_support_level == WindowSupportLevel::SUPPORTED_EX
+    // Treat SUPPORTED_EX as a THRESHOLD, not an exact value. A host that negotiates, say,
+    // SUPPORTED | SUPPORTED_EX (3) plainly does support extended orders, but an equality test
+    // rejects it and errors the session out. Same root cause as the `wndSupportLevel` decode
+    // that had to be made tolerant -- real hosts send values outside the three documented ones.
+    if window_support_level.0 >= WindowSupportLevel::SUPPORTED_EX.0
         || !orders.orders.iter().any(|order| order.requires_extended_support())
     {
         return Ok(());
