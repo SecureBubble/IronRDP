@@ -36,6 +36,8 @@ export function preConnectionBlob(pcb: string): Extension {
 // may pass either the bare value or the full cookie form.
 export function loadBalanceInfo(info: string): Extension {
     return new Extension('load_balance_info', info);
+}
+
 export type VmConnectMode = 'enhanced' | 'basic';
 
 export function vmConnect(vmId: string, mode: VmConnectMode = 'enhanced'): Extension {
