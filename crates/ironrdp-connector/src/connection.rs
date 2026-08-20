@@ -1515,6 +1515,21 @@ fn create_client_info_pdu(
     // than a desktop shell, and drives the `rail` static channel.
     if config.rail.is_some() {
         flags |= ClientInfoFlags::RAIL;
+
+        // NOTE: we deliberately do NOT advertise `HIDEF_RAIL_SUPPORTED`.
+        //
+        // HiDef windowed RemoteApp makes the host render EACH window as its own eGFX
+        // surface (MapSurfaceToWindow / ScaledWindow). That model was a structural bug
+        // generator for the browser client — per-window surface recycling (ghost/duplicate
+        // video), per-window AVC surfaces (green padding border), scaled-window resampling
+        // (blur), and per-window eGFX AVC (AVC444 "Preparing Windows" freeze).
+        //
+        // Microsoft's own web RDP client does NOT use HiDef: it takes ONE output surface
+        // (CreateSurface + MapSurfaceToOutput[DESKTOP]) and derives window geometry from the
+        // RAIL Window-List orders, clipping the single surface per window in z-order. Not
+        // advertising HiDef makes the host fall back to exactly that model (Path A), which is
+        // simpler, matches the reference implementation, and eliminates the whole bug class.
+        // (Re-enable by OR-ing in `ClientInfoFlags::HIDEF_RAIL_SUPPORTED` here.)
     }
 
     // Advertise bulk compression support if configured

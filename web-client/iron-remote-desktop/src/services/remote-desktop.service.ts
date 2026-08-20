@@ -237,6 +237,9 @@ export class RemoteDesktopService {
         this.session = session;
         this.fileTransferProvider?.setSession(session);
         this.avcDecoderProvider?.setSession(session);
+        // Hand the render canvas to the AVC provider (optional; used by the GPU present path to
+        // build a stacked WebGL overlay). Harmless for providers that don't implement it.
+        this.avcDecoderProvider?.setCanvas?.(this.canvas!);
         // Hand the render canvas to the AVC decoder so it can draw frames directly on
         // the GPU (no readback); it falls back to CPU readback if this isn't provided.
         if (this.canvas != null) {

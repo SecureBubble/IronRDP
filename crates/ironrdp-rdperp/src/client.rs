@@ -17,7 +17,10 @@ use ironrdp_pdu::{PduResult, decode_err};
 use ironrdp_svc::{SvcClientProcessor, SvcEncode, SvcMessage, SvcProcessor};
 use tracing::{debug, info, warn};
 
-use crate::pdu::{Activate, ClientExecute, ClientStatus, ClientStatusFlags, Handshake, RailPdu, ServerExecuteResult};
+use crate::pdu::{
+    Activate, ClientExecute, ClientStatus, ClientStatusFlags, Handshake, RailPdu, ServerExecuteResult, ServerMoveSize,
+    WindowMove,
+};
 
 /// Any RAIL PDU can be sent on the channel.
 impl SvcEncode for RailPdu {}
@@ -42,6 +45,10 @@ pub struct RailChannel {
     client_build_number: u32,
     client_status_flags: ClientStatusFlags,
     launch: Option<ClientExecute>,
+    /// Server Move/Size (§2.2.2.7.2) events received since the last drain. The SVC processor
+    /// only decodes them; the run loop drives the actual local move (it owns the compositor +
+    /// input) via [`RailChannel::take_move_size_events`].
+    pending_move_size: Vec<ServerMoveSize>,
 }
 
 impl RailChannel {
@@ -55,6 +62,7 @@ impl RailChannel {
             client_build_number: CLIENT_BUILD_NUMBER,
             client_status_flags: ClientStatusFlags::ALLOWLOCALMOVESIZE | ClientStatusFlags::AUTORECONNECT,
             launch: None,
+            pending_move_size: Vec::new(),
         }
     }
 
@@ -82,6 +90,24 @@ impl RailChannel {
     /// Notify the server that a RAIL window gained/lost focus (§2.2.2.6.1).
     pub fn activate(&self, window_id: u32, enabled: bool) -> SvcMessage {
         SvcMessage::from(RailPdu::Activate(Activate { window_id, enabled }))
+    }
+
+    /// Drain the Server Move/Size events (§2.2.2.7.2) received since the last call. The run loop
+    /// polls this each iteration to begin/end a local window drag.
+    pub fn take_move_size_events(&mut self) -> Vec<ServerMoveSize> {
+        core::mem::take(&mut self.pending_move_size)
+    }
+
+    /// Build a client Window Move PDU (§2.2.2.7.4) reporting a window's final rectangle after a
+    /// local move. `right`/`bottom` are exclusive. Send it on this channel when the drag ends.
+    pub fn window_move(&self, window_id: u32, left: i16, top: i16, right: i16, bottom: i16) -> SvcMessage {
+        SvcMessage::from(RailPdu::WindowMove(WindowMove {
+            window_id,
+            left,
+            top,
+            right,
+            bottom,
+        }))
     }
 
     /// Build the client's response to a server Handshake: reply + client status
@@ -151,12 +177,43 @@ impl SvcProcessor for RailChannel {
     }
 
     fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
+        // DIAG: the raw orderType (first 2 bytes) of every RAIL SVC PDU, so a live console shows
+        // exactly what the host sends during a drag (LocalMoveSize is 0x0009).
+        let raw_order_type = if payload.len() >= 2 {
+            u16::from_le_bytes([payload[0], payload[1]])
+        } else {
+            0
+        };
         let pdu = decode::<RailPdu>(payload).map_err(|e| decode_err!(e))?;
+        debug!(target: "rail_diag", order_type = format!("{raw_order_type:#06x}"), pdu = pdu.name(), "RAIL SVC recv");
 
         match pdu {
+            // HiDef is negotiated primarily via the `INFO_HIDEF_RAIL_SUPPORTED`
+            // Client Info PDU flag (set in ironrdp-connector). The server's
+            // HandshakeEx carries `HandshakeExFlags::HIDEF` as a secondary,
+            // informational advertisement; per MS-RDPERP the client replies to
+            // both Handshake and HandshakeEx with a plain Handshake PDU, so we
+            // do not echo a separate HandshakeEx. TODO: if the host requires the
+            // client to reflect specific HandshakeEx flags, store and honor
+            // `HandshakeEx::rail_handshake_flags` here.
             RailPdu::Handshake(_) | RailPdu::HandshakeEx(_) => Ok(self.on_server_handshake()),
             RailPdu::ServerExecuteResult(result) => {
                 Self::on_exec_result(&result);
+                Ok(Vec::new())
+            }
+            RailPdu::ServerMoveSize(ms) => {
+                // Queue for the run loop, which owns the compositor + input and runs the actual
+                // local move. No SVC response is emitted from here.
+                debug!(
+                    target: "rail_diag",
+                    window_id = format!("{:#x}", ms.window_id),
+                    start = ms.is_move_size_start,
+                    move_size_type = ms.move_size_type,
+                    pos_x = ms.pos_x,
+                    pos_y = ms.pos_y,
+                    "RAIL: server move/size"
+                );
+                self.pending_move_size.push(ms);
                 Ok(Vec::new())
             }
             other => {

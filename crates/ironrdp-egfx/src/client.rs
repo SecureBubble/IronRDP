@@ -411,6 +411,16 @@ pub trait GraphicsPipelineHandler: Send {
     /// `VideoDecoder` — and composites the resulting RGBA through its normal region
     /// path. Default: no-op (AVC frames dropped).
     fn on_avc_frame(&mut self, _frame: &AvcFrame<'_>) {}
+
+    /// Called for an ALPHA-codec (`RDPGFX_CODECID_ALPHA` = 0x000C) update.
+    ///
+    /// ALPHA rewrites ONLY the alpha channel of pixels already present in the surface
+    /// (drawn by a prior color codec in the same frame); RGB is preserved. The client
+    /// forwards the raw ALPHA `bitmap_data` (signature + compressed flag + raw/RLE
+    /// stream); the handler owns the surface buffers, so it decodes the stream with
+    /// [`ironrdp_graphics::alpha::decode_alpha_stream`] and applies the per-pixel alpha
+    /// over `dest_rect`. Default: no-op (handlers without surface buffers ignore it).
+    fn on_alpha_update(&mut self, _surface_id: u16, _dest_rect: &ExclusiveRectangle, _alpha_stream: &[u8]) {}
 }
 
 // ============================================================================
@@ -591,6 +601,49 @@ impl GraphicsPipelineClient {
     #[must_use]
     pub fn get_surface(&self, surface_id: u16) -> Option<&Surface> {
         self.surfaces.get(&surface_id)
+    }
+
+    /// Run the handler's frame-completion (compositing) pass immediately, outside a server
+    /// `EndFrame`.
+    ///
+    /// HiDef RAIL needs this. A RemoteApp window's on-screen *position* arrives on the RAIL
+    /// channel (Window List orders), which the run loop decodes independently of — and often
+    /// AFTER — the eGFX `EndFrame` that painted that window. The compositor only runs on
+    /// `EndFrame`, so a window whose position lands after its final paint would never be
+    /// placed (it freezes on the last desktop frame). The run loop calls this right after a
+    /// RAIL order changes a window position, so the newly-positioned window composites at
+    /// once. It is a no-op for output-mapped/legacy sessions (the handler composites nothing
+    /// when there are no window-mapped surfaces).
+    pub fn present_now(&mut self) {
+        self.handler.on_frame_complete(self.current_frame_id.unwrap_or(0));
+    }
+
+    /// Composite an out-of-band-decoded AVC region (RGBA) into its surface, exactly like a
+    /// synchronously-decoded codec region.
+    ///
+    /// The browser WebCodecs decoder returns RGBA asynchronously (after the server `EndFrame`),
+    /// having already cropped the frame to a single valid region rect in SURFACE coordinates.
+    /// Routing it through [`GraphicsPipelineHandler::on_bitmap_updated`] — the same path
+    /// ClearCodec/Planar use — blits it into the handler's per-surface buffer and marks it
+    /// dirty, so the next composite scales/positions it through the identical per-window path
+    /// (correct for HiDef RAIL) instead of being slapped onto the canvas at raw coordinates.
+    /// The caller runs [`GraphicsPipelineClient::present_now`] afterwards to flush it.
+    pub fn deliver_avc_region(&mut self, surface_id: u16, x: u32, y: u32, width: u32, height: u32, data: Vec<u8>) {
+        let clamp = |v: u32| v.min(u32::from(u16::MAX)) as u16;
+        let update = BitmapUpdate {
+            surface_id,
+            destination_rectangle: ExclusiveRectangle {
+                left: clamp(x),
+                top: clamp(y),
+                right: clamp(x.saturating_add(width)),
+                bottom: clamp(y.saturating_add(height)),
+            },
+            codec_id: Codec1Type::Avc420,
+            data,
+            width: clamp(width),
+            height: clamp(height),
+        };
+        self.handler.on_bitmap_updated(&update);
     }
 
     /// Get the total number of frames decoded
@@ -959,6 +1012,14 @@ impl GraphicsPipelineClient {
             Codec1Type::Uncompressed => {
                 self.handle_uncompressed(pdu);
             }
+            Codec1Type::Alpha => {
+                // ALPHA only rewrites the alpha channel of pixels already present in the
+                // surface. The surfaces live in the handler (not here), so forward the raw
+                // ALPHA stream; the handler decodes it via `ironrdp_graphics::alpha` and
+                // applies the per-pixel alpha over the dest rect (RGB preserved).
+                self.handler
+                    .on_alpha_update(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data);
+            }
             _ => {
                 trace!(codec_id = ?pdu.codec_id, "Forwarding unsupported codec to handler");
                 self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
@@ -973,14 +1034,32 @@ impl GraphicsPipelineClient {
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
 
         let Some(ref mut decoder) = self.h264_decoder else {
+            // No Rust H.264 decoder (the browser/web case): forward the single YUV420
+            // picture to the out-of-band WebCodecs decoder, exactly like AVC444 stream1.
+            // AVC420 is a SINGLE-stream 4:2:0 codec, so this fully decodes it — there is no
+            // auxiliary/chroma sub-stream and no 4:4:4 recombination to do. Without this the
+            // frame was dropped (old "Stage 0 stub"), so any host that chose AVC420 for a
+            // region — e.g. motion video, which AVD encodes as AVC420 even with the AVC444
+            // GPO off — rendered a frozen/blank rectangle. Mark the frame as async-AVC so its
+            // FrameAcknowledge is deferred until the browser decoder presents (flow control),
+            // matching decode_avc444.
             trace!(
                 surface_id,
                 width = dest_rect.width(),
                 height = dest_rect.height(),
                 len = bitmap_data.len(),
                 regions = stream.rectangles.len(),
-                "AVC420 frame received (Stage 0 stub: decode pending out-of-band)"
+                "AVC420 frame -> WebCodecs (out-of-band single-stream decode)"
             );
+            self.current_frame_has_avc = true;
+            self.handler.on_avc_frame(&AvcFrame {
+                surface_id,
+                frame_id: self.current_frame_id.unwrap_or(0),
+                codec_id: Codec1Type::Avc420,
+                destination_rectangle: dest_rect.clone(),
+                main_stream: stream.data,
+                regions: &stream.rectangles,
+            });
             return Ok(());
         };
 

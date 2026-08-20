@@ -418,6 +418,97 @@ impl Decode<'_> for Activate {
     }
 }
 
+/// `moveSizeType` value for a window MOVE (drag) in a Server Move/Size PDU (§2.2.2.7.2). The
+/// other values (`RAIL_WMSZ_*` 0x1..0x8) are resize edges/corners, which we leave server-driven.
+pub const RAIL_WMSZ_MOVE: u16 = 0x0009;
+
+/// `TS_RAIL_ORDER_LOCALMOVESIZE` (§2.2.2.7.2) — server → client. Tells the client to run a
+/// window move/resize loop LOCALLY (no per-frame server round-trip). For a MOVE
+/// (`move_size_type == RAIL_WMSZ_MOVE`), `pos_x/pos_y` are the grab anchor: the cursor position
+/// relative to the window's top-left, so `new_top_left = mouse_desktop - (pos_x, pos_y)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerMoveSize {
+    pub window_id: u32,
+    /// `true` = begin the local move/size loop; `false` = end it.
+    pub is_move_size_start: bool,
+    pub move_size_type: u16,
+    pub pos_x: i16,
+    pub pos_y: i16,
+}
+
+impl ServerMoveSize {
+    const BODY_SIZE: usize = 4 /* windowId */ + 2 /* isStart */ + 2 /* type */ + 2 /* posX */ + 2 /* posY */;
+    const NAME: &'static str = "TS_RAIL_ORDER_LOCALMOVESIZE";
+}
+
+impl Decode<'_> for ServerMoveSize {
+    fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        let header = RailPduHeader::decode(src)?;
+        check_order_type(&header, RailOrderType::LocalMoveSize)?;
+        ensure_size!(in: src, size: Self::BODY_SIZE);
+        Ok(Self {
+            window_id: src.read_u32(),
+            is_move_size_start: src.read_u16() != 0,
+            move_size_type: src.read_u16(),
+            pos_x: src.read_i16(),
+            pos_y: src.read_i16(),
+        })
+    }
+}
+
+/// `TS_RAIL_ORDER_WINDOWMOVE` (§2.2.2.7.4) — client → server. Sent when the local move/size loop
+/// ends (mouse-up), reporting the window's final rectangle. Coordinates are desktop-absolute;
+/// `right`/`bottom` are EXCLUSIVE (one past the last pixel), per the proxy/host contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowMove {
+    pub window_id: u32,
+    pub left: i16,
+    pub top: i16,
+    pub right: i16,
+    pub bottom: i16,
+}
+
+impl WindowMove {
+    const BODY_SIZE: usize = 4 /* windowId */ + 2 * 4 /* left/top/right/bottom */;
+    const NAME: &'static str = "TS_RAIL_ORDER_WINDOWMOVE";
+}
+
+impl Encode for WindowMove {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        RailPduHeader::encode(RailOrderType::WindowMove, self.size(), dst)?;
+        ensure_size!(in: dst, size: Self::BODY_SIZE);
+        dst.write_u32(self.window_id);
+        dst.write_i16(self.left);
+        dst.write_i16(self.top);
+        dst.write_i16(self.right);
+        dst.write_i16(self.bottom);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        HEADER_SIZE + Self::BODY_SIZE
+    }
+}
+
+impl Decode<'_> for WindowMove {
+    fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        let header = RailPduHeader::decode(src)?;
+        check_order_type(&header, RailOrderType::WindowMove)?;
+        ensure_size!(in: src, size: Self::BODY_SIZE);
+        Ok(Self {
+            window_id: src.read_u32(),
+            left: src.read_i16(),
+            top: src.read_i16(),
+            right: src.read_i16(),
+            bottom: src.read_i16(),
+        })
+    }
+}
+
 bitflags! {
     /// `Flags` of the Server Execute Result PDU (§2.2.2.3.2). Echoes the flags
     /// from the client's Execute request.
@@ -488,6 +579,13 @@ impl Decode<'_> for ServerExecuteResult {
     }
 }
 
+/// Server->client min/max tracking info (MS-RDPERP 2.2.2.7.4). Optional: only meaningful for
+/// client-side move/size, which the server-driven Path A model doesn't perform.
+const ORDER_TYPE_MINMAXINFO: u16 = 0x000a;
+/// Server->client system parameter update (MS-RDPERP 2.2.2.5.2). The server variant carries only
+/// screensaver flags; the richer workarea/taskbar/high-contrast set is client->server.
+const ORDER_TYPE_SYSPARAM: u16 = 0x0003;
+
 /// Any RAIL control PDU, for dispatching decode and building outbound messages.
 ///
 /// Unmodeled order types (e.g. server system-parameter updates we don't act on
@@ -501,7 +599,14 @@ pub enum RailPdu {
     ClientExecute(ClientExecute),
     Activate(Activate),
     ServerExecuteResult(ServerExecuteResult),
-    Other { order_type: u16, data: Vec<u8> },
+    /// Server → client: begin/end a local window move/size loop (§2.2.2.7.2).
+    ServerMoveSize(ServerMoveSize),
+    /// Client → server: final window rect after a local move (§2.2.2.7.4).
+    WindowMove(WindowMove),
+    Other {
+        order_type: u16,
+        data: Vec<u8>,
+    },
 }
 
 impl Encode for RailPdu {
@@ -513,6 +618,8 @@ impl Encode for RailPdu {
             Self::ClientExecute(p) => p.encode(dst),
             Self::Activate(p) => p.encode(dst),
             Self::ServerExecuteResult(p) => p.encode(dst),
+            Self::WindowMove(p) => p.encode(dst),
+            Self::ServerMoveSize(_) => Err(invalid_field_err!("RailPdu", "ServerMoveSize is server->client only")),
             Self::Other { order_type, data } => {
                 ensure_size!(in: dst, size: HEADER_SIZE + data.len());
                 dst.write_u16(*order_type);
@@ -531,6 +638,23 @@ impl Encode for RailPdu {
             Self::ClientExecute(p) => p.name(),
             Self::Activate(p) => p.name(),
             Self::ServerExecuteResult(p) => p.name(),
+            Self::ServerMoveSize(_) => ServerMoveSize::NAME,
+            Self::WindowMove(p) => p.name(),
+            // Recognized-but-deliberately-unhandled orders get their real names so they don't read
+            // as decode failures. Both are optional and carry nothing we act on: MINMAXINFO
+            // (0x000a) supplies min/max tracking sizes for CLIENT-side move/size, which Path A
+            // doesn't do (geometry is server-driven via the window-info orders); the server variant
+            // of SYSPARAM (0x0003) carries only screensaver flags — the workarea/taskbar/
+            // high-contrast payloads are the client->server direction, which we never receive.
+            // The body is still consumed by orderLength in `decode`, so the stream stays aligned.
+            Self::Other {
+                order_type: ORDER_TYPE_MINMAXINFO,
+                ..
+            } => "TS_RAIL_ORDER_MINMAXINFO (ignored)",
+            Self::Other {
+                order_type: ORDER_TYPE_SYSPARAM,
+                ..
+            } => "TS_RAIL_ORDER_SYSPARAM (ignored)",
             Self::Other { .. } => "TS_RAIL_ORDER_UNKNOWN",
         }
     }
@@ -543,6 +667,8 @@ impl Encode for RailPdu {
             Self::ClientExecute(p) => p.size(),
             Self::Activate(p) => p.size(),
             Self::ServerExecuteResult(p) => p.size(),
+            Self::ServerMoveSize(_) => HEADER_SIZE + ServerMoveSize::BODY_SIZE,
+            Self::WindowMove(p) => p.size(),
             Self::Other { data, .. } => HEADER_SIZE + data.len(),
         }
     }
@@ -557,6 +683,8 @@ impl Decode<'_> for RailPdu {
             Some(RailOrderType::Exec) => Ok(Self::ClientExecute(ClientExecute::decode(src)?)),
             Some(RailOrderType::Activate) => Ok(Self::Activate(Activate::decode(src)?)),
             Some(RailOrderType::ExecResult) => Ok(Self::ServerExecuteResult(ServerExecuteResult::decode(src)?)),
+            Some(RailOrderType::LocalMoveSize) => Ok(Self::ServerMoveSize(ServerMoveSize::decode(src)?)),
+            Some(RailOrderType::WindowMove) => Ok(Self::WindowMove(WindowMove::decode(src)?)),
             _ => {
                 let header = RailPduHeader::decode(src)?;
                 let body_len = usize::from(header.order_length).saturating_sub(HEADER_SIZE);
@@ -590,6 +718,25 @@ mod tests {
             "orderLength must be total PDU size"
         );
         decode::<T>(&bytes).unwrap()
+    }
+
+    /// The two optional server orders must decode into `Other` (body consumed by orderLength, so
+    /// the stream stays aligned) and report their real names — they are expected traffic, not a
+    /// decode failure, and reading as "UNKNOWN" has already sent one investigation down a dead end.
+    #[test]
+    fn optional_server_orders_are_named_not_unknown() {
+        // MINMAXINFO: 4-byte header + 20-byte body = 24 total.
+        let mut minmax = vec![0x0a, 0x00, 24, 0x00];
+        minmax.extend_from_slice(&[0u8; 20]);
+        let pdu = decode::<RailPdu>(&minmax).unwrap();
+        assert_eq!(pdu.name(), "TS_RAIL_ORDER_MINMAXINFO (ignored)");
+        assert_eq!(pdu.size(), minmax.len(), "body must be consumed by orderLength");
+
+        // SYSPARAM (server variant): 4-byte header + 5-byte body = 9 total.
+        let sysparam = vec![0x03, 0x00, 9, 0x00, 0x11, 0x00, 0x00, 0x00, 0x01];
+        let pdu = decode::<RailPdu>(&sysparam).unwrap();
+        assert_eq!(pdu.name(), "TS_RAIL_ORDER_SYSPARAM (ignored)");
+        assert_eq!(pdu.size(), sysparam.len());
     }
 
     #[test]

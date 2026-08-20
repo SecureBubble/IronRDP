@@ -3,6 +3,7 @@ use core::net::{Ipv4Addr, SocketAddrV4};
 use core::num::NonZeroU32;
 use core::time::Duration;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use anyhow::Context as _;
@@ -30,10 +31,12 @@ use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
 use ironrdp::rdperp::client::{RailChannel, RemoteApp};
-use ironrdp::rdperp::orders::WindowOrder;
+use ironrdp::rdperp::orders::{WindowOrder, WindowState};
+use ironrdp::rdperp::pdu::RAIL_WMSZ_MOVE;
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd, RdpsndClientHandler, RdpsndDvcListener};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
+use ironrdp::svc::SvcProcessorMessages;
 use ironrdp_core::WriteBuf;
 use ironrdp_egfx::client::GraphicsPipelineClient;
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
@@ -48,7 +51,7 @@ use crate::canvas::Canvas;
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::error::IronError;
-use crate::graphics::{blend_watermark_into, WasmGraphicsHandler, WasmGraphicsMessageProxy, Watermark};
+use crate::graphics::{LocalDrag, RailWindowStore, WasmGraphicsHandler, WasmGraphicsMessageProxy, Watermark};
 use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
 use crate::network_client::WasmNetworkClient;
@@ -118,6 +121,35 @@ struct SessionBuilderInner {
     /// Passive: it never touches frame-ack / present flow. (The AVC GPU direct-draw path
     /// notifies JS-side from `AvcDecoder`, since it never re-enters this run loop.)
     canvas_updated_callback: Option<js_sys::Function>,
+    /// Unified WebGL present callback (extension `surface_present_callback`). When set, the run loop
+    /// forwards each decoded NON-AVC region `(x, y, width, height, rgba: Uint8Array)` to JS — which
+    /// uploads it into the single surface-0 WebGL texture via `texSubImage2D` — INSTEAD of painting
+    /// the 2D canvas. This is the GPU-composite path (`?ironwebgl=1`); `None` = classic 2D
+    /// `put_image_data`. The 2D `render_canvas` stays blank behind the JS-owned WebGL canvas.
+    surface_present_callback: Option<js_sys::Function>,
+    /// WebGL present layout (extension `surface_layout_callback`). Fired when the RemoteApp
+    /// window layout (or present mode) changes so the JS renderer knows what to clip the
+    /// surface-0 texture to. Only meaningful alongside `surface_present_callback`.
+    surface_layout_callback: Option<js_sys::Function>,
+    /// WebGL GPU copy callback (extension `surface_copy_callback`). Executes eGFX
+    /// SurfaceToSurface copies inside the GPU surface texture.
+    surface_copy_callback: Option<js_sys::Function>,
+    /// RAIL active-window notification (extension `rail_window_callback`). Fired
+    /// when the presentation rect of the active RAIL (RemoteApp) top-level window
+    /// changes, with `(x, y, width, height)` in virtual-desktop coordinates. The
+    /// webapp uses it to crop/scale the canvas so only the app window fills the
+    /// viewport (RAIL paints the whole desktop surface; the surround is stale /
+    /// unpainted). `x`/`y` can be negative in RAIL, hence i32. Absent (a full
+    /// desktop session) => never fired, so the crop is never applied.
+    rail_window_callback: Option<js_sys::Function>,
+    /// Render-canvas backing-store resize notification (trait `canvas_resized_callback`).
+    /// Fired after the run loop resizes the canvas to a HiDef RAIL window surface so the
+    /// JS element re-fits the (now differently-sized) canvas to the viewport with its
+    /// existing single-monitor "fit" logic. The `<iron-remote-desktop>` element registers
+    /// this callback unconditionally, but the bundle only ever invokes it on the HiDef RAIL
+    /// window-present path — a normal desktop session never resizes the canvas here, so its
+    /// path is unchanged. Absent => the resize still happens; only the re-fit is skipped.
+    canvas_resized_callback: Option<js_sys::Function>,
 
     // Setting printer stream callbacks activates the virtual printer.
     invalid_print_job_stream_callbacks: bool,
@@ -177,6 +209,11 @@ impl Default for SessionBuilderInner {
             avc_decode_callback: None,
             avc_watermark_callback: None,
             canvas_updated_callback: None,
+            surface_present_callback: None,
+            surface_layout_callback: None,
+            surface_copy_callback: None,
+            rail_window_callback: None,
+            canvas_resized_callback: None,
 
             invalid_print_job_stream_callbacks: false,
             print_job_stream_callbacks: None,
@@ -295,8 +332,13 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         self.clone()
     }
 
-    /// Because the server does not resize the framebuffer in the RDP protocol, this feature is unused in IronRDP.
-    fn canvas_resized_callback(&self, _callback: js_sys::Function) -> Self {
+    /// Classic RDP never resizes the framebuffer, but HiDef RAIL (piece 3) does: the app
+    /// window's eGFX surface — presented AS the canvas — can differ in size from the
+    /// negotiated desktop. Store the callback so the run loop can tell the JS element to
+    /// re-fit after it resizes the canvas backing store. Never invoked for a normal desktop
+    /// session (the canvas is only resized on the window-present path).
+    fn canvas_resized_callback(&self, callback: js_sys::Function) -> Self {
+        self.0.borrow_mut().canvas_resized_callback = Some(callback);
         self.clone()
     }
 
@@ -417,6 +459,28 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |canvas_updated_callback: JsValue| {
                 self.0.borrow_mut().canvas_updated_callback = canvas_updated_callback.dyn_into::<js_sys::Function>().ok();
             };
+            // Unified WebGL present: registering it routes each NON-AVC region's RGBA to JS (which
+            // uploads it into the surface-0 WebGL texture) instead of the 2D canvas.
+            |surface_present_callback: JsValue| {
+                self.0.borrow_mut().surface_present_callback = surface_present_callback.dyn_into::<js_sys::Function>().ok();
+            };
+            // WebGL present layout: registering it lets the run loop tell the JS renderer which
+            // RemoteApp window rects to clip the surface-0 texture to (and when to blank or
+            // present full-screen). Inert without `surface_present_callback`.
+            |surface_layout_callback: JsValue| {
+                self.0.borrow_mut().surface_layout_callback = surface_layout_callback.dyn_into::<js_sys::Function>().ok();
+            };
+            // RAIL (RemoteApp) active-window rect notification. Registering it lets the
+            // run loop report the active top-level window's presentation rect so the
+            // webapp can crop/scale to just that window (see field docs). Passive: it
+            // never affects protocol / frame-ack state and never fires for a full desktop.
+            // WebGL GPU copy: executes SurfaceToSurface inside the GPU surface texture.
+            |surface_copy_callback: JsValue| {
+                self.0.borrow_mut().surface_copy_callback = surface_copy_callback.dyn_into::<js_sys::Function>().ok();
+            };
+            |rail_window_callback: JsValue| {
+                self.0.borrow_mut().rail_window_callback = rail_window_callback.dyn_into::<js_sys::Function>().ok();
+            };
         }
 
         self.clone()
@@ -449,6 +513,11 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             avc_decode_callback,
             avc_watermark_callback,
             canvas_updated_callback,
+            surface_present_callback,
+            surface_layout_callback,
+            surface_copy_callback,
+            rail_window_callback,
+            canvas_resized_callback,
             invalid_print_job_stream_callbacks,
             print_job_stream_callbacks,
             printer_name,
@@ -495,6 +564,11 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             avc_decode_callback = inner.avc_decode_callback.clone();
             avc_watermark_callback = inner.avc_watermark_callback.clone();
             canvas_updated_callback = inner.canvas_updated_callback.clone();
+            surface_present_callback = inner.surface_present_callback.clone();
+            surface_layout_callback = inner.surface_layout_callback.clone();
+            surface_copy_callback = inner.surface_copy_callback.clone();
+            rail_window_callback = inner.rail_window_callback.clone();
+            canvas_resized_callback = inner.canvas_resized_callback.clone();
             invalid_print_job_stream_callbacks = inner.invalid_print_job_stream_callbacks;
             print_job_stream_callbacks = inner.print_job_stream_callbacks.clone();
             printer_name = inner.printer_name.clone();
@@ -663,9 +737,20 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         // full multi-codec eGFX stream (ClearCodec text/UI + RFX Progressive photo +
         // AVC/uncompressed) in the client core, compositing to the canvas. The pair
         // (flag + handler) must move together; both off falls back to bitmap/Surface-Bits.
-        let graphics_handler = Some(WasmGraphicsHandler::new(WasmGraphicsMessageProxy::new(
-            input_events_tx.clone(),
-        )));
+        // Shared HiDef-RAIL window-position store: the run loop writes each RAIL window's
+        // desktop position (decoded from Window List orders) here, and the graphics handler
+        // reads it while compositing every mapped window. The handler is `Send` and is moved
+        // into the eGFX DVC processor by `connect()`, so this `Send`+`Clone` handle is the only
+        // bridge back to it from the run loop.
+        let rail_store = RailWindowStore::default();
+        // A registered `surface_present_callback` IS the `?ironwebgl=1` switch: it means JS owns
+        // the composite (it draws the AVC video straight into the surface-0 WebGL texture), so the
+        // handler must feed it decoded rects + a window layout instead of compositing itself.
+        let graphics_handler = Some(WasmGraphicsHandler::new(
+            WasmGraphicsMessageProxy::new(input_events_tx.clone()),
+            rail_store.clone(),
+            surface_present_callback.is_some(),
+        ));
 
         let (connection_result, ws) = connect(ConnectParams {
             ws,
@@ -700,6 +785,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             input_database: RefCell::new(ironrdp::input::Database::new()),
             writer_tx,
             input_events_tx,
+            rail_store,
 
             render_canvas,
             set_cursor_style_callback,
@@ -707,6 +793,11 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             avc_decode_callback,
             avc_watermark_callback,
             canvas_updated_callback,
+            surface_present_callback,
+            surface_layout_callback,
+            surface_copy_callback,
+            rail_window_callback,
+            canvas_resized_callback,
 
             input_events_rx: RefCell::new(Some(input_events_rx)),
             rdp_reader: RefCell::new(Some(rdp_reader)),
@@ -741,21 +832,61 @@ pub(crate) enum RdpInputEvent {
     /// JS access, so it forwards the compressed frame here; the run loop hands it to
     /// the JS decode callback, which later returns RGBA via [`RdpInputEvent::AvcRegion`].
     Avc(AvcFrameEvent),
-    /// An out-of-band-decoded AVC region (RGBA), returned by the JS WebCodecs decoder,
-    /// with the eGFX `frame_id` its pixels belong to. Unlike [`RdpInputEvent::Graphics`],
-    /// this bypassed the handler's surface buffer, so the run loop re-blends the watermark
-    /// before drawing. This is the CPU-readback fallback's PIXEL-delivery path only; the
-    /// FrameAcknowledge for `frame_id` was already sent at decode via [`RdpInputEvent::AvcAck`].
-    AvcRegion(GraphicsRegion, u32),
+    /// An out-of-band-decoded AVC region (RGBA), returned by the JS WebCodecs decoder for
+    /// `surface_id`, already cropped to ONE valid region rect in SURFACE coordinates
+    /// (`region.x`/`y`), with the eGFX `frame_id` its pixels belong to. The run loop composites
+    /// it into that surface's buffer via the normal codec path so the compositor scales/positions
+    /// it (correct for HiDef RAIL windows). This is the CPU-readback fallback's PIXEL-delivery
+    /// path only; the FrameAcknowledge for `frame_id` was already sent at decode via
+    /// [`RdpInputEvent::AvcAck`].
+    AvcRegion {
+        surface_id: u16,
+        region: GraphicsRegion,
+        frame_id: u32,
+    },
     /// The WebCodecs decoder produced a frame for eGFX `frame_id`: send its deferred
     /// FrameAcknowledge. Fired at DECODE-completion (not present) so the server is paced to
     /// real decode throughput rather than a present round-trip — the fix for the
     /// two-monitor + AVC stutter. No drawing here; presentation happens independently on the
     /// JS side (GPU direct-draw or the CPU [`RdpInputEvent::AvcRegion`] pixel path).
     AvcAck(u32),
+    /// WebGL present (`?ironwebgl=1`): the presentation layout for the frame — a mode
+    /// ([`crate::graphics::WEBGL_LAYOUT_CLIP`] and friends) plus the RemoteApp window rects in
+    /// desktop coords. The graphics handler is `Send` and has no JS access, so it routes the
+    /// layout here; the run loop hands it to the JS renderer, which GPU-clips the presented
+    /// surface to those rects. Emitted only when the layout actually changes.
+    SurfaceLayout {
+        mode: u8,
+        /// The eGFX surface's real size — the authoritative dimension for the JS GPU texture.
+        surface_w: u32,
+        surface_h: u32,
+        rects: Vec<(i32, i32, u32, u32)>,
+    },
+    /// WebGL present: an eGFX `SURFACE_TO_SURFACE` screen-to-screen copy that must be executed on
+    /// the GPU, because the pixels it moves live only in the JS surface texture (AVC never reaches
+    /// the WASM `SurfaceBuf` on this path). The host uses this to RELOCATE a window instead of
+    /// re-encoding it, so getting it wrong duplicates content and paints black.
+    SurfaceCopy {
+        src_x: u32,
+        src_y: u32,
+        width: u32,
+        height: u32,
+        points: Vec<(u32, u32)>,
+    },
     /// The current session watermark, forwarded by the graphics handler so the run
     /// loop can re-blend it onto out-of-band AVC regions.
     Watermark(Watermark),
+    /// HiDef RAIL (piece 3): the active window-mapped surface being presented changed
+    /// size, so the render-canvas backing store must be resized to match. In HiDef RAIL
+    /// the app window's graphics live on their OWN eGFX surface (MapSurfaceToWindow) with
+    /// NO output/desktop surface, and that surface — usually a different size than the
+    /// negotiated desktop — is presented AS the canvas. Emitted by the graphics handler
+    /// only when an active window surface exists (never for a normal output-mapped
+    /// desktop / legacy-RAIL / multimon session, so the output present path is untouched).
+    GraphicsResize {
+        width: u32,
+        height: u32,
+    },
     Resize {
         width: u32,
         height: u32,
@@ -763,6 +894,19 @@ pub(crate) enum RdpInputEvent {
         physical_size: Option<(u32, u32)>,
     },
     TerminateSession,
+    /// HiDef RAIL local drag: the input path moved the dragged window's position (in
+    /// `rail_store`) client-side; ask the run loop to recomposite immediately (no server
+    /// round-trip). Carries no data — the new position is already in the shared store.
+    RailPresent,
+    /// HiDef RAIL local drag finished (mouse-up): send the client `WindowMove` PDU with the
+    /// window's final desktop rect (right/bottom exclusive) so the host snaps to it.
+    RailWindowMove {
+        window_id: u32,
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+    },
     /// The server marked a surface capture-protected (proxy `PROTECT_SURFACE`).
     /// A browser cannot enforce capture protection, so the session is refused
     /// fail-closed rather than shown unprotected. See [`PROTECTED_SESSION_REFUSAL`].
@@ -772,8 +916,7 @@ pub(crate) enum RdpInputEvent {
 /// User-facing reason shown when a capture-protected session is refused in the
 /// browser. Fail-closed: we never display protected content in a client that
 /// cannot honor `SetWindowDisplayAffinity`-style screen-capture exclusion.
-const PROTECTED_SESSION_REFUSAL: &str =
-    "This session requires screen-capture protection, which isn't available in the browser — please use the native client.";
+const PROTECTED_SESSION_REFUSAL: &str = "This session requires screen-capture protection, which isn't available in the browser — please use the native client.";
 
 /// A decoded RGBA region positioned in output (desktop) coordinates.
 #[derive(Debug)]
@@ -784,21 +927,35 @@ pub(crate) struct GraphicsRegion {
     pub(crate) height: u32,
     /// Row-major RGBA8888, `width * height * 4` bytes.
     pub(crate) data: Vec<u8>,
+    /// Present with the alpha-preserving path ([`Canvas::draw_preserve_alpha`]) instead of the
+    /// default force-opaque [`Canvas::draw`]. Set only for HiDef RAIL window-mapped surfaces,
+    /// whose per-pixel alpha (window edges/shadows) must survive to the canvas. `false` for the
+    /// desktop/output and AVC paths, keeping them byte-for-byte identical to before.
+    pub(crate) preserve_alpha: bool,
 }
 
-/// A raw AVC (H.264) main sub-stream awaiting out-of-band (WebCodecs) decode, with
-/// its destination already resolved to output (desktop) coordinates.
+/// A raw AVC (H.264) main sub-stream awaiting out-of-band (WebCodecs) decode.
+///
+/// The H.264 picture is coded at the FULL surface size and aligned to the surface origin
+/// (0,0); only the `regions` sub-rects carry valid video — the encoder fills the rest with
+/// YUV(0,0,0), which decodes to green (BT.601). So the decoder must blit ONLY the region
+/// rects, never the whole picture (that green padding is the "green border" artifact).
+/// Region coords are therefore in SURFACE space (== source coords in the coded picture),
+/// and the decoded RGBA is composited back through the per-surface `SurfaceBuf` path (like
+/// every other codec) so it scales/positions correctly for HiDef RAIL windows.
 #[derive(Debug)]
 pub(crate) struct AvcFrameEvent {
     pub(crate) surface_id: u16,
     /// eGFX frame this picture belongs to; echoed back on present so the run loop can
     /// send the deferred FrameAcknowledge (flow control).
     pub(crate) frame_id: u32,
-    /// Destination origin + size in output (desktop) coordinates.
-    pub(crate) x: u32,
-    pub(crate) y: u32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
+    /// Surface's output (desktop) origin — only the GPU direct-draw path (multi-monitor,
+    /// output-mapped) uses it to place a region; the `SurfaceBuf` path positions via the
+    /// compositor and ignores it.
+    pub(crate) origin_x: u32,
+    pub(crate) origin_y: u32,
+    /// Valid sub-rects `(x, y, w, h)` in SURFACE space. Blit only these.
+    pub(crate) regions: Vec<(u32, u32, u32, u32)>,
     /// Main (`stream1`) H.264 bitstream (Annex B).
     pub(crate) main_stream: Vec<u8>,
 }
@@ -818,6 +975,9 @@ pub(crate) struct Session {
     input_database: RefCell<ironrdp::input::Database>,
     writer_tx: mpsc::UnboundedSender<Vec<u8>>,
     input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
+    /// Shared HiDef-RAIL window positions, fed to the graphics handler's compositor from
+    /// the run loop's Window List order decoding. Inert for non-RAIL / output-mapped sessions.
+    rail_store: RailWindowStore,
 
     render_canvas: HtmlCanvasElement,
     set_cursor_style_callback: js_sys::Function,
@@ -828,6 +988,19 @@ pub(crate) struct Session {
     avc_watermark_callback: Option<js_sys::Function>,
     /// Passive render-canvas update notification; `None` if no presenter registered.
     canvas_updated_callback: Option<js_sys::Function>,
+    /// Unified WebGL present callback; `None` = classic 2D present. When set, NON-AVC regions are
+    /// forwarded to JS (surface-0 WebGL texture) instead of painting the 2D canvas.
+    surface_present_callback: Option<js_sys::Function>,
+    /// WebGL present layout callback; `None` if the JS renderer registered none. Carries the
+    /// present mode + RemoteApp window rects the JS renderer clips the surface-0 texture to.
+    surface_layout_callback: Option<js_sys::Function>,
+    /// WebGL GPU copy callback; executes eGFX SurfaceToSurface inside the GPU surface texture.
+    surface_copy_callback: Option<js_sys::Function>,
+    /// RAIL active-window rect notification; `None` if the webapp registered none.
+    rail_window_callback: Option<js_sys::Function>,
+    /// Render-canvas backing-store resize notification; fired after the run loop resizes the
+    /// canvas to a HiDef RAIL window surface so the JS element re-fits it. `None` if none set.
+    canvas_resized_callback: Option<js_sys::Function>,
 
     // Consumed when `run` is called
     input_events_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpInputEvent>>>,
@@ -894,6 +1067,113 @@ impl Session {
             }
         }
     }
+
+    /// Forward a decoded NON-AVC region's RGBA to the JS WebGL renderer (surface-0 `texSubImage2D`),
+    /// on the `?ironwebgl=1` path only. Returns `true` if a callback consumed it, so the caller
+    /// skips the classic 2D `gui.draw`. The RGBA is presented as-is; the WebGL shader forces alpha
+    /// opaque, so no per-pixel alpha fix-up is needed here. Best-effort: a throwing callback is
+    /// logged and still returns `true` (never fall back to 2D mid-session).
+    fn present_surface_region(&self, x: u32, y: u32, width: u32, height: u32, data: &[u8]) -> bool {
+        let Some(cb) = &self.surface_present_callback else {
+            return false;
+        };
+        let args = js_sys::Array::from_iter([
+            JsValue::from_f64(f64::from(x)),
+            JsValue::from_f64(f64::from(y)),
+            JsValue::from_f64(f64::from(width)),
+            JsValue::from_f64(f64::from(height)),
+            js_sys::Uint8Array::from(data).into(),
+        ]);
+        if let Err(err) = cb.apply(&JsValue::NULL, &args) {
+            warn!(?err, "surface_present callback threw");
+        }
+        true
+    }
+
+    /// Hand the WebGL renderer the presentation layout: `mode` (blank / full-screen / clip — see
+    /// [`crate::graphics::WEBGL_LAYOUT_CLIP`]) and the RemoteApp window rects in desktop coords,
+    /// flattened as `[x, y, w, h, ...]`. JS clips the presented surface-0 texture to them, which is
+    /// what keeps a dragged window from leaving a ghost. Best-effort: a throwing callback is logged
+    /// and never influences protocol / frame-ack state.
+    fn notify_surface_layout(&self, mode: u8, surface_w: u32, surface_h: u32, rects: &[(i32, i32, u32, u32)]) {
+        let Some(cb) = &self.surface_layout_callback else {
+            return;
+        };
+        let flat = js_sys::Int32Array::new_with_length(u32::try_from(rects.len() * 4).unwrap_or(0));
+        for (i, &(x, y, w, h)) in rects.iter().enumerate() {
+            let base = u32::try_from(i * 4).unwrap_or(0);
+            flat.set_index(base, x);
+            flat.set_index(base + 1, y);
+            flat.set_index(base + 2, i32::try_from(w).unwrap_or(0));
+            flat.set_index(base + 3, i32::try_from(h).unwrap_or(0));
+        }
+        let args = js_sys::Array::from_iter([
+            JsValue::from_f64(f64::from(mode)),
+            JsValue::from_f64(f64::from(surface_w)),
+            JsValue::from_f64(f64::from(surface_h)),
+            flat.into(),
+        ]);
+        if let Err(err) = cb.apply(&JsValue::NULL, &args) {
+            warn!(?err, "surface_layout callback threw");
+        }
+    }
+
+    /// Execute an eGFX SurfaceToSurface copy on the GPU (WebGL path): copy the `w`x`h` block at
+    /// (`src_x`,`src_y`) of the surface texture to each destination point. Best-effort.
+    fn notify_surface_copy(&self, src_x: u32, src_y: u32, width: u32, height: u32, points: &[(u32, u32)]) {
+        let Some(cb) = &self.surface_copy_callback else {
+            return;
+        };
+        let flat = js_sys::Int32Array::new_with_length(u32::try_from(points.len() * 2).unwrap_or(0));
+        for (i, &(x, y)) in points.iter().enumerate() {
+            let base = u32::try_from(i * 2).unwrap_or(0);
+            flat.set_index(base, i32::try_from(x).unwrap_or(0));
+            flat.set_index(base + 1, i32::try_from(y).unwrap_or(0));
+        }
+        let args = js_sys::Array::from_iter([
+            JsValue::from_f64(f64::from(src_x)),
+            JsValue::from_f64(f64::from(src_y)),
+            JsValue::from_f64(f64::from(width)),
+            JsValue::from_f64(f64::from(height)),
+            flat.into(),
+        ]);
+        if let Err(err) = cb.apply(&JsValue::NULL, &args) {
+            warn!(?err, "surface_copy callback threw");
+        }
+    }
+
+    /// Notify the JS element that the render-canvas backing store was resized (HiDef RAIL
+    /// piece 3), so it re-fits the (already-resized) canvas to the viewport with its existing
+    /// single-monitor "fit" logic. The element's registered handler reads the canvas's own
+    /// `width`/`height` and takes no arguments, so none are passed. Best-effort: a throwing
+    /// callback is logged and ignored and never influences protocol / frame-ack state. No-op
+    /// if no callback was registered (the resize still happened; only the re-fit is skipped).
+    fn notify_canvas_resized(&self) {
+        if let Some(cb) = &self.canvas_resized_callback {
+            if let Err(err) = cb.apply(&JsValue::NULL, &js_sys::Array::new()) {
+                warn!(?err, "canvas_resized callback threw");
+            }
+        }
+    }
+
+    /// Notify the webapp that the active RAIL (RemoteApp) window's presentation rect
+    /// changed to `(x, y, width, height)` in virtual-desktop coordinates, so it can
+    /// crop/scale the canvas to just that window. `x`/`y` may be negative in RAIL, so
+    /// they are `i32`. Best-effort: a throwing callback is logged and ignored, and it
+    /// never influences protocol / frame-ack state. No-op if no callback was registered.
+    fn notify_rail_window(&self, x: i32, y: i32, width: u32, height: u32) {
+        if let Some(cb) = &self.rail_window_callback {
+            let args = js_sys::Array::from_iter([
+                JsValue::from_f64(f64::from(x)),
+                JsValue::from_f64(f64::from(y)),
+                JsValue::from_f64(f64::from(width)),
+                JsValue::from_f64(f64::from(height)),
+            ]);
+            if let Err(err) = cb.apply(&JsValue::NULL, &args) {
+                warn!(?err, "rail_window callback threw");
+            }
+        }
+    }
 }
 
 impl iron_remote_desktop::Session for Session {
@@ -952,9 +1232,22 @@ impl iron_remote_desktop::Session for Session {
         // Reused across frames so per-region extraction doesn't allocate on every draw.
         let mut draw_buffer = WriteBuf::new();
 
-        // Latest session watermark, forwarded by the graphics handler. Re-blended onto
-        // out-of-band AVC regions (which bypass the handler's flush-time re-blend).
-        let mut current_watermark: Option<Watermark> = None;
+        // RAIL (RemoteApp) window tracking. The host paints the whole virtual-desktop
+        // surface but sends Window List orders describing each top-level window's
+        // geometry; we track the ACTIVE top-level window's rect and report it to the
+        // webapp so it can crop/scale to just that window (killing the stale surround).
+        // `rail_windows` accumulates each accepted top-level window's optional geometry
+        // deltas (Window List updates are partial); `rail_active` is the window whose
+        // rect we currently report; `rail_last_reported` dedupes so we fire only on a
+        // real change. All inert for a full desktop session (no window orders arrive).
+        let mut rail_windows: HashMap<u32, RailWindowGeom> = HashMap::new();
+        let mut rail_active: Option<u32> = None;
+        let mut rail_last_reported: Option<(i32, i32, u32, u32)> = None;
+        // Monotonic z-order counter for HiDef RAIL compositing: each Window List Create/Update
+        // stamps the touched window with the next value, so the most-recently-touched window
+        // composites on top (a simple most-recent-on-top ordering; MS-RDPERP's Desktop order
+        // window_ids list is the exact z-order and could refine this later).
+        let mut rail_z_counter: u32 = 0;
 
         // Full-desktop rectangle used for the post-connect Refresh Rect (see below).
         // `desktop_size` is Copy, so read it before the builder consumes the rest.
@@ -1160,17 +1453,61 @@ impl iron_remote_desktop::Session for Session {
                                 bottom: bottom.min(u32::from(u16::MAX)) as u16,
                             };
                             let mut data = region.data;
-                            if let Err(e) = gui.draw(&mut data, rect) {
-                                warn!(error = format!("{e:#}"), "failed to draw EGFX region");
+                            // WebGL path: forward the region to JS (surface-0 texSubImage2D) and skip
+                            // the 2D paint entirely. Classic path: paint the 2D canvas. HiDef RAIL
+                            // window surfaces preserve per-pixel alpha (window edges/shadows); the
+                            // desktop/output path forces opaque as before.
+                            if !self.present_surface_region(rx, ry, rw, rh, &data) {
+                                let draw_result = if region.preserve_alpha {
+                                    gui.draw_preserve_alpha(&data, rect)
+                                } else {
+                                    gui.draw(&mut data, rect)
+                                };
+                                if let Err(e) = draw_result {
+                                    warn!(error = format!("{e:#}"), "failed to draw EGFX region");
+                                }
                             }
                             // Passive: tell an external presenter which area changed.
                             self.notify_canvas_updated(rx, ry, rw, rh);
                             Vec::new()
                         }
+                        RdpInputEvent::SurfaceCopy { src_x, src_y, width, height, points } => {
+                            // GPU screen-to-screen copy (window relocation). No WASM pixels move.
+                            self.notify_surface_copy(src_x, src_y, width, height, &points);
+                            Vec::new()
+                        }
+                        RdpInputEvent::SurfaceLayout { mode, surface_w, surface_h, rects } => {
+                            // WebGL present only: forward the RemoteApp window layout to the JS
+                            // renderer, which GPU-clips the surface-0 texture to it. No pixels and
+                            // no protocol state involved.
+                            self.notify_surface_layout(mode, surface_w, surface_h, &rects);
+                            Vec::new()
+                        }
+                        RdpInputEvent::GraphicsResize { width, height } => {
+                            // HiDef RAIL (piece 3): the active window-mapped surface presented
+                            // AS the canvas changed size, so resize the canvas backing store to
+                            // match, then ask the JS element to re-fit it to the viewport. Only
+                            // ever reached for a HiDef RAIL session; a normal output-mapped
+                            // desktop never emits GraphicsResize.
+                            match (NonZeroU32::new(width), NonZeroU32::new(height)) {
+                                (Some(w), Some(h)) => {
+                                    debug!(width, height, "HiDef RAIL: resizing canvas to window surface");
+                                    gui.resize(w, h);
+                                    // Re-fit on the JS side (reads the new canvas size); the
+                                    // notify_canvas_updated is inert unless a multimon presenter
+                                    // registered, but keeps the full-repaint contract symmetric.
+                                    self.notify_canvas_resized();
+                                    self.notify_canvas_updated(0, 0, width, height);
+                                }
+                                _ => warn!(width, height, "ignoring HiDef RAIL canvas resize with zero dimension"),
+                            }
+                            Vec::new()
+                        }
                         RdpInputEvent::Watermark(wm) => {
-                            // Forward the tile to the GPU AVC draw path so JS can overdraw
-                            // it on each frame (the CPU fallback re-blends `current_watermark`
-                            // in Rust instead).
+                            // Forward the tile to the GPU AVC draw path so JS can overdraw it on
+                            // each frame. The CPU AVC path now composites through the surface
+                            // buffer, so its watermark is re-blended by the surface flush/composite
+                            // (graphics.rs), not here.
                             if let Some(cb) = &self.avc_watermark_callback {
                                 let rgba = js_sys::Uint8Array::from(wm.rgba.as_slice());
                                 let args = js_sys::Array::from_iter([
@@ -1187,40 +1524,28 @@ impl iron_remote_desktop::Session for Session {
                                     warn!(?err, "AVC watermark callback threw");
                                 }
                             }
-                            // Retain the current watermark for re-blending onto CPU AVC regions.
-                            current_watermark = Some(wm);
+                            let _ = wm;
                             Vec::new()
                         }
-                        RdpInputEvent::AvcRegion(region, frame_id) => {
-                            // CPU-readback fallback PIXEL-delivery path: JS read the decoded
-                            // frame back to RGBA and handed us the pixels to blit. Out-of-band
-                            // AVC decode bypassed the handler's surface buffer (and thus its
-                            // flush-time watermark re-blend), so re-blend the mark here before
-                            // painting, then draw exactly like a normal Graphics region.
+                        RdpInputEvent::AvcRegion { surface_id, region, frame_id } => {
+                            // CPU-readback PIXEL-delivery path: JS read the decoded frame back to
+                            // RGBA, cropped to ONE valid region rect in SURFACE coords, and handed
+                            // us the pixels. Composite it into that surface's buffer through the
+                            // same path as ClearCodec/Planar, then run a present so the compositor
+                            // scales/positions it (HiDef RAIL) or flushes it (output-mapped) — this
+                            // is what fixes the green border (only region rects are blitted) and the
+                            // RAIL offset/scale (video now rides the per-window compositor instead of
+                            // being slapped onto the canvas at raw coords). The watermark is
+                            // re-blended by the surface flush/composite, so no manual blend here.
                             //
                             // The FrameAcknowledge for `frame_id` was already sent at DECODE
-                            // (RdpInputEvent::AvcAck), so we do NOT ack here — flow control is
-                            // paced by decode throughput, not this present. (`frame_id` is
-                            // retained only for symmetry / potential future use.)
+                            // (RdpInputEvent::AvcAck), so we do NOT ack here — flow control is paced
+                            // by decode throughput, not this present.
                             let _ = frame_id;
                             let (rx, ry, rw, rh) = (region.x, region.y, region.width, region.height);
-                            let mut data = region.data;
-                            if let Some(wm) = &current_watermark {
-                                blend_watermark_into(wm, &mut data, rx, ry, rw, rh);
-                            }
-                            let right = rx.saturating_add(rw).saturating_sub(1);
-                            let bottom = ry.saturating_add(rh).saturating_sub(1);
-                            let rect = ironrdp::pdu::geometry::InclusiveRectangle {
-                                left: rx.min(u32::from(u16::MAX)) as u16,
-                                top: ry.min(u32::from(u16::MAX)) as u16,
-                                right: right.min(u32::from(u16::MAX)) as u16,
-                                bottom: bottom.min(u32::from(u16::MAX)) as u16,
-                            };
-                            if let Err(e) = gui.draw(&mut data, rect) {
-                                warn!(error = format!("{e:#}"), "failed to draw AVC region");
-                            }
-                            // Passive: the CPU AVC readback path updated the canvas here
-                            // (the GPU direct-draw path notifies JS-side from AvcDecoder).
+                            deliver_avc_region(&mut active_stage, surface_id, rx, ry, rw, rh, region.data);
+                            force_gfx_present(&mut active_stage);
+                            // Passive: notify an external presenter of the changed area.
                             self.notify_canvas_updated(rx, ry, rw, rh);
                             Vec::new()
                         }
@@ -1242,19 +1567,25 @@ impl iron_remote_desktop::Session for Session {
                             }
                         }
                         RdpInputEvent::Avc(frame) => {
-                            // Hand the compressed AVC main sub-stream to the browser
-                            // WebCodecs decoder. It decodes asynchronously and returns
-                            // RGBA via the `on_avc_decoded` extension, which re-enters
-                            // the loop as an `RdpInputEvent::AvcRegion`.
+                            // Hand the compressed AVC main sub-stream to the browser WebCodecs
+                            // decoder. It decodes asynchronously and, for each valid region rect
+                            // (SURFACE coords), returns cropped RGBA via the `on_avc_decoded`
+                            // extension, which re-enters the loop as an `RdpInputEvent::AvcRegion`.
+                            // `regions` is a flat [x,y,w,h, x,y,w,h, ...] Uint32Array so only the
+                            // valid sub-rects are blitted (never the green YUV(0,0,0) padding).
                             if let Some(cb) = &self.avc_decode_callback {
                                 let data = js_sys::Uint8Array::from(frame.main_stream.as_slice());
+                                let mut flat: Vec<u32> = Vec::with_capacity(frame.regions.len() * 4);
+                                for (x, y, w, h) in &frame.regions {
+                                    flat.extend_from_slice(&[*x, *y, *w, *h]);
+                                }
+                                let regions = js_sys::Uint32Array::from(flat.as_slice());
                                 let args = js_sys::Array::from_iter([
                                     JsValue::from_f64(f64::from(frame.surface_id)),
                                     JsValue::from_f64(f64::from(frame.frame_id)),
-                                    JsValue::from_f64(f64::from(frame.x)),
-                                    JsValue::from_f64(f64::from(frame.y)),
-                                    JsValue::from_f64(f64::from(frame.width)),
-                                    JsValue::from_f64(f64::from(frame.height)),
+                                    JsValue::from_f64(f64::from(frame.origin_x)),
+                                    JsValue::from_f64(f64::from(frame.origin_y)),
+                                    regions.into(),
                                     data.into(),
                                 ]);
                                 if let Err(err) = cb.apply(&JsValue::NULL, &args) {
@@ -1314,6 +1645,32 @@ impl iron_remote_desktop::Session for Session {
                                 PROTECTED_SESSION_REFUSAL.to_owned(),
                             ))]
                         }
+                        RdpInputEvent::RailPresent => {
+                            // The input path moved the dragged window locally; recomposite now.
+                            force_gfx_present(&mut active_stage);
+                            Vec::new()
+                        }
+                        RdpInputEvent::RailWindowMove { window_id, left, top, right, bottom } => {
+                            // Local drag ended: report the final rect so the host snaps to it.
+                            let msg = active_stage
+                                .get_svc_processor::<RailChannel>()
+                                .map(|r| r.window_move(window_id, left, top, right, bottom));
+                            let mut outs = Vec::new();
+                            if let Some(msg) = msg {
+                                match active_stage.process_svc_processor_messages(
+                                    SvcProcessorMessages::<RailChannel>::from(vec![msg]),
+                                ) {
+                                    Ok(frame) if !frame.is_empty() => {
+                                        debug!(target: "rail_diag", window_id = format!("{window_id:#x}"), left, top, right, bottom, "RAIL: sent client WindowMove");
+                                        outs.push(ActiveStageOutput::ResponseFrame(frame));
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => warn!(error = %e, "RAIL WindowMove send failed"),
+                                }
+                            }
+                            force_gfx_present(&mut active_stage);
+                            outs
+                        }
                     }
                 }
                 _ = cleanup_interval.next() => {
@@ -1371,9 +1728,199 @@ impl iron_remote_desktop::Session for Session {
             // and surface it (the window *content* renders via the normal
             // GraphicsUpdate path below). Full local-window compositing is a
             // frontend concern; here we make the decoded state observable.
+            // Tracks whether any RAIL order this pass changed a window position, so we can
+            // force one compositing pass afterwards (positions arrive on a different channel
+            // than — and usually after — the eGFX EndFrame that painted the window).
+            let mut rail_position_changed = false;
+            // While a window is being dragged LOCALLY, ignore the host's Window-List position
+            // updates for it — they lag the local drag and would snap it backward each frame. The
+            // host confirms the final position with an UPDATE after our WindowMove, and the drag
+            // is cleared by then, so that authoritative snap still applies.
+            let dragging_window = self.rail_store.local_drag().map(|d| d.window_id);
             for orders in active_stage.take_rail_orders() {
                 for order in WindowOrder::decode_orders_update(&orders) {
                     log_rail_window_order(&order);
+                    // Apply the window geometry: track the active top-level window and,
+                    // when its presentation rect changes, tell the webapp to crop to it.
+                    match &order {
+                        WindowOrder::CreateWindow { window_id, state } => {
+                            // Track EVERY window's geometry (a later Update can flip
+                            // presentability), but only FEED the compositor the ones that are
+                            // real, presentable RemoteApp windows. WS_EX_NOACTIVATE chrome
+                            // (shadows / drag markers / slivers) and the 0x0 phantom are dropped
+                            // so they neither ghost the canvas nor sit topmost eating clicks.
+                            let geom = rail_windows.entry(*window_id).or_default();
+                            geom.merge(state);
+                            if geom.is_presentable() {
+                                rail_active = Some(*window_id);
+                                // Feed this window's desktop rect (position + size) to the
+                                // compositor. Prefer windowOffset/windowSize (full frame incl.
+                                // border/title), else visibleOffset/clientAreaSize. Widen the u32
+                                // windowId to u64. Skip while it's being locally dragged.
+                                if let Some((wx, wy)) = geom.window_offset.or(geom.visible_offset) {
+                                    if dragging_window != Some(u64::from(*window_id)) {
+                                        let (ww, wh) = geom.window_size.or(geom.client_area_size).unwrap_or((0, 0));
+                                        rail_z_counter = rail_z_counter.wrapping_add(1);
+                                        self.rail_store.set_rail_window(
+                                            u64::from(*window_id),
+                                            wx,
+                                            wy,
+                                            u32::try_from(ww).unwrap_or(0),
+                                            u32::try_from(wh).unwrap_or(0),
+                                            rail_z_counter,
+                                        );
+                                        rail_position_changed = true;
+                                    }
+                                }
+                            } else {
+                                // Chrome / phantom: keep it out of the compositor.
+                                self.rail_store.remove_rail_window(u64::from(*window_id));
+                                rail_position_changed = true;
+                            }
+                        }
+                        WindowOrder::UpdateWindow { window_id, state } => {
+                            if let Some(geom) = rail_windows.get_mut(window_id) {
+                                geom.merge(state);
+                                if geom.is_presentable() {
+                                    rail_active = Some(*window_id);
+                                    if let Some((wx, wy)) = geom.window_offset.or(geom.visible_offset) {
+                                        if dragging_window != Some(u64::from(*window_id)) {
+                                            let (ww, wh) = geom.window_size.or(geom.client_area_size).unwrap_or((0, 0));
+                                            rail_z_counter = rail_z_counter.wrapping_add(1);
+                                            self.rail_store.set_rail_window(
+                                                u64::from(*window_id),
+                                                wx,
+                                                wy,
+                                                u32::try_from(ww).unwrap_or(0),
+                                                u32::try_from(wh).unwrap_or(0),
+                                                rail_z_counter,
+                                            );
+                                            rail_position_changed = true;
+                                        }
+                                    }
+                                } else {
+                                    // Became (or stayed) non-presentable: drop from compositor.
+                                    self.rail_store.remove_rail_window(u64::from(*window_id));
+                                    rail_position_changed = true;
+                                }
+                            }
+                        }
+                        WindowOrder::DeleteWindow { window_id } => {
+                            rail_windows.remove(window_id);
+                            // HiDef RAIL: drop the window from the compositor too.
+                            self.rail_store.remove_rail_window(u64::from(*window_id));
+                            rail_position_changed = true;
+                            // If the active window went away, stop reporting but keep the
+                            // last rect shown (the app may be closing the whole session).
+                            if rail_active == Some(*window_id) {
+                                rail_active = None;
+                            }
+                        }
+                        WindowOrder::Desktop { non_monitored, .. } => {
+                            // Non-Monitored Desktop = the input desktop switched to one RAIL isn't
+                            // tracking (Ctrl+Alt+Del / lock / UAC secure desktop). The host paints
+                            // it full-screen on the primary surface with no RAIL window, so tell the
+                            // compositor to present surface 0 full-screen instead of clipping to the
+                            // stale app-window rects. An Actively Monitored Desktop order clears it.
+                            self.rail_store.set_secure_desktop(*non_monitored);
+                            rail_position_changed = true;
+                        }
+                        _ => {}
+                    }
+
+                    // Recompute the active window's rect; fire only on a real change.
+                    if let Some(active_id) = rail_active {
+                        if let Some(rect) = rail_windows.get(&active_id).and_then(RailWindowGeom::rect) {
+                            if rail_last_reported != Some(rect) {
+                                rail_last_reported = Some(rect);
+                                let (x, y, w, h) = rect;
+                                debug!(
+                                    window_id = format!("{active_id:#x}"),
+                                    x, y, w, h, "RAIL: active window rect"
+                                );
+                                self.notify_rail_window(x, y, w, h);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // HiDef RAIL: a window's position arrives on the RAIL channel independently of the
+            // eGFX EndFrame that painted it. The compositor only runs on EndFrame, so a window
+            // whose position lands after its last paint would freeze on the stale desktop frame.
+            // After applying this pass's RAIL orders, force one compositing pass so any
+            // newly-positioned window is placed immediately. No-op for non-HiDef sessions.
+            if rail_position_changed {
+                force_gfx_present(&mut active_stage);
+            }
+
+            // HiDef RAIL local move/size: the RAIL SVC processor buffered any ServerLocalMoveSize
+            // PDUs. Begin a client-side local drag on a MOVE start (the input path then follows
+            // the cursor without server round-trips); on end, clear residual state. Resize
+            // move-size types stay server-driven.
+            let move_events = active_stage
+                .get_svc_processor_mut::<RailChannel>()
+                .map(|c| c.take_move_size_events())
+                .unwrap_or_default();
+            // Path A (MS-style non-HiDef RAIL): window moves are SERVER-DRIVEN. The host moves
+            // the window on the one desktop surface and re-renders it; we just forward the mouse
+            // (like the shipping prod client / Microsoft's web client). We must NOT begin a
+            // client-side local drag here — that was a HiDef-only optimization (smooth per-window-
+            // surface drag), and under Path A it is actively harmful: it suppresses the mouse
+            // forwarding the host needs while our compositor draws the raw desktop surface and
+            // never moves the window locally, so the window wouldn't move at all. Flip this to
+            // true only if per-window HiDef compositing is ever re-enabled.
+            const ENABLE_CLIENT_LOCAL_DRAG: bool = false;
+            for ms in move_events {
+                if ENABLE_CLIENT_LOCAL_DRAG && ms.is_move_size_start && ms.move_size_type == RAIL_WMSZ_MOVE {
+                    match rail_windows
+                        .get(&ms.window_id)
+                        .and_then(|g| g.window_size.or(g.client_area_size))
+                    {
+                        Some((w, h)) => {
+                            self.rail_store.begin_local_drag(LocalDrag {
+                                window_id: u64::from(ms.window_id),
+                                anchor_x: i32::from(ms.pos_x),
+                                anchor_y: i32::from(ms.pos_y),
+                                width: w,
+                                height: h,
+                            });
+                            debug!(target: "rail_diag", window_id = format!("{:#x}", ms.window_id), anchor_x = ms.pos_x, anchor_y = ms.pos_y, w, h, "RAIL: begin local move");
+                        }
+                        None => {
+                            debug!(target: "rail_diag", window_id = format!("{:#x}", ms.window_id), "RAIL: local move START but no tracked window size -> cannot drag")
+                        }
+                    }
+                } else if ms.is_move_size_start {
+                    // Report the ACTUAL reason. This used to say "is a RESIZE (not MOVE)", which is
+                    // wrong whenever `ENABLE_CLIENT_LOCAL_DRAG` is false: the const short-circuits
+                    // the branch above, so genuine MOVEs (RAIL_WMSZ_MOVE = 0x0009) land here too and
+                    // got reported as resizes. That message cost a downstream investigation, which
+                    // concluded from it that the MOVE constant was mismapped — it is not.
+                    let is_move = ms.move_size_type == RAIL_WMSZ_MOVE;
+                    debug!(
+                        target: "rail_diag",
+                        move_size_type = ms.move_size_type,
+                        is_move,
+                        local_drag_enabled = ENABLE_CLIENT_LOCAL_DRAG,
+                        "RAIL: move/size START left server-driven"
+                    );
+                } else if !ms.is_move_size_start {
+                    // Host END. Normally the client mouse-up already ended the drag (and sent the
+                    // WindowMove), so this returns None and is a no-op. If it's still active (the
+                    // client missed the mouse-up, e.g. the cursor left the canvas), report the
+                    // final dragged position now so the window snaps there instead of back.
+                    if let Some(drag) = self.rail_store.end_local_drag() {
+                        if let Some((fx, fy)) = self.rail_store.window_pos(drag.window_id) {
+                            let _ = self.input_events_tx.unbounded_send(RdpInputEvent::RailWindowMove {
+                                window_id: u32::try_from(drag.window_id).unwrap_or(0),
+                                left: i16::try_from(fx).unwrap_or(0),
+                                top: i16::try_from(fy).unwrap_or(0),
+                                right: i16::try_from(fx.saturating_add(drag.width)).unwrap_or(i16::MAX),
+                                bottom: i16::try_from(fy.saturating_add(drag.height)).unwrap_or(i16::MAX),
+                            });
+                        }
+                    }
                 }
             }
 
@@ -1584,7 +2131,66 @@ impl iron_remote_desktop::Session for Session {
     }
 
     fn apply_inputs(&self, transaction: Self::InputTransaction) -> Result<(), Self::Error> {
-        let inputs = self.input_database.borrow_mut().apply(transaction);
+        // Mouse coords arrive in canvas pixels; `bbox_origin` maps them to desktop-absolute
+        // (0,0 in desktop mode / non-RAIL).
+        let (ox, oy) = self.rail_store.bbox_origin();
+
+        // HiDef RAIL local move: the host handed us the drag loop (ServerLocalMoveSize START).
+        // Drive the dragged window's position CLIENT-SIDE from the cursor and do NOT forward the
+        // mouse to the host; on release, send one WindowMove with the final rect so the host
+        // snaps. This turns the laggy per-frame server round-trip into a smooth local drag.
+        if let Some(drag) = self.rail_store.local_drag() {
+            for op in transaction {
+                match op {
+                    ironrdp::input::Operation::MouseMove(p) => {
+                        let nx = i32::from(p.x) + ox - drag.anchor_x;
+                        let ny = i32::from(p.y) + oy - drag.anchor_y;
+                        self.rail_store.move_rail_window(drag.window_id, nx, ny);
+                        let _ = self.input_events_tx.unbounded_send(RdpInputEvent::RailPresent);
+                    }
+                    ironrdp::input::Operation::MouseButtonReleased(ironrdp::input::MouseButton::Left) => {
+                        let (fx, fy) = self.rail_store.window_pos(drag.window_id).unwrap_or((0, 0));
+                        self.rail_store.end_local_drag();
+                        let _ = self.input_events_tx.unbounded_send(RdpInputEvent::RailWindowMove {
+                            window_id: u32::try_from(drag.window_id).unwrap_or(0),
+                            left: i16::try_from(fx).unwrap_or(0),
+                            top: i16::try_from(fy).unwrap_or(0),
+                            right: i16::try_from(fx.saturating_add(drag.width)).unwrap_or(i16::MAX),
+                            bottom: i16::try_from(fy.saturating_add(drag.height)).unwrap_or(i16::MAX),
+                        });
+                        // The pre-drag mouse-DOWN went through the input DB (button marked held)
+                        // but we consumed the mouse-up here without it, so clear the DB's held
+                        // state — otherwise the next click sees Left already down. Nothing is sent
+                        // to the host (it owned the move loop and expects only the WindowMove).
+                        let _ = self.input_database.borrow_mut().release_all();
+                    }
+                    // Ignore all other input while a local move is in progress.
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
+
+        // HiDef RAIL: the canvas is the composited window bounding-box sub-region, so the
+        // browser reports mouse coordinates relative to the bbox — but the host expects
+        // DESKTOP-absolute coordinates. The compositor draws each window at `canvas = desktop -
+        // bbox_origin`; the inverse must be applied to outgoing pointer coords or clicks land at
+        // the wrong desktop point (and miss any window not at desktop (0,0)). `bbox_origin` is
+        // (0,0) for normal output-mapped / non-RAIL sessions, so this is a no-op there.
+        let inputs = if ox != 0 || oy != 0 {
+            let shifted = transaction.into_iter().map(|op| match op {
+                ironrdp::input::Operation::MouseMove(p) => {
+                    ironrdp::input::Operation::MouseMove(ironrdp::input::MousePosition {
+                        x: u16::try_from((i32::from(p.x) + ox).clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX),
+                        y: u16::try_from((i32::from(p.y) + oy).clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX),
+                    })
+                }
+                other => other,
+            });
+            self.input_database.borrow_mut().apply(shifted)
+        } else {
+            self.input_database.borrow_mut().apply(transaction)
+        };
         self.h_send_inputs(inputs)
     }
 
@@ -1724,11 +2330,13 @@ impl iron_remote_desktop::Session for Session {
 
                 return Ok(JsValue::NULL);
             };
-            // Return path for out-of-band AVC decode: JS hands back RGBA for a region
-            // it decoded via WebCodecs. Re-enters the loop as a Graphics region and is
-            // blitted to the canvas by the existing `RdpInputEvent::Graphics` arm.
+            // Return path for out-of-band AVC decode: JS hands back RGBA for ONE region rect it
+            // decoded via WebCodecs, in SURFACE coordinates. Re-enters the loop as an
+            // `RdpInputEvent::AvcRegion`, which composites it into `surface_id`'s buffer through
+            // the normal per-surface path (so the compositor scales/positions it for HiDef RAIL).
             |on_avc_decoded: JsValue| {
                 let obj = into_object(on_avc_decoded)?;
+                let surface_id = get_u32(&obj, "surfaceId")? as u16;
                 let frame_id = get_u32(&obj, "frameId")?;
                 let x = get_u32(&obj, "x")?;
                 let y = get_u32(&obj, "y")?;
@@ -1739,7 +2347,11 @@ impl iron_remote_desktop::Session for Session {
                 let data = js_sys::Uint8Array::new(&data_val).to_vec();
 
                 self.input_events_tx
-                    .unbounded_send(RdpInputEvent::AvcRegion(GraphicsRegion { x, y, width, height, data }, frame_id))
+                    .unbounded_send(RdpInputEvent::AvcRegion {
+                        surface_id,
+                        region: GraphicsRegion { x, y, width, height, data, preserve_alpha: false },
+                        frame_id,
+                    })
                     .context("send AVC-decoded region")
                     .map_err(IronError::from)?;
 
@@ -1766,6 +2378,57 @@ impl iron_remote_desktop::Session for Session {
                 .with_kind(IronErrorKind::General),
         )
     }
+}
+
+/// Force the eGFX graphics handler to run a compositing pass now, outside a server
+/// `EndFrame`. Called after RAIL Window List orders change a window position so a HiDef
+/// RemoteApp window whose position arrived after its last paint is composited immediately
+/// (see [`GraphicsPipelineClient::present_now`]). Reaches the client through DRDYNVC, the
+/// only exposed mutable path. Best-effort: silently no-ops if the graphics channel is down.
+fn force_gfx_present(active_stage: &mut ActiveStage) {
+    let Some(gfx_channel_id) = active_stage
+        .get_dvc::<GraphicsPipelineClient>()
+        .map(|dvc| dvc.channel_id())
+    else {
+        return;
+    };
+    let Some(drdynvc) = active_stage.get_svc_processor_mut::<DrdynvcClient>() else {
+        return;
+    };
+    let Some(mut chan) = drdynvc.get_dvc_by_channel_id_mut::<GraphicsPipelineClient>(gfx_channel_id) else {
+        return;
+    };
+    chan.processor_mut().present_now();
+}
+
+/// Composite an out-of-band-decoded AVC region (RGBA, already cropped to one valid region rect
+/// in SURFACE coords) into its surface via the eGFX graphics handler, exactly like a
+/// synchronously-decoded codec region. The caller runs [`force_gfx_present`] afterwards to flush
+/// it. Reaches the client through DRDYNVC (the only exposed mutable path); no-ops if the graphics
+/// channel is down.
+fn deliver_avc_region(
+    active_stage: &mut ActiveStage,
+    surface_id: u16,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
+) {
+    let Some(gfx_channel_id) = active_stage
+        .get_dvc::<GraphicsPipelineClient>()
+        .map(|dvc| dvc.channel_id())
+    else {
+        return;
+    };
+    let Some(drdynvc) = active_stage.get_svc_processor_mut::<DrdynvcClient>() else {
+        return;
+    };
+    let Some(mut chan) = drdynvc.get_dvc_by_channel_id_mut::<GraphicsPipelineClient>(gfx_channel_id) else {
+        return;
+    };
+    chan.processor_mut()
+        .deliver_avc_region(surface_id, x, y, width, height, data);
 }
 
 /// Encode a deferred graphics `FrameAcknowledge` for a now-presented AVC frame into
@@ -2020,7 +2683,10 @@ fn parse_monitors(value: &JsValue) -> Vec<GccMonitor> {
         let height = read_f64(&entry, "height").map(to_i32).unwrap_or(0);
 
         if width <= 0 || height <= 0 {
-            warn!(width, height, "`monitors` extension: skipping monitor with non-positive size");
+            warn!(
+                width,
+                height, "`monitors` extension: skipping monitor with non-positive size"
+            );
             continue;
         }
 
@@ -2107,6 +2773,114 @@ fn parse_remote_app(value: &JsValue) -> Option<connector::RailConfig> {
 /// Log a decoded RAIL Window List order at INFO so the RemoteApp window
 /// lifecycle is observable in the browser console. This is the seam a future
 /// local-window renderer would hook to composite real windows.
+/// `WS_EX_NOACTIVATE` (win32 extended window style): a window that must not be activated —
+/// used by Windows for every non-interactive RAIL artifact (drop shadows, drag markers,
+/// slivers) and the always-topmost 0x0 phantom. It is the single bit that cleanly separates
+/// real RemoteApp windows and interactive popups (dropdowns are `WS_EX_TOOLWINDOW` but NOT
+/// NOACTIVATE) from that chrome. Presentation and the RAIL-position feed both gate on it (per
+/// the proxy's deterministic ghost/phantom trace), so shadows/markers/phantoms are neither
+/// composited nor allowed to sit topmost eating clicks.
+const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+
+/// `WS_POPUP` + `WS_EX_TOOLWINDOW`: the full-desktop shell window and the 0×0 helper chrome are
+/// uniquely this pair (popup, tool-window, no caption); a real app window — even maximized — is
+/// `WS_CAPTION`/overlapped (neither bit). Dropping this class filters the shell WITHOUT a size
+/// heuristic, so a legitimately maximized app is still presented (per the proxy's style trace).
+/// (Tooltips/menus are popup+toolwindow too — fine to drop as transient chrome.)
+const WS_POPUP: u32 = 0x8000_0000;
+const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+
+/// Accumulated geometry of one RAIL window, merged across partial Window List updates (each
+/// order carries only the fields whose bit is set). Coordinates are virtual-desktop pixels and
+/// may be negative in RAIL, hence `i32`.
+#[derive(Default, Clone, Copy)]
+struct RailWindowGeom {
+    /// `windowOffset`: top-left of the whole window (incl. non-client frame).
+    window_offset: Option<(i32, i32)>,
+    /// `windowSize`: full window size (incl. frame).
+    window_size: Option<(i32, i32)>,
+    /// `visibleOffset`: top-left of the visible (on-desktop) region — preferred origin.
+    visible_offset: Option<(i32, i32)>,
+    /// `clientAreaSize`: client-area size — size fallback when `windowSize` is absent.
+    client_area_size: Option<(i32, i32)>,
+    /// `extendedStyle`: win32 `WS_EX_*` bits — checked for `WS_EX_NOACTIVATE` to drop chrome.
+    extended_style: Option<u32>,
+    /// `style`: win32 `WS_*` bits — checked for `WS_POPUP` (shell/helper class). NOT gated on
+    /// `WS_VISIBLE`: the wire toggles it as noise on live windows (see `is_presentable`).
+    style: Option<u32>,
+}
+
+impl RailWindowGeom {
+    /// Merge the present fields of a Window List order onto the tracked geometry.
+    /// Absent fields (partial update) leave the previously-tracked value intact.
+    fn merge(&mut self, state: &WindowState) {
+        if let Some(p) = state.window_offset {
+            self.window_offset = Some((p.x, p.y));
+        }
+        if let Some(s) = state.window_size {
+            self.window_size = Some((s.width, s.height));
+        }
+        if let Some(p) = state.visible_offset {
+            self.visible_offset = Some((p.x, p.y));
+        }
+        if let Some(s) = state.client_area_size {
+            self.client_area_size = Some((s.width, s.height));
+        }
+        if let Some(ex) = state.extended_style {
+            self.extended_style = Some(ex);
+        }
+        if let Some(st) = state.style {
+            self.style = Some(st);
+        }
+    }
+
+    /// Whether this is a real, presentable RemoteApp window (vs. non-interactive chrome or the
+    /// 0x0 phantom): it must have a non-zero size AND not be `WS_EX_NOACTIVATE`. Interactive
+    /// tool-window popups (e.g. dropdowns) are NOT NOACTIVATE, so they pass. Both the compositor
+    /// feed and (future) hit-testing gate on this — the proxy's deterministic ghost filter.
+    fn is_presentable(&self) -> bool {
+        // DELIBERATELY does NOT gate on WS_VISIBLE or showState. The proxy proved on the wire
+        // (session 73890406) that a live RemoteApp window's WS_VISIBLE toggles constantly as noise
+        // (0x14cf0000 <-> 0x000b0000, decoupled from any real state change — no size change, no
+        // desktop order nearby) and that showState is equally unreliable. Honoring either makes the
+        // window blink out of the presentable set mid-session (and, with the full-screen
+        // secure-desktop present, false-fire to a full desktop with no CAD at all). The two events
+        // that actually matter are handled elsewhere: DeleteWindow removes a window, and the RAIL
+        // Non-Monitored Desktop order (DESKTOP_NONE) is the ONLY unambiguous Ctrl+Alt+Del / lock /
+        // UAC signal (see the compositor's secure-desktop path). Here we classify STRUCTURE only.
+        //
+        // Full-desktop shell + 0×0 helpers are uniquely WS_POPUP && WS_EX_TOOLWINDOW; drop that
+        // class (a maximized app is WS_CAPTION/overlapped, so it stays). No size heuristic needed.
+        let popup = self.style.is_some_and(|s| s & WS_POPUP != 0);
+        let toolwin = self.extended_style.is_some_and(|ex| ex & WS_EX_TOOLWINDOW != 0);
+        if popup && toolwin {
+            return false;
+        }
+        if self.extended_style.is_some_and(|ex| ex & WS_EX_NOACTIVATE != 0) {
+            return false;
+        }
+        matches!(self.window_size.or(self.client_area_size), Some((w, h)) if w > 0 && h > 0)
+    }
+
+    /// Compute the presentation rect `(x, y, width, height)` for the crop. Prefers
+    /// `window_offset` (the full window frame, which is what `window_size` measures) and
+    /// falls back to `visible_offset` only when no window offset has ever arrived. Returns
+    /// `None` until a usable origin and a non-degenerate size are both known.
+    ///
+    /// The preference order matches the live Path A compositor. It used to be inverted here,
+    /// which mattered because `visible_offset` was mis-parsed for any order carrying
+    /// `WND_RECTS` (see `orders.rs`) -- this helper reached for the corrupt value first.
+    fn rect(&self) -> Option<(i32, i32, u32, u32)> {
+        let (ox, oy) = self.window_offset.or(self.visible_offset)?;
+        let (sw, sh) = self.window_size.or(self.client_area_size)?;
+        if sw <= 0 || sh <= 0 {
+            return None;
+        }
+        #[expect(clippy::cast_sign_loss, reason = "sw/sh are > 0 per the guard above")]
+        Some((ox, oy, sw as u32, sh as u32))
+    }
+}
+
 fn log_rail_window_order(order: &WindowOrder) {
     match order {
         WindowOrder::CreateWindow { window_id, state } => {
@@ -2144,10 +2918,17 @@ fn log_rail_window_order(order: &WindowOrder) {
             );
         }
         WindowOrder::Desktop {
+            non_monitored,
             active_window_id,
             window_ids,
         } => {
-            info!(active = ?active_window_id, count = window_ids.len(), "RAIL: monitored desktop / z-order");
+            debug!(
+                target: "rail_diag",
+                non_monitored,
+                active = ?active_window_id,
+                count = window_ids.len(),
+                "RAIL: desktop order (non_monitored=secure desktop / CAD)"
+            );
         }
     }
 }

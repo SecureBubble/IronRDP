@@ -18,7 +18,10 @@ use ironrdp_core::ReadCursor;
 
 /// `TS_STANDARD` in a drawing-order `controlFlags` (MS-RDPEGDI §2.2.2.2.1.1.2).
 const CONTROL_FLAG_STANDARD: u8 = 0x01;
-/// `TS_SECONDARY`.
+/// `TS_SECONDARY`. NOT used to classify altsec orders (see [`WindowOrder::decode_one`]); it
+/// is part of the on-wire window-order control byte (`0x2E`) and is referenced by the tests
+/// that build realistic orders.
+#[allow(dead_code)]
 const CONTROL_FLAG_SECONDARY: u8 = 0x02;
 /// The alternate-secondary order type carrying window information.
 const ALTSEC_WINDOW: u8 = 0x0B;
@@ -45,10 +48,22 @@ bitflags! {
         const WND_RECTS = 0x0000_0100;
         const VIS_OFFSET = 0x0000_1000;
         const VISIBILITY = 0x0000_0200;
+        // Resize margins (§2.2.1.3.1.2.1). Each carries TWO u16s (left/right, top/bottom)
+        // and sits between CLIENT_AREA_SIZE and RP_CONTENT. Not surfaced, but MUST be
+        // consumed: skipping them desyncs every later field, not just one.
+        const RESIZE_MARGIN_X = 0x0000_0080;
+        const RESIZE_MARGIN_Y = 0x0800_0000;
         // Class / state bits.
         const TYPE_WINDOW = 0x0100_0000;
         const TYPE_NOTIFY = 0x0200_0000;
         const TYPE_DESKTOP = 0x0400_0000;
+        // Desktop-order sub-fields (only meaningful with TYPE_DESKTOP).
+        // NONE = the input desktop switched to one RAIL is NOT monitoring (Ctrl+Alt+Del /
+        // lock / UAC secure desktop): no window fields follow and the client must stop
+        // presenting RAIL windows and show the primary surface full-screen.
+        const DESKTOP_NONE = 0x0000_0001;
+        const DESKTOP_ZORDER = 0x0000_0010;
+        const DESKTOP_ACTIVEWND = 0x0000_0020;
         const STATE_NEW = 0x1000_0000;
         const STATE_DELETED = 0x2000_0000;
         const ICON = 0x4000_0000;
@@ -105,9 +120,13 @@ pub enum WindowOrder {
         notify_id: u32,
         deleted: bool,
     },
-    /// A monitored-desktop / z-order order (or non-monitored when `window_ids`
-    /// is empty and `active_window_id` is `None`).
+    /// A desktop-information order. `non_monitored` is set for a Non-Monitored Desktop order
+    /// (`WINDOW_ORDER_FIELD_DESKTOP_NONE`): the input desktop switched to one RAIL isn't tracking
+    /// (Ctrl+Alt+Del / lock / UAC secure desktop), so no window/z-order fields are present and the
+    /// client must present the primary surface full-screen instead of clipping to RAIL windows.
+    /// Otherwise it's an Actively Monitored Desktop order carrying an active window + z-order list.
     Desktop {
+        non_monitored: bool,
         active_window_id: Option<u32>,
         window_ids: Vec<u32>,
     },
@@ -146,9 +165,16 @@ impl WindowOrder {
         let start = cursor.len(); // remaining bytes at the controlFlags byte
         let control_flags = cursor.read_u8();
 
-        // Only alternate-secondary orders (TS_STANDARD clear) of type WINDOW are
-        // handled; everything else stops the walk.
-        if control_flags & CONTROL_FLAG_STANDARD != 0 || control_flags & CONTROL_FLAG_SECONDARY != 0 {
+        // An order is *alternate secondary* iff TS_STANDARD is clear — that ALONE selects the
+        // altsec class; the TS_SECONDARY bit is NOT part of the test. This matches the RDP
+        // server encoder and FreeRDP's own dispatch (`update_recv_order`, orders.c:
+        // `if (!(controlFlags & ORDER_STANDARD)) -> altsec`). Real window orders on the wire
+        // carry controlFlags = `ORDER_SECONDARY | (ORDER_TYPE_WINDOW << 2)` = 0x2E — i.e. the
+        // SECONDARY bit IS set. A previous version also rejected SECONDARY, so every
+        // server-encoded HiDef RAIL window order was silently dropped (no positions -> the
+        // RemoteApp froze on the desktop frame). Only TS_STANDARD-set (primary/secondary)
+        // orders stop the walk.
+        if control_flags & CONTROL_FLAG_STANDARD != 0 {
             return None;
         }
         let order_type = control_flags >> 2;
@@ -238,6 +264,15 @@ impl WindowOrder {
         if flags.contains(WindowFieldFlags::CLIENT_AREA_SIZE) {
             state.client_area_size = read_size(cursor, end);
         }
+        // resizeMarginLeft/Right and resizeMarginTop/Bottom (u16 each). Consumed, not surfaced.
+        if flags.contains(WindowFieldFlags::RESIZE_MARGIN_X) {
+            read_u16_bounded(cursor, end);
+            read_u16_bounded(cursor, end);
+        }
+        if flags.contains(WindowFieldFlags::RESIZE_MARGIN_Y) {
+            read_u16_bounded(cursor, end);
+            read_u16_bounded(cursor, end);
+        }
         if flags.contains(WindowFieldFlags::RP_CONTENT) {
             read_u8_bounded(cursor, end);
         }
@@ -253,29 +288,52 @@ impl WindowOrder {
         if flags.contains(WindowFieldFlags::WND_SIZE) {
             state.window_size = read_size(cursor, end);
         }
-        // WND_RECTS / VIS_OFFSET / VISIBILITY follow but are not surfaced here;
-        // the caller advances past them via orderSize.
+        // WND_RECTS is VARIABLE length (numWindowRects u16 + n x RECT_16) and sits BETWEEN
+        // WND_SIZE and VIS_OFFSET. It is not surfaced, but it must still be consumed: reading
+        // VIS_OFFSET off the top of the rect array yields (count | left << 16, top | right << 16)
+        // -- e.g. ~(6_553_601, 73_663_176) for one rect -- which clips any window to nothing.
+        if flags.contains(WindowFieldFlags::WND_RECTS) {
+            skip_rect16_array(cursor, end);
+        }
         if flags.contains(WindowFieldFlags::VIS_OFFSET) {
             state.visible_offset = read_point(cursor, end);
         }
+        // VISIBILITY (numVisibilityRects u16 + n x RECT_16) is the last field; nothing follows
+        // it that we read, and the caller re-syncs on orderSize, so it needs no explicit skip.
 
         state
     }
 
     fn decode_desktop(cursor: &mut ReadCursor<'_>, flags: WindowFieldFlags, end: usize) -> WindowOrder {
-        // Non-monitored desktop carries no fields; monitored desktop carries an
-        // ActiveWindowId and a z-ordered WindowIds array. We surface both.
-        let active_window_id = read_u32_bounded(cursor, end).filter(|&id| id != 0);
-        let num = read_u8_bounded(cursor, end).unwrap_or(0);
+        // Non-Monitored Desktop (DESKTOP_NONE): the secure-desktop / CAD signal. It carries NO
+        // body fields, so surface the flag and stop — this is what tells the compositor to present
+        // the primary surface full-screen instead of clipping to the (now-irrelevant) RAIL windows.
+        if flags.contains(WindowFieldFlags::DESKTOP_NONE) {
+            return WindowOrder::Desktop {
+                non_monitored: true,
+                active_window_id: None,
+                window_ids: Vec::new(),
+            };
+        }
+        // Actively Monitored Desktop: ActiveWindowId (if ACTIVEWND) then a z-ordered WindowIds
+        // array (if ZORDER). Each is gated by its own field flag per MS-RDPERP §2.2.1.3.3.2.1.
+        let active_window_id = if flags.contains(WindowFieldFlags::DESKTOP_ACTIVEWND) {
+            read_u32_bounded(cursor, end).filter(|&id| id != 0)
+        } else {
+            None
+        };
         let mut window_ids = Vec::new();
-        for _ in 0..num {
-            match read_u32_bounded(cursor, end) {
-                Some(id) => window_ids.push(id),
-                None => break,
+        if flags.contains(WindowFieldFlags::DESKTOP_ZORDER) {
+            let num = read_u8_bounded(cursor, end).unwrap_or(0);
+            for _ in 0..num {
+                match read_u32_bounded(cursor, end) {
+                    Some(id) => window_ids.push(id),
+                    None => break,
+                }
             }
         }
-        let _ = flags;
         WindowOrder::Desktop {
+            non_monitored: false,
             active_window_id,
             window_ids,
         }
@@ -287,6 +345,26 @@ fn read_u8_bounded(cursor: &mut ReadCursor<'_>, end: usize) -> Option<u8> {
         return None;
     }
     Some(cursor.read_u8())
+}
+
+fn read_u16_bounded(cursor: &mut ReadCursor<'_>, end: usize) -> Option<u16> {
+    if cursor.len().checked_sub(2)? < end {
+        return None;
+    }
+    Some(cursor.read_u16())
+}
+
+/// Consume a `numRects` (u16) count followed by that many `RECT_16` (4 x u16 = 8 bytes).
+/// Stops early rather than running past the order boundary.
+fn skip_rect16_array(cursor: &mut ReadCursor<'_>, end: usize) -> Option<u16> {
+    let count = read_u16_bounded(cursor, end)?;
+    for _ in 0..count {
+        if cursor.len().checked_sub(8)? < end {
+            return None;
+        }
+        cursor.advance(8);
+    }
+    Some(count)
 }
 
 fn read_u32_bounded(cursor: &mut ReadCursor<'_>, end: usize) -> Option<u32> {
@@ -338,8 +416,11 @@ mod tests {
     use super::*;
 
     // Build one ALTSEC window order: controlFlags(WINDOW) + orderSize + fieldFlags + body.
+    // Matches the real RDP-server / FreeRDP encoding: `ORDER_SECONDARY | (ORDER_TYPE_WINDOW <<
+    // 2)` = 0x2E — TS_STANDARD clear (=> altsec), TS_SECONDARY SET. Regression guard for the
+    // bug where the decoder rejected the SECONDARY bit and dropped every window order.
     fn window_order(field_flags: u32, body: &[u8]) -> Vec<u8> {
-        let control_flags = ALTSEC_WINDOW << 2; // TS_STANDARD/SECONDARY clear
+        let control_flags = CONTROL_FLAG_SECONDARY | (ALTSEC_WINDOW << 2); // 0x2E, as on the wire
         let order_size = u16::try_from(1 + 2 + 4 + body.len()).unwrap();
         let mut v = Vec::new();
         v.push(control_flags);
@@ -395,6 +476,210 @@ mod tests {
                 width: 1024,
                 height: 768
             })
+        );
+    }
+
+    /// Real-world File Explorer CREATE order captured off the wire by the proxy:
+    /// fieldFlags = 0x1108df1e (TYPE_WINDOW | STATE_NEW | OWNER | STYLE | SHOW | TITLE |
+    /// CLIENT_AREA_OFFSET | ROOT_PARENT | WND_OFFSET | WND_CLIENT_DELTA | WND_SIZE |
+    /// WND_RECTS | VIS_OFFSET | VISIBILITY). This exercises the FULL field set — including
+    /// the variable-length WND_RECTS / VISIBILITY arrays that sit before/around VIS_OFFSET —
+    /// which the simpler test above does not. Confirms `window_offset` is extracted from a
+    /// realistic HiDef RemoteApp window order (win 0x10120 -> (292,241), size 1030x487).
+    #[test]
+    fn create_window_realworld_full_field_set() {
+        const FIELD_FLAGS: u32 = 0x1108_df1e;
+        // Sanity: our flag bits decode to exactly the field set the proxy logged.
+        let f = WindowFieldFlags::from_bits_retain(FIELD_FLAGS);
+        assert!(f.contains(WindowFieldFlags::TYPE_WINDOW | WindowFieldFlags::STATE_NEW));
+        assert!(f.contains(WindowFieldFlags::WND_OFFSET | WindowFieldFlags::WND_SIZE));
+        assert!(f.contains(WindowFieldFlags::WND_RECTS | WindowFieldFlags::VISIBILITY | WindowFieldFlags::VIS_OFFSET));
+        // 0x1108df1e sets neither CLIENT_AREA_SIZE (0x10000), RP_CONTENT (0x20000), ROOT_PARENT
+        // (0x40000) nor RESIZE_MARGIN (0x80/0x08000000). Bit 19 (0x80000) is ENFORCE_SERVER_ZORDER,
+        // which is a flag-only field carrying no body bytes (FreeRDP window.c never reads it).
+        assert!(!f.contains(WindowFieldFlags::CLIENT_AREA_SIZE));
+
+        // Body in MS-RDPERP 2.2.1.3.1.2.1 spec field order.
+        let title: Vec<u8> = "Sales".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0001_0120u32.to_le_bytes()); // windowId
+        body.extend_from_slice(&0u32.to_le_bytes()); // OWNER: ownerWindowId
+        body.extend_from_slice(&0x1600_0000u32.to_le_bytes()); // STYLE: style
+        body.extend_from_slice(&0x0000_0100u32.to_le_bytes()); // STYLE: extendedStyle
+        body.push(5); // SHOW: showState
+        body.extend_from_slice(&u16::try_from(title.len()).unwrap().to_le_bytes()); // TITLE: CbString
+        body.extend_from_slice(&title); // TITLE: string
+        body.extend_from_slice(&292i32.to_le_bytes()); // CLIENT_AREA_OFFSET: X
+        body.extend_from_slice(&268i32.to_le_bytes()); // CLIENT_AREA_OFFSET: Y
+        // (no ROOT_PARENT / RP_CONTENT / RESIZE_MARGIN — not set in 0x1108df1e)
+        body.extend_from_slice(&292i32.to_le_bytes()); // WND_OFFSET: X  <-- target
+        body.extend_from_slice(&241i32.to_le_bytes()); // WND_OFFSET: Y  <-- target
+        body.extend_from_slice(&0i32.to_le_bytes()); // WND_CLIENT_DELTA: X
+        body.extend_from_slice(&27i32.to_le_bytes()); // WND_CLIENT_DELTA: Y
+        body.extend_from_slice(&1030i32.to_le_bytes()); // WND_SIZE: width
+        body.extend_from_slice(&487i32.to_le_bytes()); // WND_SIZE: height
+        body.extend_from_slice(&1u16.to_le_bytes()); // WND_RECTS: numRects
+        for v in [292u16, 241, 1322, 728] {
+            body.extend_from_slice(&v.to_le_bytes()); // one rect: L,T,R,B
+        }
+        body.extend_from_slice(&292i32.to_le_bytes()); // VIS_OFFSET: X
+        body.extend_from_slice(&241i32.to_le_bytes()); // VIS_OFFSET: Y
+        body.extend_from_slice(&1u16.to_le_bytes()); // VISIBILITY: numRects
+        for v in [292u16, 241, 1322, 728] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let update = orders_update(&[window_order(FIELD_FLAGS, &body)]);
+        let orders = WindowOrder::decode_orders_update(&update);
+
+        assert_eq!(orders.len(), 1, "expected exactly one CreateWindow");
+        let WindowOrder::CreateWindow { window_id, state } = &orders[0] else {
+            panic!("expected CreateWindow, got {:?}", orders[0]);
+        };
+        assert_eq!(*window_id, 0x1_0120);
+        assert_eq!(
+            state.window_offset,
+            Some(Point { x: 292, y: 241 }),
+            "window_offset must decode from the real full field set"
+        );
+        assert_eq!(
+            state.window_size,
+            Some(Size {
+                width: 1030,
+                height: 487
+            })
+        );
+        // The field that regressed: VIS_OFFSET sits AFTER the variable-length WND_RECTS array.
+        // Reading it without consuming the rects yields (numRects | left << 16, top | right << 16)
+        // = (0x0124_0001, 0x052A_00F1) = (19_136_513, 86_638_833) here.
+        assert_eq!(
+            state.visible_offset,
+            Some(Point { x: 292, y: 241 }),
+            "visible_offset must be read AFTER the WND_RECTS array, not off the top of it"
+        );
+    }
+
+    /// Ground truth handed over by the proxy from a live AVD RemoteApp session (2026-08-19):
+    /// the dominant CREATE fieldFlags on AVD is 0x1100df1e, WND_RECTS is present in essentially
+    /// every order with numWindowRects = 1, and `visibleOffset == windowOffset` in every sample
+    /// captured (no >=6-digit offset appeared anywhere in the scan). That equality is the
+    /// assertion, and it is exactly what the pre-fix parser could not produce.
+    #[test]
+    fn avd_capture_visible_offset_equals_window_offset() {
+        const FIELD_FLAGS: u32 = 0x1100_df1e;
+        let f = WindowFieldFlags::from_bits_retain(FIELD_FLAGS);
+        assert!(f.contains(WindowFieldFlags::WND_RECTS | WindowFieldFlags::VIS_OFFSET | WindowFieldFlags::VISIBILITY));
+        // The proxy scanned 17 distinct fieldFlags values in the capture; none set either
+        // resize-margin bit, so those stay correct-but-unexercised on AVD.
+        assert!(!f.intersects(WindowFieldFlags::RESIZE_MARGIN_X | WindowFieldFlags::RESIZE_MARGIN_Y));
+
+        for (window_id, ox, oy, w, h) in [
+            (0x0002_0100u32, 0i32, 0i32, 1024i32, 768i32),
+            (0x0002_0200, 1304, 915, 600, 400),
+            (0x0002_0300, 1455, 293, 820, 610),
+        ] {
+            let title: Vec<u8> = "App".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            let mut body = Vec::new();
+            body.extend_from_slice(&window_id.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes()); // OWNER
+            body.extend_from_slice(&0x1600_0000u32.to_le_bytes()); // STYLE
+            body.extend_from_slice(&0u32.to_le_bytes()); // extendedStyle
+            body.push(5); // SHOW
+            body.extend_from_slice(&u16::try_from(title.len()).unwrap().to_le_bytes());
+            body.extend_from_slice(&title);
+            body.extend_from_slice(&ox.to_le_bytes()); // CLIENT_AREA_OFFSET X
+            body.extend_from_slice(&oy.to_le_bytes()); // CLIENT_AREA_OFFSET Y
+            body.extend_from_slice(&ox.to_le_bytes()); // WND_OFFSET X
+            body.extend_from_slice(&oy.to_le_bytes()); // WND_OFFSET Y
+            body.extend_from_slice(&0i32.to_le_bytes()); // WND_CLIENT_DELTA X
+            body.extend_from_slice(&0i32.to_le_bytes()); // WND_CLIENT_DELTA Y
+            body.extend_from_slice(&w.to_le_bytes()); // WND_SIZE
+            body.extend_from_slice(&h.to_le_bytes());
+            body.extend_from_slice(&1u16.to_le_bytes()); // WND_RECTS: numWindowRects = 1
+            for v in [
+                u16::try_from(ox).unwrap(),
+                u16::try_from(oy).unwrap(),
+                u16::try_from(ox + w).unwrap(),
+                u16::try_from(oy + h).unwrap(),
+            ] {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            body.extend_from_slice(&ox.to_le_bytes()); // VIS_OFFSET X
+            body.extend_from_slice(&oy.to_le_bytes()); // VIS_OFFSET Y
+            body.extend_from_slice(&0u16.to_le_bytes()); // VISIBILITY: numVisibilityRects = 0
+
+            let update = orders_update(&[window_order(FIELD_FLAGS, &body)]);
+            let orders = WindowOrder::decode_orders_update(&update);
+            let WindowOrder::CreateWindow { state, .. } = &orders[0] else {
+                panic!("expected CreateWindow, got {:?}", orders[0]);
+            };
+            assert_eq!(state.window_offset, Some(Point { x: ox, y: oy }));
+            assert_eq!(
+                state.visible_offset, state.window_offset,
+                "AVD ground truth: visibleOffset == windowOffset for window {window_id:#x}"
+            );
+        }
+    }
+
+    /// No host in this deployment sets the resize-margin bits, so this is the only coverage they
+    /// get. It is worth having: unlike the VIS_OFFSET bug (one corrupt field, no desync, because
+    /// it is the last field we read), an unconsumed margin sits EARLY and shifts every later
+    /// field -- offsets and sizes included.
+    #[test]
+    fn resize_margins_are_consumed_so_later_fields_stay_aligned() {
+        const FIELD_FLAGS: u32 = 0x1000_0000 // STATE_NEW
+            | 0x0100_0000 // TYPE_WINDOW
+            | 0x0001_0000 // CLIENT_AREA_SIZE
+            | 0x0000_0080 // RESIZE_MARGIN_X
+            | 0x0800_0000 // RESIZE_MARGIN_Y
+            | 0x0000_0800 // WND_OFFSET
+            | 0x0000_0400 // WND_SIZE
+            | 0x0000_0100 // WND_RECTS
+            | 0x0000_1000; // VIS_OFFSET
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x55u32.to_le_bytes()); // windowId
+        body.extend_from_slice(&800i32.to_le_bytes()); // CLIENT_AREA_SIZE: width
+        body.extend_from_slice(&600i32.to_le_bytes()); // CLIENT_AREA_SIZE: height
+        body.extend_from_slice(&8u16.to_le_bytes()); // RESIZE_MARGIN_X: left
+        body.extend_from_slice(&8u16.to_le_bytes()); // RESIZE_MARGIN_X: right
+        body.extend_from_slice(&4u16.to_le_bytes()); // RESIZE_MARGIN_Y: top
+        body.extend_from_slice(&4u16.to_le_bytes()); // RESIZE_MARGIN_Y: bottom
+        body.extend_from_slice(&70i32.to_le_bytes()); // WND_OFFSET: X
+        body.extend_from_slice(&90i32.to_le_bytes()); // WND_OFFSET: Y
+        body.extend_from_slice(&816i32.to_le_bytes()); // WND_SIZE: width
+        body.extend_from_slice(&608i32.to_le_bytes()); // WND_SIZE: height
+        body.extend_from_slice(&2u16.to_le_bytes()); // WND_RECTS: TWO rects
+        for v in [70u16, 90, 886, 394, 70, 394, 886, 698] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(&70i32.to_le_bytes()); // VIS_OFFSET: X
+        body.extend_from_slice(&90i32.to_le_bytes()); // VIS_OFFSET: Y
+
+        let update = orders_update(&[window_order(FIELD_FLAGS, &body)]);
+        let orders = WindowOrder::decode_orders_update(&update);
+        let WindowOrder::CreateWindow { state, .. } = &orders[0] else {
+            panic!("expected CreateWindow, got {:?}", orders[0]);
+        };
+        assert_eq!(
+            state.client_area_size,
+            Some(Size {
+                width: 800,
+                height: 600
+            })
+        );
+        assert_eq!(state.window_offset, Some(Point { x: 70, y: 90 }));
+        assert_eq!(
+            state.window_size,
+            Some(Size {
+                width: 816,
+                height: 608
+            })
+        );
+        assert_eq!(
+            state.visible_offset,
+            Some(Point { x: 70, y: 90 }),
+            "a multi-rect WND_RECTS array must be skipped by count, not by a fixed size"
         );
     }
 

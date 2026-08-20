@@ -313,13 +313,13 @@ mod tests {
         backend.wave(0, 123, Cow::Borrowed(&[1, 2, 3, 4]));
 
         match rx.try_recv().unwrap() {
-            Some(RdpInputEvent::Sound(SoundBackendMessage::Wave {
+            RdpInputEvent::Sound(SoundBackendMessage::Wave {
                 sample_rate,
                 channels,
                 bits_per_sample,
                 data,
                 ..
-            })) => {
+            }) => {
                 assert_eq!(sample_rate, PLAYBACK_SAMPLE_RATE);
                 assert_eq!(channels, PLAYBACK_CHANNELS);
                 assert_eq!(bits_per_sample, PLAYBACK_BITS_PER_SAMPLE);
@@ -333,7 +333,7 @@ mod tests {
     fn unknown_format_index_is_dropped() {
         let (mut backend, mut rx) = sound_backend();
         backend.wave(9, 0, Cow::Borrowed(&[1, 2]));
-        assert!(rx.try_recv().unwrap().is_none());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -342,7 +342,7 @@ mod tests {
         backend.close();
         assert!(matches!(
             rx.try_recv().unwrap(),
-            Some(RdpInputEvent::Sound(SoundBackendMessage::Close))
+            RdpInputEvent::Sound(SoundBackendMessage::Close)
         ));
     }
 
@@ -353,11 +353,11 @@ mod tests {
         backend.wave(0, 0, Cow::Borrowed(&[1, 2, 3, 4])); // exactly at budget
         assert!(matches!(
             rx.try_recv().unwrap(),
-            Some(RdpInputEvent::Sound(SoundBackendMessage::Wave { .. }))
+            RdpInputEvent::Sound(SoundBackendMessage::Wave { .. })
         ));
         // The first chunk is still queued (not yet dropped by the event loop), so
         // a second chunk exceeds the 4-byte budget and is dropped.
         backend.wave(0, 0, Cow::Borrowed(&[5, 6, 7, 8]));
-        assert!(rx.try_recv().unwrap().is_none());
+        assert!(rx.try_recv().is_err());
     }
 }

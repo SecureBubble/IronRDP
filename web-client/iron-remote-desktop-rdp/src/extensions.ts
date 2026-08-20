@@ -140,10 +140,12 @@ export function avcDecodeCallback(
     cb: (
         surfaceId: number,
         frameId: number,
-        x: number,
-        y: number,
-        width: number,
-        height: number,
+        originX: number,
+        originY: number,
+        // Flat [x, y, w, h, x, y, w, h, ...] valid region rects in SURFACE coords. The H.264
+        // picture is coded at full surface size; only these sub-rects are valid video (the rest
+        // is YUV(0,0,0) = green padding), so the decoder blits ONLY these.
+        regions: Uint32Array,
         data: Uint8Array,
     ) => void,
 ): Extension {
@@ -151,7 +153,9 @@ export function avcDecodeCallback(
 }
 
 export function onAvcDecoded(params: {
+    surfaceId: number;
     frameId: number;
+    // Region-rect origin in SURFACE coords; the run loop composites into this surface's buffer.
     x: number;
     y: number;
     width: number;
@@ -180,6 +184,54 @@ export function canvasUpdatedCallback(
     cb: (x: number, y: number, width: number, height: number) => void,
 ): Extension {
     return new Extension('canvas_updated_callback', cb as unknown);
+}
+
+/** Unified WebGL present (`?ironwebgl=1`). When registered, the run loop forwards each decoded
+ *  NON-AVC region `(x, y, width, height, rgba)` here instead of painting the 2D canvas — JS uploads
+ *  it into the single surface-0 WebGL texture via `texSubImage2D`. `rgba` is width×height×4 bytes,
+ *  a view into WASM memory valid only for the synchronous call (copy/upload before returning). */
+export function surfacePresentCallback(
+    cb: (x: number, y: number, width: number, height: number, rgba: Uint8Array) => void,
+): Extension {
+    return new Extension('surface_present_callback', cb as unknown);
+}
+
+/** Unified WebGL present (`?ironwebgl=1`) LAYOUT. The run loop calls it whenever the RemoteApp
+ *  presentation layout changes, with `mode` and the app-window rects flattened as
+ *  `[x, y, w, h, ...]` in desktop (== surface) coords. `surfaceW`/`surfaceH` are the eGFX
+ *  surface's real dimensions — the AUTHORITATIVE size for the GPU texture (the DOM canvas is a
+ *  different quantity and using it caused permanent black regions; see `SurfaceRenderer.syncSize`). `mode` mirrors the Rust compositor's three
+ *  present modes: 0 = blank (pre-first-app logon / no app window), 1 = full-screen unclipped (the
+ *  secure desktop — Ctrl+Alt+Del / lock / UAC, which the host paints with no RAIL window of its
+ *  own), 2 = clip to `rects`. Clipping on the GPU is what stops a dragged window leaving a ghost:
+ *  the vacated area simply stops being presented, so nothing has to clear it. Never fires for a
+ *  full desktop session (no Window List orders), so registering it is inert there. */
+export function surfaceLayoutCallback(
+    cb: (mode: number, surfaceW: number, surfaceH: number, rects: Int32Array) => void,
+): Extension {
+    return new Extension('surface_layout_callback', cb as unknown);
+}
+
+/** WebGL GPU copy (`?ironwebgl=1`). An eGFX `SURFACE_TO_SURFACE` screen-to-screen copy: move the
+ *  `width`x`height` block at (`srcX`,`srcY`) to each destination point in `points` (flattened
+ *  `[x, y, ...]`), all in surface coords. This MUST run on the GPU: the host uses this primitive to
+ *  RELOCATE a window rather than re-encode it, and on this path the pixels being moved exist only
+ *  in the GPU surface texture. Doing it from the WASM surface buffer instead copies a hole (black)
+ *  and leaves the originals in place (duplicated content). */
+export function surfaceCopyCallback(
+    cb: (srcX: number, srcY: number, width: number, height: number, points: Int32Array) => void,
+): Extension {
+    return new Extension('surface_copy_callback', cb as unknown);
+}
+
+/** RAIL (RemoteApp) active-window rect notification. The run loop calls it when the
+ *  active top-level window's presentation rect changes, with `(x, y, width, height)` in
+ *  virtual-desktop coordinates (x/y may be negative). The webapp uses it to crop/scale
+ *  the render surface so only the app window fills the viewport — RAIL paints the whole
+ *  desktop surface, leaving the surround stale/unpainted. Never fires for a full desktop
+ *  session (no Window List orders), so registering it is inert there. */
+export function railWindowCallback(cb: (x: number, y: number, width: number, height: number) => void): Extension {
+    return new Extension('rail_window_callback', cb as unknown);
 }
 
 /** Session watermark forwarded to the GPU AVC draw path so it can overdraw the tile

@@ -42,11 +42,25 @@ impl Canvas {
         for pixel in buffer.chunks_exact_mut(4) {
             pixel[3] = 0xFF;
         }
+        self.put_region(buffer, region)
+    }
 
+    /// Blits a dirty region WITHOUT forcing alpha opaque, so the per-pixel alpha that eGFX
+    /// ALPHA decode wrote into the surface reaches the canvas. Used only for window-mapped
+    /// (HiDef RAIL) surfaces, whose window edges / rounded corners / shadows carry real
+    /// transparency. Opaque app content is unaffected — its alpha is already 0xFF — so this
+    /// differs from [`Self::draw`] only at translucent pixels. The desktop/output present path
+    /// keeps `draw` (force-opaque) unchanged.
+    pub(crate) fn draw_preserve_alpha(&self, buffer: &[u8], region: InclusiveRectangle) -> anyhow::Result<()> {
+        self.put_region(buffer, region)
+    }
+
+    /// Shared `put_image_data` blit backing both present paths (opaque and alpha-preserving).
+    fn put_region(&self, buffer: &[u8], region: InclusiveRectangle) -> anyhow::Result<()> {
         #[cfg(target_arch = "wasm32")]
         {
             let image = ImageData::new_with_u8_clamped_array_and_sh(
-                Clamped(&*buffer),
+                Clamped(buffer),
                 u32::from(region.width()),
                 u32::from(region.height()),
             )
@@ -61,7 +75,6 @@ impl Canvas {
             unimplemented!("web canvas is only available on wasm32")
         }
     }
-
 }
 
 /// Acquires the canvas 2D context (wasm only; panics on other targets).

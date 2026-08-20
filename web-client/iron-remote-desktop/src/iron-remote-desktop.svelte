@@ -304,6 +304,18 @@
         remoteDesktopService.setCanvas(canvas);
         remoteDesktopService.setOnCanvasResized(canvasResized);
 
+        // Robust re-fit: whenever the canvas BACKING STORE (width/height attributes)
+        // changes — e.g. HiDef RAIL resizing the canvas to a per-window surface via the
+        // wasm client — re-run the current scale so the viewport fit recomputes. This
+        // does not depend on the wasm canvas-resized callback firing; a MutationObserver
+        // on the attributes catches every backing-store change directly.
+        try {
+            const backingStoreObserver = new MutationObserver(() => scaleSession(scale || 'fit'));
+            backingStoreObserver.observe(canvas, { attributes: true, attributeFilter: ['width', 'height'] });
+        } catch (e) {
+            loggingService.error(`Failed to observe canvas backing-store size: ${e}`);
+        }
+
         initListeners();
     }
 
