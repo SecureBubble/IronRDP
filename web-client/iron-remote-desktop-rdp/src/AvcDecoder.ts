@@ -96,7 +96,7 @@ interface MainSurface {
     /** Monotonic per-surface chunk timestamp; also the `geom` map key. */
     timestamp: number;
     /** decode-time metadata keyed by chunk timestamp (matched on decoder output). */
-    geom: Map<number, { frameId: number; rects: RegionRect[] }>;
+    geom: Map<number, { frameId: number; rects: RegionRect[]; originX: number; originY: number }>;
 }
 
 export class AvcDecoder {
@@ -107,6 +107,8 @@ export class AvcDecoder {
     private warnedUnsupported = false;
     /** Passive multi-monitor presenter notification (source-canvas pixel coords). Optional. */
     private canvasUpdated: ((x: number, y: number, width: number, height: number) => void) | null = null;
+    /** surface_id -> MapSurfaceToOutput origin, for translating surface coords into output space. */
+    private origins = new Map<number, { x: number; y: number }>();
 
     // --- WebGL (main-thread) path state ---
     private renderer: SurfaceRenderer | null = null;
@@ -126,13 +128,20 @@ export class AvcDecoder {
     getBuilderExtensions(): Extension[] {
         return [
             avcDecodeCallback((surfaceId, frameId, originX, originY, regions, data) => {
-                // originX/originY were only used by the removed GPU direct-draw path; both live paths
-                // composite at the surface coords carried in `regions`.
-                void originX;
-                void originY;
+                // originX/originY are this surface's MapSurfaceToOutput origin. They are (0,0) for a
+                // single monitor, which is why discarding them went unnoticed — but under
+                // multi-monitor EACH monitor is its own eGFX surface, so surface 1's regions start
+                // at (0,0) again and must be shifted into output space or they paint over monitor 0
+                // and monitor 1 never updates.
+                //
+                // WHERE the shift belongs differs by path, so it is NOT applied here:
+                //  - WebGL: composites straight into the output-space texture -> needs the shift.
+                //  - Worker: hands regions back to the WASM compositor, which applies each surface's
+                //    origin itself -> must stay in surface coords, or it would be shifted twice.
+                this.origins.set(surfaceId, { x: originX, y: originY });
                 // Copy out of WASM memory first — the underlying buffer is reused by the run loop.
                 if (this.useWebGl) {
-                    this.decodeMain(surfaceId, frameId, new Uint32Array(regions), new Uint8Array(data));
+                    this.decodeMain(surfaceId, frameId, originX, originY, new Uint32Array(regions), new Uint8Array(data));
                 } else {
                     const dataCopy = new Uint8Array(data);
                     const regionsCopy = new Uint32Array(regions);
@@ -227,7 +236,14 @@ export class AvcDecoder {
         return sd;
     }
 
-    private decodeMain(surfaceId: number, frameId: number, regions: Uint32Array, data: Uint8Array): void {
+    private decodeMain(
+        surfaceId: number,
+        frameId: number,
+        originX: number,
+        originY: number,
+        regions: Uint32Array,
+        data: Uint8Array,
+    ): void {
         if (typeof VideoDecoder === 'undefined') {
             if (!this.warnedUnsupported) {
                 this.warnedUnsupported = true;
@@ -260,7 +276,11 @@ export class AvcDecoder {
         if (hasKey) sd.sawKeyframe = true;
 
         const ts = sd.timestamp++;
-        sd.geom.set(ts, { frameId, rects: unflatten(regions) });
+        // Rects stay in SURFACE coords: they double as the SOURCE rect inside the decoded video
+        // frame, so shifting them here would break the sampling. The origin rides along and is
+        // applied only where an OUTPUT-space coordinate is actually needed (the GPU destination
+        // rect, and the canvas-update notification).
+        sd.geom.set(ts, { frameId, rects: unflatten(regions), originX, originY });
         try {
             sd.decoder.decode(new EncodedVideoChunk({ type: hasKey ? 'key' : 'delta', timestamp: ts, data }));
         } catch (e) {
@@ -285,8 +305,10 @@ export class AvcDecoder {
         // GPU present: hand the VideoFrame to the unified surface renderer (drop-to-latest; it
         // uploads + closes on the next rAF). No WASM surface write — AVC is a hole in the chrome.
         if (this.renderer) {
-            this.renderer.submitAvcFrame(frame, meta.rects);
-            for (const r of meta.rects) this.canvasUpdated?.(r.x, r.y, r.w, r.h);
+            this.renderer.submitAvcFrame(frame, meta.rects, meta.originX, meta.originY);
+            for (const r of meta.rects) {
+                this.canvasUpdated?.(r.x + meta.originX, r.y + meta.originY, r.w, r.h);
+            }
         } else {
             frame.close();
         }
@@ -320,7 +342,11 @@ export class AvcDecoder {
                             data,
                         }),
                     );
-                    this.canvasUpdated?.(r.x, r.y, r.w, r.h);
+                    // The region itself stays in surface coords (the WASM compositor positions it),
+                    // but an external presenter is told about OUTPUT-space rects — otherwise a
+                    // second monitor's update marks the wrong monitor dirty.
+                    const o = this.origins.get(msg.surfaceId);
+                    this.canvasUpdated?.(r.x + (o?.x ?? 0), r.y + (o?.y ?? 0), r.w, r.h);
                 }
                 break;
             case 'unsupported':

@@ -593,6 +593,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         // `connection_result.desktop_size`, which already drives the canvas /
         // DecodedImage sizing, and the eGFX compositor blits each output-mapped
         // surface at its virtual-desktop origin into that single framebuffer.
+        // (0,0) for single-monitor and for any layout whose primary is the top-left monitor.
+        let mut rail_desktop_origin: (i32, i32) = (0, 0);
         let monitors = self.0.borrow().monitors.clone();
         if !monitors.is_empty() {
             if let Some((bbox_width, bbox_height)) = monitors_bounding_box(&monitors) {
@@ -605,6 +607,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     bounding_box = format!("{bbox_width}x{bbox_height}"),
                     "Advertising multi-monitor layout (spanning virtual desktop)"
                 );
+                rail_desktop_origin = monitors_desktop_origin(&monitors);
                 config.monitors = monitors;
             } else {
                 warn!("Ignoring multi-monitor layout: could not compute a valid bounding box");
@@ -750,6 +753,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             WasmGraphicsMessageProxy::new(input_events_tx.clone()),
             rail_store.clone(),
             surface_present_callback.is_some(),
+            rail_desktop_origin,
         ));
 
         let (connection_result, ws) = connect(ConnectParams {
@@ -2754,6 +2758,25 @@ fn monitors_bounding_box(monitors: &[GccMonitor]) -> Option<(u16, u16)> {
     let height = u16::try_from(height).unwrap_or(u16::MAX);
 
     Some((width, height))
+}
+
+/// Translation from the host's DESKTOP coordinate space into eGFX OUTPUT (framebuffer) space.
+///
+/// Two different spaces, and RAIL vs eGFX each use a different one:
+///   * GCC Client Monitor Data -- and therefore every RAIL Window-List rect the host sends -- is
+///     PRIMARY-RELATIVE: the primary monitor is at (0,0) and a monitor to its left/above has a
+///     NEGATIVE origin. (MS-RDPBCGR requires this; FreeRDP rejects a layout whose primary isn't
+///     at 0/0.)
+///   * The eGFX framebuffer is BOUNDING-BOX space: its top-left is (0,0), which is where each
+///     surface's `MapSurfaceToOutput` origin lives.
+///
+/// The two coincide only when the primary monitor IS the top-left one -- always true for a single
+/// monitor, which is why clipping RAIL rects as if they were output coords worked until now.
+/// Otherwise every RAIL rect is off by the bounding-box minimum.
+fn monitors_desktop_origin(monitors: &[GccMonitor]) -> (i32, i32) {
+    let min_left = monitors.iter().map(|m| m.left).min().unwrap_or(0);
+    let min_top = monitors.iter().map(|m| m.top).min().unwrap_or(0);
+    (-i32::from(min_left), -i32::from(min_top))
 }
 
 fn parse_remote_app(value: &JsValue) -> Option<connector::RailConfig> {

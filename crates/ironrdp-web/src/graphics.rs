@@ -644,6 +644,12 @@ pub(crate) struct WasmGraphicsHandler {
     cache: HashMap<u16, SurfaceBuf>,
     /// surface_id -> output origin (x, y) for surfaces mapped to the output.
     mapped: HashMap<u16, (u32, u32)>,
+    /// Added to a RAIL window rect to move it from the host's DESKTOP space (primary-relative,
+    /// negative to the left of/above the primary) into eGFX OUTPUT space (bounding-box top-left
+    /// is the origin). `(0, 0)` for a single monitor and whenever the primary IS the top-left
+    /// monitor -- which is why Path A clipping worked before multi-monitor. See
+    /// `monitors_desktop_origin` in `session.rs`.
+    desktop_origin: (i32, i32),
     /// surface_id -> RAIL window mapping, for surfaces mapped to a window
     /// instead of the output (HiDef RAIL). Mutually exclusive with `mapped`.
     /// Populated here (piece 2); piece 3's per-window compositing (`on_frame_complete`)
@@ -729,8 +735,14 @@ struct ScaledBuf {
 }
 
 impl WasmGraphicsHandler {
-    pub(crate) fn new(proxy: WasmGraphicsMessageProxy, rail: RailWindowStore, webgl_present: bool) -> Self {
+    pub(crate) fn new(
+        proxy: WasmGraphicsMessageProxy,
+        rail: RailWindowStore,
+        webgl_present: bool,
+        desktop_origin: (i32, i32),
+    ) -> Self {
         Self {
+            desktop_origin,
             proxy,
             surfaces: HashMap::new(),
             cache: HashMap::new(),
@@ -820,11 +832,7 @@ impl WasmGraphicsHandler {
         // Sent for NON-RAIL sessions too (mode FULLSCREEN, no window rects) — a plain desktop needs
         // the size just as much; only the clipping is RAIL-specific.
         let wins: Vec<(i32, i32, u32, u32)> = if self.rail_session {
-            self.rail
-                .app_windows()
-                .into_iter()
-                .map(|(x, y, w, h, _z)| (x, y, w, h))
-                .collect()
+            self.app_windows_in_output_space()
         } else {
             Vec::new()
         };
@@ -851,7 +859,15 @@ impl WasmGraphicsHandler {
             None => true,
         };
         if changed && ow > 0 && oh > 0 {
-            debug!(mode, ow, oh, windows = wins.len(), "WebGL: surface layout -> JS");
+            debug!(
+                mode,
+                ow,
+                oh,
+                windows = wins.len(),
+                desktop_origin = format!("{:?}", self.desktop_origin),
+                rects = format!("{wins:?}"),
+                "WebGL: surface layout -> JS"
+            );
             self.proxy.send_layout(mode, ow, oh, wins.clone());
             self.last_webgl_layout = Some((mode, ow, oh, wins));
         }
@@ -929,6 +945,54 @@ impl WasmGraphicsHandler {
         }
     }
 
+    /// Presentable RAIL app-window rects, translated from the host's DESKTOP space into eGFX
+    /// OUTPUT space so they can be compared with and clipped against surface geometry. Bottom→top
+    /// by z, exactly as `RailWindowStore::app_windows` returns them.
+    fn app_windows_in_output_space(&self) -> Vec<(i32, i32, u32, u32)> {
+        let (dx, dy) = self.desktop_origin;
+        self.rail
+            .app_windows()
+            .into_iter()
+            .map(|(x, y, w, h, _z)| (x.saturating_add(dx), y.saturating_add(dy), w, h))
+            .collect()
+    }
+
+    /// Send an OUTPUT-space rect, sourcing its pixels from whichever output-mapped surface(s)
+    /// actually cover it.
+    ///
+    /// Path A used to read surface 0 directly, because with one monitor surface 0 IS the whole
+    /// output and the two coordinate spaces are identical. With several monitors the output is
+    /// tiled from one surface per monitor, each at its own origin, so a rect must be split: a
+    /// window straddling the seam between two monitors emits one region per surface. Single
+    /// monitor still yields exactly one region -- the old behaviour plus one intersection test.
+    fn send_output_rect(&mut self, px: u32, py: u32, pw: u32, ph: u32) {
+        let mapped: Vec<(u16, (u32, u32))> = self.mapped.iter().map(|(&id, &o)| (id, o)).collect();
+        for (id, (ox, oy)) in mapped {
+            let Some((sw, sh)) = self.surfaces.get(&id).map(|s| (s.width, s.height)) else {
+                continue;
+            };
+            let ix0 = px.max(ox);
+            let iy0 = py.max(oy);
+            let ix1 = px.saturating_add(pw).min(ox.saturating_add(sw));
+            let iy1 = py.saturating_add(ph).min(oy.saturating_add(sh));
+            if ix1 <= ix0 || iy1 <= iy0 {
+                continue;
+            }
+            let (iw, ih) = (ix1 - ix0, iy1 - iy0);
+            let Some(data) = self.surfaces.get(&id).map(|s| s.extract(ix0 - ox, iy0 - oy, iw, ih)) else {
+                continue;
+            };
+            self.proxy.send(GraphicsRegion {
+                x: ix0,
+                y: iy0,
+                width: iw,
+                height: ih,
+                data,
+                preserve_alpha: false,
+            });
+        }
+    }
+
     /// Path A (MS-style non-HiDef RAIL) presentation.
     ///
     /// The RemoteApp rides ONE output-mapped desktop surface (surface 0) that already holds the
@@ -954,18 +1018,43 @@ impl WasmGraphicsHandler {
         // chrome, non-zero size — and DELIBERATELY not gated on WS_VISIBLE, which the wire toggles
         // as noise). A live app window therefore stays in this set continuously; it leaves only on
         // DeleteWindow. When the set is empty no real app is up (startup / app closed) → blank.
-        let wins: Vec<(i32, i32, u32, u32)> = self
-            .rail
-            .app_windows()
-            .into_iter()
-            .map(|(x, y, w, h, _z)| (x, y, w, h))
-            .collect();
+        let wins: Vec<(i32, i32, u32, u32)> = self.app_windows_in_output_space();
         if !wins.is_empty() {
             self.path_a_had_windows = true;
         }
 
-        // What changed on the desktop surface since the last present (bounding box), drained here.
-        let dirty0 = self.dirty.remove(&0);
+        // What changed since the last present, drained for EVERY output-mapped surface.
+        //
+        // This used to be `self.dirty.remove(&0)` alone, on the premise (stated in the per-window
+        // paint below) that "surface 0 IS the desktop". That premise dies under multi-monitor:
+        // each physical monitor is its OWN surface, so a RemoteApp on the second monitor dirtied
+        // surface 1, `dirty0` was None on every frame, and this function returned early having
+        // presented nothing -- a frozen picture while frames kept arriving. Surface 1's dirty
+        // region also accumulated forever, since nothing ever drained it.
+        let mapped_ids: Vec<u16> = self.mapped.keys().copied().collect();
+        let dirty_by_surface: Vec<(u16, Dirty)> = mapped_ids
+            .iter()
+            .filter_map(|&id| self.dirty.remove(&id).map(|d| (id, d)))
+            .collect();
+        // Union of every surface's dirty box, in OUTPUT coords, for the "did anything repaint at
+        // all" gate and the per-window overlap test below.
+        let dirty0: Option<Dirty> = dirty_by_surface
+            .iter()
+            .filter_map(|&(id, d)| {
+                let (ox, oy) = self.mapped.get(&id).copied()?;
+                Some(Dirty {
+                    min_x: d.min_x.saturating_add(ox),
+                    min_y: d.min_y.saturating_add(oy),
+                    max_x: d.max_x.saturating_add(ox),
+                    max_y: d.max_y.saturating_add(oy),
+                })
+            })
+            .reduce(|a, b| Dirty {
+                min_x: a.min_x.min(b.min_x),
+                min_y: a.min_y.min(b.min_y),
+                max_x: a.max_x.max(b.max_x),
+                max_y: a.max_y.max(b.max_y),
+            });
         let was_empty = self.last_path_a_layout.as_deref() == Some(&[][..]);
         let secure = self.rail.secure_desktop();
 
@@ -984,16 +1073,7 @@ impl WasmGraphicsHandler {
         // desktop. The restore (Actively Monitored Desktop order + fresh app Create) clears `secure`.
         if secure && self.path_a_had_windows {
             if dirty0.is_some() {
-                if let Some(data) = self.surfaces.get(&0).map(|s| s.extract(0, 0, ow, oh)) {
-                    self.proxy.send(GraphicsRegion {
-                        x: 0,
-                        y: 0,
-                        width: ow,
-                        height: oh,
-                        data,
-                        preserve_alpha: false,
-                    });
-                }
+                self.send_output_rect(0, 0, ow, oh);
             }
             self.last_path_a_layout = Some(Vec::new());
             return;
@@ -1061,11 +1141,11 @@ impl WasmGraphicsHandler {
         }
 
         // Draw each app window bottom→top. On a layout change repaint the WHOLE window; otherwise
-        // present only the surface's dirty region CLIPPED to the window — the video updates a small
-        // sub-rect, and repainting the whole ~1000×760 window every frame is wasted CPU. BOTH the
-        // AVC/ClearCodec composite (which wrote into SurfaceBuf) and this present live in the SAME
-        // surface/desktop coordinate space (surface 0 IS the desktop), so extracting the dirty∩
-        // window sub-rect yields correct pixels. (dvc55 regressed here, but the real cause was the
+        // present only the dirty region CLIPPED to the window — the video updates a small sub-rect,
+        // and repainting the whole ~1000×760 window every frame is wasted CPU. Everything here is
+        // in OUTPUT space: `wins` has been translated out of the host's desktop space, and the
+        // dirty boxes have been translated out of each surface's local space, so they are directly
+        // comparable. `send_output_rect` converts back per surface when it reads pixels. (dvc55 regressed here, but the real cause was the
         // video-freeze backpressure — fixed by the decode worker — not this coord math; the sanity
         // log below confirms SurfaceBuf holds video, not white, inside each window.)
         let diag = self.path_a_diag_count < 24 && !wins.is_empty();
@@ -1084,8 +1164,16 @@ impl WasmGraphicsHandler {
             // must be VIDEO, not the white (0xFF) init. `white=true` here means the composite wrote
             // to the wrong space — the exact failure mode behind the dvc55 white window.
             if diag && overlaps {
-                if let Some(s) = self.surfaces.get(&0) {
-                    let px = s.extract(cx + cw / 2, cy + ch / 2, 1, 1);
+                // Read the surface that actually COVERS the window centre, not surface 0. Under
+                // multi-monitor this probe reported a confident, wrong "centre is black" for
+                // windows living on surface 1 -- a diagnostic that misleads is worse than none.
+                let (mcx, mcy) = (cx + cw / 2, cy + ch / 2);
+                let owner = self.mapped.iter().find_map(|(&id, &(ox, oy))| {
+                    let (sw, sh) = self.surfaces.get(&id).map(|s| (s.width, s.height))?;
+                    (mcx >= ox && mcy >= oy && mcx < ox + sw && mcy < oy + sh).then_some((id, ox, oy))
+                });
+                if let Some((s, ox, oy)) = owner.and_then(|(id, ox, oy)| self.surfaces.get(&id).map(|s| (s, ox, oy))) {
+                    let px = s.extract(mcx - ox, mcy - oy, 1, 1);
                     let (r, g, b) = (
                         px.first().copied().unwrap_or(0),
                         px.get(1).copied().unwrap_or(0),
@@ -1119,17 +1207,7 @@ impl WasmGraphicsHandler {
             } else {
                 continue;
             };
-            let Some(data) = self.surfaces.get(&0).map(|s| s.extract(px, py, pw, ph)) else {
-                continue;
-            };
-            self.proxy.send(GraphicsRegion {
-                x: px,
-                y: py,
-                width: pw,
-                height: ph,
-                data,
-                preserve_alpha: false,
-            });
+            self.send_output_rect(px, py, pw, ph);
         }
 
         self.last_path_a_layout = Some(wins);
@@ -1538,12 +1616,28 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         // Note this is NOT the tile cache — SurfaceToCache/CacheToSurface are unused in this
         // session (wire-confirmed); SurfaceToSurface is a separate primitive.
         if self.webgl_present {
+            // The GPU texture is ONE output-space framebuffer, but these coordinates are
+            // SURFACE-local. They coincide only when the surface's output origin is (0,0) --
+            // i.e. single monitor. Under multi-monitor each screen is its own surface, so a copy
+            // on the second surface would read from and write to the wrong screen entirely
+            // (window-shaped black blocks and stray outlines while dragging). Translate both ends
+            // by their OWN surface's origin, which also keeps a cross-surface copy correct.
+            let (src_ox, src_oy) = self.mapped.get(&pdu.source_surface_id).copied().unwrap_or((0, 0));
+            let (dst_ox, dst_oy) = self.mapped.get(&pdu.destination_surface_id).copied().unwrap_or((0, 0));
             self.proxy.send_copy(
-                sx,
-                sy,
+                sx.saturating_add(src_ox),
+                sy.saturating_add(src_oy),
                 w,
                 h,
-                points.iter().map(|p| (u32::from(p.x), u32::from(p.y))).collect(),
+                points
+                    .iter()
+                    .map(|p| {
+                        (
+                            u32::from(p.x).saturating_add(dst_ox),
+                            u32::from(p.y).saturating_add(dst_oy),
+                        )
+                    })
+                    .collect(),
             );
             return;
         }
@@ -2278,7 +2372,7 @@ mod hidef_repro {
             rail.set_rail_window(wid, x, y, 1024, 768, (i + 1) as u32);
         }
         // webgl_present = false: this fixture exercises the CPU compositor path.
-        let handler = WasmGraphicsHandler::new(proxy, rail, false);
+        let handler = WasmGraphicsHandler::new(proxy, rail, false, (0, 0));
         let mut client = GraphicsPipelineClient::new(Box::new(handler), None);
         client
             .process_pdu_bytes_for_test(&bytes)

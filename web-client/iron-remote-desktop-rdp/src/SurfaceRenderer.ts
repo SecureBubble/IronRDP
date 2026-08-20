@@ -170,7 +170,7 @@ export class SurfaceRenderer {
      * So: upload + draw here, synchronously. Only the final present to the visible canvas stays
      * rAF-coalesced (that one IS safe to coalesce — it re-presents the whole retained texture).
      */
-    submitAvcFrame(frame: VideoFrame, rects: Rect[]): void {
+    submitAvcFrame(frame: VideoFrame, rects: Rect[], originX = 0, originY = 0): void {
         if (!this.ensure()) {
             frame.close();
             return;
@@ -197,6 +197,14 @@ export class SurfaceRenderer {
         // of the accumulation path: FBO row 0 == surface row 0 (no flip); the flip happens only at
         // present. Source coords normalize by the DECODED frame size (which is macroblock-padded,
         // e.g. 1312 for a 1308 surface); destination coords normalize by the surface size.
+        //
+        // TWO COORDINATE SPACES, and the rect means something different in each:
+        //  - SOURCE: where the pixels sit inside THIS surface's decoded frame -> raw rect.
+        //  - DESTINATION: where they belong in the shared output texture -> rect + this surface's
+        //    MapSurfaceToOutput origin.
+        // They coincide only when the origin is (0,0), i.e. single monitor. Under multi-monitor
+        // each screen is its own eGFX surface whose regions restart at (0,0), so without the
+        // origin every surface draws over monitor 0 and the others never update.
         if (this.avcW > 0 && this.avcH > 0 && rects.length > 0) {
             gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
             gl.viewport(0, 0, this.surfW, this.surfH);
@@ -204,7 +212,9 @@ export class SurfaceRenderer {
             const H = this.surfH;
             for (const r of rects) {
                 if (r.w <= 0 || r.h <= 0) continue;
-                gl.uniform4f(this.uDst, (r.x / W) * 2 - 1, (r.y / H) * 2 - 1, (r.w / W) * 2, (r.h / H) * 2);
+                const dx = r.x + originX;
+                const dy = r.y + originY;
+                gl.uniform4f(this.uDst, (dx / W) * 2 - 1, (dy / H) * 2 - 1, (r.w / W) * 2, (r.h / H) * 2);
                 gl.uniform4f(this.uSrc, r.x / this.avcW, r.y / this.avcH, r.w / this.avcW, r.h / this.avcH);
                 gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
             }
@@ -380,6 +390,10 @@ export class SurfaceRenderer {
         overlay.style.width = '100%';
         overlay.style.height = '100%';
         overlay.style.pointerEvents = 'none';
+        // Marks this as the canvas that actually HOLDS the composited framebuffer, so an
+        // external presenter (the webapp's multi-monitor controller) can find the pixels.
+        // `#renderer` stays blank on this path, and sampling it yielded all-black monitors.
+        overlay.setAttribute('data-iron-present', '1');
         overlay.width = Math.max(1, this.base.width);
         overlay.height = Math.max(1, this.base.height);
         if (getComputedStyle(parent).position === 'static') {
@@ -387,7 +401,15 @@ export class SurfaceRenderer {
         }
         parent.appendChild(overlay);
 
-        const gl = overlay.getContext('webgl2', { alpha: true, premultipliedAlpha: false, antialias: false });
+        // `preserveDrawingBuffer` is REQUIRED, not a nicety: an external presenter reads this
+        // canvas with drawImage() from its own rAF, i.e. outside our draw tick. Without it the
+        // drawing buffer is cleared after compositing and every such read returns empty.
+        const gl = overlay.getContext('webgl2', {
+            alpha: true,
+            premultipliedAlpha: false,
+            antialias: false,
+            preserveDrawingBuffer: true,
+        });
         if (!gl) {
             overlay.remove();
             this.failed = true;
