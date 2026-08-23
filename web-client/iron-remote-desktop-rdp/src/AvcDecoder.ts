@@ -58,7 +58,8 @@ function webGlPathSupported(): boolean {
 function webGlPresentEnabled(): boolean {
     let param: string | null = null;
     try {
-        param = new URLSearchParams(globalThis.location?.search ?? '').get('ironwebgl');
+        // Tolerant of a JSON-quoted value; see the same note on STATS_ENABLED in SurfaceRenderer.
+        param = new URLSearchParams(globalThis.location?.search ?? '').get('ironwebgl')?.replace(/^"|"$/g, '') ?? null;
     } catch {
         /* no location (worker/SSR) — fall through to capability detection */
     }
@@ -70,6 +71,25 @@ function webGlPresentEnabled(): boolean {
     }
     return ok;
 }
+
+/**
+ * Hardware H.264 decode on the WebGL path. DEFAULT ON; `?ironhwdec=0` forces software back.
+ *
+ * Worth roughly half the renderer's CPU (see the configure call for the measurements). Per-surface
+ * fallback to software is automatic if the hardware decoder refuses to configure or errors at
+ * runtime, so this flag is an override, not the safety net.
+ *
+ * Read once at module scope, like the other flags: a decoder is configured per surface at its first
+ * keyframe, and re-reading per surface would let a mid-session URL change split one session in two.
+ */
+const HW_DECODE = (() => {
+    try {
+        const p = new URLSearchParams(globalThis.location?.search ?? '').get('ironhwdec')?.replace(/^"|"$/g, '');
+        return p !== '0' && p !== 'false';
+    } catch {
+        return true;
+    }
+})();
 
 /** The subset of the connected Session we call back into. */
 interface SessionLike {
@@ -93,6 +113,11 @@ interface MainSurface {
     decoder: VideoDecoder | null;
     codec: string | null;
     sawKeyframe: boolean;
+    /**
+     * Latched once this surface has fallen back to software decode, so a machine whose hardware
+     * decoder fails does not retry hardware on every keyframe and thrash.
+     */
+    softwareFallback: boolean;
     /** Monotonic per-surface chunk timestamp; also the `geom` map key. */
     timestamp: number;
     /** decode-time metadata keyed by chunk timestamp (matched on decoder output). */
@@ -117,7 +142,9 @@ export class AvcDecoder {
     constructor() {
         if (this.useWebGl) {
             this.worker = null;
-            console.info('[AVC] WebGL present path: main-thread decode + ack-on-decode (default; ?ironwebgl=0 to opt out)');
+            console.info(
+                '[AVC] WebGL present path: main-thread decode + ack-on-decode (default; ?ironwebgl=0 to opt out)',
+            );
         } else {
             this.worker = new AvcWorker();
             this.worker.onmessage = (e: MessageEvent<WorkerMessage>) => this.onWorkerMessage(e.data);
@@ -141,7 +168,14 @@ export class AvcDecoder {
                 this.origins.set(surfaceId, { x: originX, y: originY });
                 // Copy out of WASM memory first — the underlying buffer is reused by the run loop.
                 if (this.useWebGl) {
-                    this.decodeMain(surfaceId, frameId, originX, originY, new Uint32Array(regions), new Uint8Array(data));
+                    this.decodeMain(
+                        surfaceId,
+                        frameId,
+                        originX,
+                        originY,
+                        new Uint32Array(regions),
+                        new Uint8Array(data),
+                    );
                 } else {
                     const dataCopy = new Uint8Array(data);
                     const regionsCopy = new Uint32Array(regions);
@@ -230,7 +264,14 @@ export class AvcDecoder {
     private getMainSurface(surfaceId: number): MainSurface {
         let sd = this.surfaces.get(surfaceId);
         if (sd === undefined) {
-            sd = { decoder: null, codec: null, sawKeyframe: false, timestamp: 0, geom: new Map() };
+            sd = {
+                decoder: null,
+                codec: null,
+                sawKeyframe: false,
+                softwareFallback: false,
+                timestamp: 0,
+                geom: new Map(),
+            };
             this.surfaces.set(surfaceId, sd);
         }
         return sd;
@@ -259,14 +300,49 @@ export class AvcDecoder {
             sd.codec = codecStringFromSps(sps);
             const decoder = new VideoDecoder({
                 output: (frame) => this.onFrameMain(surfaceId, frame),
-                error: (e) => console.error('[AVC] VideoDecoder error (surface', surfaceId, ')', e),
+                error: (e) => {
+                    console.error('[AVC] VideoDecoder error (surface', surfaceId, ')', e);
+                    // A decoder that errors is closed and cannot be reused. If it was the hardware
+                    // one, drop this surface back to software and rebuild on the next keyframe --
+                    // otherwise a machine with a broken hardware decoder gets a dead surface, which
+                    // would be a far worse regression than the CPU we are trying to save.
+                    this.fallBackToSoftware(surfaceId);
+                },
             });
             try {
-                // Software decode (MSFT does the same) → CPU-backed frames; texImage2D uploads them
-                // to the GPU. optimizeForLatency keeps the decode queue shallow for the ack window.
-                decoder.configure({ codec: sd.codec, optimizeForLatency: true, hardwareAcceleration: 'prefer-software' });
+                // HARDWARE decode on this path, and it is worth ~half the renderer's CPU.
+                //
+                // This used to be `prefer-software`, inherited from the WORKER path -- where it is
+                // correct, because CPU-backed frames make that path's per-rect `copyTo` a cheap
+                // memcpy instead of a GPU->CPU readback stall. Here the requirement is the opposite:
+                // we hand the frame straight to `texImage2D`, so we want it already on the GPU.
+                //
+                // Measured on one session, same content, only this line changed:
+                //   tab CPU          164 / 129  ->  82 / 45   (Chrome task manager)
+                //   texImage2D avg   1.6-2.3ms  ->  0.3-0.6ms (no CPU-side I420->RGBA convert)
+                //   `up` per second  38-210ms/s ->  4-28ms/s
+                // The 210ms/s stall regime, where uploads blocked on a full driver queue and rAF
+                // fell to 1Hz, did not reappear at all.
+                //
+                // Software decode also ran H.264 on a CPU thread pool, which is why nine rounds of
+                // main-thread instrumentation never found this: the cost was never on the thread we
+                // were measuring. `?ironhwdec=0` forces the old behaviour back.
+                const accel: HardwareAcceleration =
+                    HW_DECODE && !sd.softwareFallback ? 'prefer-hardware' : 'prefer-software';
+                console.info(`[AVC] decoder configure codec=${sd.codec} hardwareAcceleration=${accel}`);
+                decoder.configure({
+                    codec: sd.codec,
+                    optimizeForLatency: true,
+                    hardwareAcceleration: accel,
+                });
             } catch (e) {
                 console.error('[AVC] configure failed for', sd.codec, e);
+                // Only hardware is optional. If SOFTWARE configure failed there is nothing left to
+                // try, so do not latch and retry forever -- just drop the frame as before.
+                if (!sd.softwareFallback && HW_DECODE) {
+                    console.warn('[AVC] hardware decode unavailable — falling back to software');
+                    sd.softwareFallback = true;
+                }
                 return;
             }
             sd.decoder = decoder;
@@ -287,6 +363,24 @@ export class AvcDecoder {
             console.error('[AVC] decode() threw (surface', surfaceId, ')', e);
             sd.geom.delete(ts);
         }
+    }
+
+    /**
+     * Drop one surface back to software decode after its hardware decoder failed.
+     *
+     * The errored decoder is already closed, so the surface is torn down to the pre-keyframe state
+     * and rebuilt on the next keyframe -- deltas in between are useless without their reference
+     * frames. `geom` is cleared too: those entries are keyed by chunk timestamp for a decoder that
+     * will never produce output, and would otherwise leak for the life of the session.
+     */
+    private fallBackToSoftware(surfaceId: number): void {
+        const sd = this.surfaces.get(surfaceId);
+        if (!sd || sd.softwareFallback) return;
+        console.warn('[AVC] hardware decoder failed on surface', surfaceId, '— retrying in software');
+        sd.softwareFallback = true;
+        sd.decoder = null;
+        sd.sawKeyframe = false;
+        sd.geom.clear();
     }
 
     private onFrameMain(surfaceId: number, frame: VideoFrame): void {

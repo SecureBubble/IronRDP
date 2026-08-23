@@ -32,9 +32,19 @@ interface Rect {
 }
 
 /** `?ironstats=1` re-enables the rolling present-stats line (off by default: console flood). */
+/**
+ * STICKY, and it has to be: connecting navigates to `/webclient` and the query string does not
+ * survive it, which silently disarmed an entire A/B capture -- the session ran, AVC frames flowed,
+ * and not one stat line was written. The webapp latches the flag into sessionStorage on first
+ * sighting; this reads the same latch so the vendor and the app arm together.
+ */
 const STATS_ENABLED = (() => {
     try {
-        return new URLSearchParams(globalThis.location?.search ?? '').get('ironstats') === '1';
+        // Tolerant of both `ironstats=1` and `ironstats="1"` -- the app router JSON-serializes
+        // string search values, and the quoted form silently fails a strict `=== '1'` test.
+        const param = new URLSearchParams(globalThis.location?.search ?? '').get('ironstats')?.replace(/^"|"$/g, '');
+        if (param === '0') return false;
+        return param === '1' || sessionStorage.getItem('ironstats') === '1';
     } catch {
         return false;
     }
@@ -94,6 +104,83 @@ class PresentStats {
     }
 }
 
+/**
+ * Rolling per-second AVC upload stats — the measurement for the "full-frame texImage2D" question.
+ *
+ * The AVC frame path never enters Rust, so the Rust-side counters (`upload_n` and friends) are
+ * structurally blind to it: they watch the Rust compositor, and AVC bypasses it. Chrome can't
+ * unwind it either (it lands in `(program)`). So it gets timed here, in JS, directly.
+ *
+ * The number that matters is `up=ms/s` — cost per WALL second, comparable against the ~965 ms/s
+ * total main-thread budget. Per-call averages are not: they say nothing about how often it runs.
+ *
+ * `cov` is the fraction of the decoded frame the region rects actually touch. The host sends
+ * full-frame destRects with sparse real content, so this is the headroom a sub-rect upload would
+ * reclaim — cov=0.10 means we upload 10x what changed.
+ *
+ * Cost of the instrument itself: 3 `performance.now()` calls per AVC frame, ~90/s at 30fps. The
+ * last round's instrumentation added ~1,000 WASM<->JS crossings/s and BECAME the cost being
+ * measured; this cannot, but re-check that assumption before trusting a surprising result.
+ */
+class AvcUploadStats {
+    private frames = 0;
+    private upSum = 0;
+    private upMax = 0;
+    private drawSum = 0;
+    private covSum = 0;
+    private bboxSum = 0;
+    private rectSum = 0;
+    private emptyFrames = 0;
+    private windowStart = 0;
+    private dims = '';
+
+    record(
+        upMs: number,
+        drawMs: number,
+        coverage: number,
+        bboxCoverage: number,
+        rectCount: number,
+        w: number,
+        h: number,
+        now: number,
+    ): void {
+        if (this.windowStart === 0) this.windowStart = now;
+        this.frames++;
+        this.upSum += upMs;
+        this.upMax = Math.max(this.upMax, upMs);
+        this.drawSum += drawMs;
+        this.covSum += coverage;
+        this.bboxSum += bboxCoverage;
+        this.rectSum += rectCount;
+        if (rectCount === 0) this.emptyFrames++;
+        this.dims = `${w}x${h}`;
+        const elapsed = now - this.windowStart;
+        if (elapsed >= 2000) {
+            if (STATS_ENABLED) {
+                const perSec = (ms: number) => (ms / elapsed) * 1000;
+                console.info(
+                    `[AVC upload] ${this.dims} fps=${((this.frames / elapsed) * 1000).toFixed(1)} ` +
+                        `up=${perSec(this.upSum).toFixed(1)}ms/s (avg=${(this.upSum / this.frames).toFixed(2)} ` +
+                        `max=${this.upMax.toFixed(2)}) draw=${perSec(this.drawSum).toFixed(1)}ms/s ` +
+                        `cov=${(this.covSum / this.frames).toFixed(3)} ` +
+                        `bbox=${(this.bboxSum / this.frames).toFixed(3)} ` +
+                        `rects=${(this.rectSum / this.frames).toFixed(1)} ` +
+                        `empty=${this.emptyFrames}/${this.frames}`,
+                );
+            }
+            this.frames = 0;
+            this.upSum = 0;
+            this.upMax = 0;
+            this.drawSum = 0;
+            this.covSum = 0;
+            this.bboxSum = 0;
+            this.rectSum = 0;
+            this.emptyFrames = 0;
+            this.windowStart = now;
+        }
+    }
+}
+
 export class SurfaceRenderer {
     private readonly base: HTMLCanvasElement;
     private overlay: HTMLCanvasElement | null = null;
@@ -130,6 +217,7 @@ export class SurfaceRenderer {
     private rafScheduled = false;
     private pending = false;
     private readonly stats = new PresentStats();
+    private readonly upStats = new AvcUploadStats();
 
     constructor(baseCanvas: HTMLCanvasElement) {
         this.base = baseCanvas;
@@ -178,6 +266,11 @@ export class SurfaceRenderer {
         this.syncSize();
         const gl = this.gl!;
 
+        // FULL-FRAME UPLOAD, measured. The decoder is configured `prefer-software` (see AvcDecoder),
+        // so `frame` is CPU-backed and this call color-converts I420->RGBA and pushes the WHOLE
+        // frame across, on the main thread, every frame -- no matter that the region rects below
+        // often touch <10% of it. `up=ms/s` in the [AVC upload] line is the cost of that.
+        const t0 = STATS_ENABLED ? performance.now() : 0;
         try {
             gl.bindTexture(gl.TEXTURE_2D, this.avcTex);
             gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
@@ -190,6 +283,10 @@ export class SurfaceRenderer {
             frame.close();
             return;
         }
+        // GPU work is deferred, so this timer captures the CPU-side convert+stage, which is the
+        // part that competes with everything else on this thread. It does NOT capture GPU time.
+        const t1 = STATS_ENABLED ? performance.now() : 0;
+
         // Free the decoder buffer straight away — a pinned VideoFrame stalls the decoder.
         frame.close();
 
@@ -219,6 +316,41 @@ export class SurfaceRenderer {
                 gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
             }
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        }
+
+        if (STATS_ENABLED) {
+            const t2 = performance.now();
+            // `cov` sizes a PER-RECT upload; `bbox` sizes a SINGLE bounding-box upload. They diverge
+            // when the rects are scattered, and that gap is the whole decision: one texSubImage2D of
+            // the bbox is safe, whereas N per-rect calls risk Chrome re-converting the CPU-backed
+            // frame N times -- which would be slower than the full upload we have now.
+            let covered = 0;
+            let n = 0;
+            let x0 = Infinity;
+            let y0 = Infinity;
+            let x1 = 0;
+            let y1 = 0;
+            for (const r of rects) {
+                if (r.w <= 0 || r.h <= 0) continue;
+                covered += r.w * r.h;
+                n++;
+                x0 = Math.min(x0, r.x);
+                y0 = Math.min(y0, r.y);
+                x1 = Math.max(x1, r.x + r.w);
+                y1 = Math.max(y1, r.y + r.h);
+            }
+            const area = this.avcW * this.avcH;
+            const bbox = n > 0 ? (x1 - x0) * (y1 - y0) : 0;
+            this.upStats.record(
+                t1 - t0,
+                t2 - t1,
+                area > 0 ? covered / area : 0,
+                area > 0 ? bbox / area : 0,
+                n,
+                this.avcW,
+                this.avcH,
+                t2,
+            );
         }
 
         this.avcRects = rects;
@@ -320,18 +452,13 @@ export class SurfaceRenderer {
         // The 2D path cannot hit this: its size comes from the Rust-owned SurfaceBuf.
         this.syncSize();
 
-
-
         // One-shot sanity check: the decoded picture is macroblock-padded (e.g. 1312 for a 1308
         // surface), which is expected — source coords normalize by the DECODED size and
         // destination coords by the SURFACE size. Logged once so a real mismatch is still visible.
         if (this.hasAvc && !this.geomLogged) {
             this.geomLogged = true;
-            console.warn(
-                `[SurfaceRenderer] avcFrame=${this.avcW}x${this.avcH} surface=${this.surfW}x${this.surfH}`,
-            );
+            console.warn(`[SurfaceRenderer] avcFrame=${this.avcW}x${this.avcH} surface=${this.surfW}x${this.surfH}`);
         }
-
 
         // 3) Present the surface-0 texture to the visible canvas — one quad, chrome + AVC together,
         //    clipped to the Path A layout. The canvas is cleared to TRANSPARENT first, every frame:
@@ -348,8 +475,7 @@ export class SurfaceRenderer {
             // FULLSCREEN (plain desktop, or the secure desktop the host paints with no RAIL window
             // of its own) presents the whole surface; CLIP presents one quad per app window. The
             // windows share one composited texture, so per-window quads need no z-ordering.
-            const quads =
-                this.layoutMode === LAYOUT_CLIP ? this.windowRects : [{ x: 0, y: 0, w: W, h: H }];
+            const quads = this.layoutMode === LAYOUT_CLIP ? this.windowRects : [{ x: 0, y: 0, w: W, h: H }];
             for (const r of quads) {
                 // Window rects are desktop-absolute and may hang off the edges (RAIL allows
                 // negative origins); clamp to the surface so the source texcoords stay in range.
@@ -367,7 +493,6 @@ export class SurfaceRenderer {
                 gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
             }
         }
-
 
         this.stats.record(performance.now() - t0, performance.now());
     }
