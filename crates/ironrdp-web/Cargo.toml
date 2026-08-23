@@ -96,3 +96,10 @@ base64 = "0.22"
 
 [lints]
 workspace = true
+
+# Keep the wasm NAME SECTION in `wasm-pack build --profiling` builds. Without `-g`, wasm-opt
+# strips it, and Chrome DevTools then collapses the entire client into one opaque wasm-bindgen
+# trampoline in the flame chart — which is exactly what made a CPU investigation on 2026-08-23
+# unreadable. Affects ONLY the profiling profile; --release output is unchanged.
+[package.metadata.wasm-pack.profile.profiling]
+wasm-opt = ['-O', '-g']

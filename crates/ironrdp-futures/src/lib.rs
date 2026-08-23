@@ -50,7 +50,19 @@ where
 
         Box::pin(async {
             // NOTE(perf): tokio implementation is more efficient
-            let mut read_bytes = [0u8; 1024];
+            //
+            // 16 KiB, not 1 KiB. Measured on the wire (2026-08-23) against a live AVD session:
+            // the server delivers PDU-granular WebSocket frames of ~1,623 bytes, dead uniform
+            // (p50 = p90 = p99 = 1,623, max 6,653). A 1 KiB buffer therefore needed AT LEAST TWO
+            // reads for every single frame, and in the browser build each read is a fresh
+            // `Box::pin` heap allocation plus a JS<->wasm crossing -- paid ~18,000 times per
+            // session for nothing. Verified after the change: exactly one read per PDU, ~1.5 KB
+            // each.
+            //
+            // Honest caveat: this did NOT measurably reduce CPU. It removes a real inefficiency;
+            // it is not the explanation for the web client using ~2.5x the CPU of the Microsoft
+            // web client, which remains unexplained.
+            let mut read_bytes = [0u8; 16 * 1024];
             let len = self.inner.read(&mut read_bytes).await?;
             buf.extend_from_slice(&read_bytes[..len]);
 
@@ -120,7 +132,19 @@ where
 
         Box::pin(async {
             // NOTE(perf): tokio implementation is more efficient
-            let mut read_bytes = [0u8; 1024];
+            //
+            // 16 KiB, not 1 KiB. Measured on the wire (2026-08-23) against a live AVD session:
+            // the server delivers PDU-granular WebSocket frames of ~1,623 bytes, dead uniform
+            // (p50 = p90 = p99 = 1,623, max 6,653). A 1 KiB buffer therefore needed AT LEAST TWO
+            // reads for every single frame, and in the browser build each read is a fresh
+            // `Box::pin` heap allocation plus a JS<->wasm crossing -- paid ~18,000 times per
+            // session for nothing. Verified after the change: exactly one read per PDU, ~1.5 KB
+            // each.
+            //
+            // Honest caveat: this did NOT measurably reduce CPU. It removes a real inefficiency;
+            // it is not the explanation for the web client using ~2.5x the CPU of the Microsoft
+            // web client, which remains unexplained.
+            let mut read_bytes = [0u8; 16 * 1024];
             let len = self.inner.read(&mut read_bytes[..]).await?;
             buf.extend_from_slice(&read_bytes[..len]);
 
