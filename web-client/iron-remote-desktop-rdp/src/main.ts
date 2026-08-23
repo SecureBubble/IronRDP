@@ -173,6 +173,11 @@ export {
     avcWatermarkCallback,
     canvasUpdatedCallback,
     railActivate,
+    railSysCommand,
+    SC_MINIMIZE,
+    SC_MAXIMIZE,
+    SC_CLOSE,
+    SC_RESTORE,
     railWindowsCallback,
     railWindowCallback,
 } from './extensions';

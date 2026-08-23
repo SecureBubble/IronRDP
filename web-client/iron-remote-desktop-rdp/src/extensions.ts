@@ -177,8 +177,27 @@ export interface RailWindow {
     title: string;
     /** True for the window the HOST reports as active (not a client-side guess). */
     active: boolean;
+    /** True when the host reports the window MINIMISED. `railActivate` alone will not bring it
+     *  back — send {@link SC_RESTORE} first. */
+    minimized: boolean;
     /** Key into the icon cache (`"cacheId:cacheEntry"`), or null while the window has no icon. */
     iconKey: string | null;
+}
+
+/** Window system commands for {@link railSysCommand} (standard win32 `SC_*` values). */
+export const SC_MINIMIZE = 0xf020;
+export const SC_MAXIMIZE = 0xf030;
+export const SC_CLOSE = 0xf060;
+export const SC_RESTORE = 0xf120;
+
+/**
+ * Run a window system command — `TS_RAIL_ORDER_SYSCOMMAND`.
+ *
+ * `SC_RESTORE` is NOT safe to send blindly: on a MAXIMISED window it un-maximises it. Check
+ * {@link RailWindow.minimized} first.
+ */
+export function railSysCommand(params: { window_id: number; command: number }): Extension {
+    return new Extension('rail_sys_command', params as unknown);
 }
 
 /** A window icon, delivered ONCE per cache slot. Convert and cache it by `key`. */

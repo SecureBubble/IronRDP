@@ -933,6 +933,11 @@ pub(crate) enum RdpInputEvent {
     RailActivate {
         window_id: u32,
     },
+    /// `TS_RAIL_ORDER_SYSCOMMAND`: minimise / maximise / restore / close a RAIL window.
+    RailSysCommand {
+        window_id: u32,
+        command: u16,
+    },
     /// The server marked a surface capture-protected (proxy `PROTECT_SURFACE`).
     /// A browser cannot enforce capture protection, so the session is refused
     /// fail-closed rather than shown unprotected. See [`PROTECTED_SESSION_REFUSAL`].
@@ -1138,6 +1143,7 @@ impl Session {
             set("id", JsValue::from_f64(f64::from(w.id)));
             set("title", JsValue::from_str(&w.title));
             set("active", JsValue::from_bool(w.active));
+            set("minimized", JsValue::from_bool(w.minimized));
             set(
                 "iconKey",
                 w.icon_key.as_ref().map_or(JsValue::NULL, |k| JsValue::from_str(k)),
@@ -1753,6 +1759,27 @@ impl iron_remote_desktop::Session for Session {
                             }
                             outs
                         }
+                        RdpInputEvent::RailSysCommand { window_id, command } => {
+                            let msg = active_stage
+                                .get_svc_processor::<RailChannel>()
+                                .map(|r| r.sys_command(window_id, command));
+                            let mut outs = Vec::new();
+                            if let Some(msg) = msg {
+                                match active_stage.process_svc_processor_messages(
+                                    SvcProcessorMessages::<RailChannel>::from(vec![msg]),
+                                ) {
+                                    Ok(frame) if !frame.is_empty() => {
+                                        info!(target: "rail_diag", window_id = format!("{window_id:#x}"), command = format!("{command:#06x}"), "RAIL: sent client SysCommand");
+                                        outs.push(ActiveStageOutput::ResponseFrame(frame));
+                                    }
+                                    Ok(_) => warn!(window_id = format!("{window_id:#x}"), "RAIL SysCommand produced no frame"),
+                                    Err(e) => warn!(error = %e, "RAIL SysCommand send failed"),
+                                }
+                            } else {
+                                warn!("RAIL SysCommand: no RailChannel processor attached");
+                            }
+                            outs
+                        }
                         RdpInputEvent::RailWindowMove { window_id, left, top, right, bottom } => {
                             // Local drag ended: report the final rect so the host snaps to it.
                             let msg = active_stage
@@ -2000,6 +2027,7 @@ impl iron_remote_desktop::Session for Session {
                                     id: *id,
                                     title: g.title.clone().unwrap_or_default(),
                                     active: rail_active == Some(*id),
+                                    minimized: g.is_minimized(),
                                     icon_key: rail_window_icon.get(id).map(|(c, e)| format!("{c}:{e}")),
                                 })
                             })
@@ -2498,6 +2526,19 @@ impl iron_remote_desktop::Session for Session {
         // to keep the iron-remote-desktop trait surface protocol-agnostic.
         iron_remote_desktop::extension_match! {
             match ext;
+            |rail_sys_command: JsValue| {
+                let obj = into_object(rail_sys_command)?;
+                let window_id = get_u32(&obj, "window_id")?;
+                let command = get_u32(&obj, "command")?;
+                self.input_events_tx
+                    .unbounded_send(RdpInputEvent::RailSysCommand {
+                        window_id,
+                        command: u16::try_from(command).unwrap_or(0),
+                    })
+                    .context("send RAIL sys command")
+                    .map_err(IronError::from)?;
+                return Ok(JsValue::NULL);
+            };
             |rail_activate: JsValue| {
                 let obj = into_object(rail_activate)?;
                 let window_id = get_u32(&obj, "window_id")?;
@@ -3030,6 +3071,10 @@ struct RailTaskbarWindow {
     id: u32,
     title: String,
     active: bool,
+    /// True when the host last reported `showState == SW_SHOWMINIMIZED`. The UI needs this
+    /// because `Activate` alone will NOT bring a minimised window back — that takes
+    /// `SC_RESTORE`, which in turn must not be sent to a window that is merely maximised.
+    minimized: bool,
     /// `"cacheId:cacheEntry"` of this window's icon, or `None` while it has none. A KEY rather
     /// than the pixels: the list is diffed on every RAIL order pass, and comparing icon buffers
     /// there would be wasteful. The bits travel once, in `new_icons`.
@@ -3146,6 +3191,21 @@ impl RailWindowGeom {
     /// ~14 impostors, several of which have titles AND non-zero sizes (`Rdptray`, `Proxy Desktop`,
     /// `PopupHost`). Fall back to the structural filter plus a title only when the host omits the
     /// field entirely, and never list a window owned by another (a dialog belongs to its owner).
+    /// Is the host reporting this window as MINIMISED?
+    ///
+    /// Measured on the wire (2026-08-23) rather than assumed: minimising an app produced exactly
+    /// one `showState = SW_SHOWMINIMIZED (2)` per event on the listed app windows, with no other
+    /// `show` value on them at all. The `showState` churn recorded earlier as "wire-proven noise"
+    /// is real but lives on HELPER windows (PopupHost et al) that `is_taskbar_listed` filters out.
+    ///
+    /// The obvious alternative — the `WS_MINIMIZE` (0x2000_0000) style bit — is UNUSABLE here:
+    /// the host does not resend `style` on a minimise, so the field is absent exactly when it
+    /// would be needed. Building on it would have produced detection that never fires.
+    fn is_minimized(&self) -> bool {
+        // SW_SHOWMINIMIZED = 2, SW_MINIMIZE = 6, SW_SHOWMINNOACTIVE = 7.
+        matches!(self.show_state, Some(2 | 6 | 7))
+    }
+
     fn is_taskbar_listed(&self) -> bool {
         if self.owner_window_id.is_some_and(|o| o != 0) {
             return false;
@@ -3214,10 +3274,22 @@ fn log_rail_window_order(order: &WindowOrder) {
             );
         }
         WindowOrder::UpdateWindow { window_id, state } => {
+            // MEASUREMENT (taskbar Milestone 3): which signal actually tracks "minimised"?
+            //   * `show` = showState. SW_SHOWMINIMIZED = 2, SW_MINIMIZE = 6, SW_SHOWMINNOACTIVE = 7.
+            //     Recorded during the CAD work as wire-proven NOISE on this deployment, which is
+            //     why `is_presentable` ignores it -- but that was about WS_VISIBLE-style churn on
+            //     live windows, not about a real minimise, so it deserves a direct test.
+            //   * `style` bit WS_MINIMIZE (0x2000_0000) is the independent candidate.
+            // Whichever moves cleanly on minimise/restore is what SC_RESTORE gets gated on;
+            // sending SC_RESTORE blindly would UN-MAXIMISE a maximised window.
+            let minimized_style = state.style.map(|st| st & 0x2000_0000 != 0);
             info!(
                 window_id = format!("{window_id:#x}"),
                 offset = ?state.window_offset,
                 size = ?state.window_size,
+                show = ?state.show_state,
+                style = ?state.style.map(|st| format!("{st:#010x}")),
+                ws_minimize = ?minimized_style,
                 "RAIL: window updated"
             );
         }

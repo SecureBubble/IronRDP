@@ -18,6 +18,7 @@ pub enum RailOrderType {
     Exec = 0x0001,
     Activate = 0x0002,
     SysParam = 0x0003,
+    SysCommand = 0x0004,
     Handshake = 0x0005,
     NotifyEvent = 0x0006,
     WindowMove = 0x0008,
@@ -418,6 +419,66 @@ impl Decode<'_> for Activate {
     }
 }
 
+/// System commands for [`SysCommand`] ([MS-RDPERP] 2.2.2.6.2). These are the standard win32
+/// `SC_*` values.
+pub const SC_SIZE: u16 = 0xF000;
+pub const SC_MOVE: u16 = 0xF010;
+pub const SC_MINIMIZE: u16 = 0xF020;
+pub const SC_MAXIMIZE: u16 = 0xF030;
+pub const SC_CLOSE: u16 = 0xF060;
+pub const SC_KEYMENU: u16 = 0xF100;
+pub const SC_RESTORE: u16 = 0xF120;
+pub const SC_DEFAULT: u16 = 0xF160;
+
+/// `TS_RAIL_ORDER_SYSCOMMAND` ([MS-RDPERP] 2.2.2.6.2) — client → server. Asks the host to run a
+/// window system command: minimise, maximise, restore or close.
+///
+/// Distinct from [`Activate`], which only raises/focuses a window. A MINIMISED window does not
+/// come back from `Activate` — it needs `SC_RESTORE`. Equally, `SC_RESTORE` must not be sent
+/// blindly: on a MAXIMISED window it un-maximises it, so the caller has to know the window's
+/// state first (`showState == SW_SHOWMINIMIZED`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SysCommand {
+    pub window_id: u32,
+    /// One of the `SC_*` constants above.
+    pub command: u16,
+}
+
+impl SysCommand {
+    const BODY_SIZE: usize = 6;
+    const NAME: &'static str = "TS_RAIL_ORDER_SYSCOMMAND";
+}
+
+impl Encode for SysCommand {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        RailPduHeader::encode(RailOrderType::SysCommand, self.size(), dst)?;
+        ensure_size!(in: dst, size: Self::BODY_SIZE);
+        dst.write_u32(self.window_id);
+        dst.write_u16(self.command);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        HEADER_SIZE + Self::BODY_SIZE
+    }
+}
+
+impl Decode<'_> for SysCommand {
+    fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        let header = RailPduHeader::decode(src)?;
+        check_order_type(&header, RailOrderType::SysCommand)?;
+        ensure_size!(in: src, size: Self::BODY_SIZE);
+        Ok(Self {
+            window_id: src.read_u32(),
+            command: src.read_u16(),
+        })
+    }
+}
+
 /// `moveSizeType` value for a window MOVE (drag) in a Server Move/Size PDU (§2.2.2.7.2). The
 /// other values (`RAIL_WMSZ_*` 0x1..0x8) are resize edges/corners, which we leave server-driven.
 pub const RAIL_WMSZ_MOVE: u16 = 0x0009;
@@ -598,6 +659,7 @@ pub enum RailPdu {
     ClientStatus(ClientStatus),
     ClientExecute(ClientExecute),
     Activate(Activate),
+    SysCommand(SysCommand),
     ServerExecuteResult(ServerExecuteResult),
     /// Server → client: begin/end a local window move/size loop (§2.2.2.7.2).
     ServerMoveSize(ServerMoveSize),
@@ -617,6 +679,7 @@ impl Encode for RailPdu {
             Self::ClientStatus(p) => p.encode(dst),
             Self::ClientExecute(p) => p.encode(dst),
             Self::Activate(p) => p.encode(dst),
+            Self::SysCommand(p) => p.encode(dst),
             Self::ServerExecuteResult(p) => p.encode(dst),
             Self::WindowMove(p) => p.encode(dst),
             Self::ServerMoveSize(_) => Err(invalid_field_err!("RailPdu", "ServerMoveSize is server->client only")),
@@ -637,6 +700,7 @@ impl Encode for RailPdu {
             Self::ClientStatus(p) => p.name(),
             Self::ClientExecute(p) => p.name(),
             Self::Activate(p) => p.name(),
+            Self::SysCommand(p) => p.name(),
             Self::ServerExecuteResult(p) => p.name(),
             Self::ServerMoveSize(_) => ServerMoveSize::NAME,
             Self::WindowMove(p) => p.name(),
@@ -666,6 +730,7 @@ impl Encode for RailPdu {
             Self::ClientStatus(p) => p.size(),
             Self::ClientExecute(p) => p.size(),
             Self::Activate(p) => p.size(),
+            Self::SysCommand(p) => p.size(),
             Self::ServerExecuteResult(p) => p.size(),
             Self::ServerMoveSize(_) => HEADER_SIZE + ServerMoveSize::BODY_SIZE,
             Self::WindowMove(p) => p.size(),
@@ -682,6 +747,7 @@ impl Decode<'_> for RailPdu {
             Some(RailOrderType::ClientStatus) => Ok(Self::ClientStatus(ClientStatus::decode(src)?)),
             Some(RailOrderType::Exec) => Ok(Self::ClientExecute(ClientExecute::decode(src)?)),
             Some(RailOrderType::Activate) => Ok(Self::Activate(Activate::decode(src)?)),
+            Some(RailOrderType::SysCommand) => Ok(Self::SysCommand(SysCommand::decode(src)?)),
             Some(RailOrderType::ExecResult) => Ok(Self::ServerExecuteResult(ServerExecuteResult::decode(src)?)),
             Some(RailOrderType::LocalMoveSize) => Ok(Self::ServerMoveSize(ServerMoveSize::decode(src)?)),
             Some(RailOrderType::WindowMove) => Ok(Self::WindowMove(WindowMove::decode(src)?)),
@@ -782,6 +848,36 @@ mod tests {
             enabled: true,
         };
         assert_eq!(round_trip(&pdu), pdu);
+    }
+
+    #[test]
+    fn sys_command_round_trip() {
+        for command in [SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE, SC_CLOSE] {
+            let pdu = SysCommand {
+                window_id: 0x000A_00B2,
+                command,
+            };
+            assert_eq!(round_trip(&pdu), pdu);
+        }
+    }
+
+    /// The order type must be 0x0004 on the wire. It was missing from `RailOrderType` entirely
+    /// (0x0003 jumped straight to 0x0005), so a typo here would be silently accepted by our own
+    /// round trip while the host ignored the PDU.
+    #[test]
+    fn sys_command_uses_order_type_4() {
+        let encoded = encode_vec(&SysCommand {
+            window_id: 1,
+            command: SC_RESTORE,
+        })
+        .unwrap();
+        assert_eq!(u16::from_le_bytes([encoded[0], encoded[1]]), 0x0004);
+        // 6-byte body after the header, and the command lands in the last two bytes.
+        assert_eq!(encoded.len(), HEADER_SIZE + 6);
+        assert_eq!(
+            u16::from_le_bytes([encoded[encoded.len() - 2], encoded[encoded.len() - 1]]),
+            SC_RESTORE
+        );
     }
 
     #[test]

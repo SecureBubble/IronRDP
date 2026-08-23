@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::pdu::{
     Activate, ClientExecute, ClientStatus, ClientStatusFlags, Handshake, RailPdu, ServerExecuteResult, ServerMoveSize,
-    WindowMove,
+    SysCommand, WindowMove,
 };
 
 /// Any RAIL PDU can be sent on the channel.
@@ -90,6 +90,15 @@ impl RailChannel {
     /// Notify the server that a RAIL window gained/lost focus (§2.2.2.6.1).
     pub fn activate(&self, window_id: u32, enabled: bool) -> SvcMessage {
         SvcMessage::from(RailPdu::Activate(Activate { window_id, enabled }))
+    }
+
+    /// Build a `TS_RAIL_ORDER_SYSCOMMAND` (§2.2.2.6.2): minimise / maximise / restore / close.
+    ///
+    /// `command` is one of the `SC_*` constants. Note `SC_RESTORE` is NOT safe to send blindly —
+    /// on a maximised window it un-maximises it — so callers must check the window is actually
+    /// minimised first.
+    pub fn sys_command(&self, window_id: u32, command: u16) -> SvcMessage {
+        SvcMessage::from(RailPdu::SysCommand(SysCommand { window_id, command }))
     }
 
     /// Drain the Server Move/Size events (§2.2.2.7.2) received since the last call. The run loop
