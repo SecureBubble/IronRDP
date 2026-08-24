@@ -819,7 +819,14 @@ export class SurfaceRenderer {
             cell.width = wm.cellW;
             cell.height = wm.cellH;
             const cctx = cell.getContext('2d');
-            if (!cctx) return;
+            if (!cctx) {
+                // FAIL CLOSED. Returning here would leave the layer canvas cleared and transparent,
+                // so the session would present NORMALLY and UNWATERMARKED with no error -- the proxy
+                // mandated a watermark, we could not build it, and nobody would ever know.
+                console.error('[SurfaceRenderer] watermark tile context unavailable — blocking the session');
+                this.wmBlocked = true;
+                return;
+            }
             const img = cctx.createImageData(wm.width, wm.height);
             const level = Math.min(255, Math.max(0, wm.opacity));
             for (let i = 0; i < wm.width * wm.height; i++) {
@@ -835,7 +842,14 @@ export class SurfaceRenderer {
             cctx.putImageData(img, wm.offX, wm.offY);
             this.wmPattern = ctx.createPattern(cell, 'repeat');
         }
-        if (!this.wmPattern) return;
+        if (!this.wmPattern) {
+            // Same fail-open trap as the tile context above: no pattern means no tiles get drawn,
+            // and a transparent layer over a healthy session is indistinguishable from no watermark
+            // at all. Block instead.
+            console.error('[SurfaceRenderer] watermark pattern unavailable — blocking the session');
+            this.wmBlocked = true;
+            return;
+        }
 
         ctx.fillStyle = this.wmPattern;
         if (clip) {
