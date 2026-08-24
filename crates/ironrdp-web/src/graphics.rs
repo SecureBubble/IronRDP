@@ -669,6 +669,14 @@ pub(crate) struct WasmGraphicsHandler {
     output_height: u32,
     /// Active session watermark overlay (proxy extension), re-blended each flush.
     watermark: Option<Watermark>,
+    /// A watermark PDU has been received this session, so the session MUST be watermarked.
+    ///
+    /// Latched separately from `watermark` because the two disagree in exactly the case that
+    /// matters: a malformed or truncated PDU leaves `watermark` as None while the requirement
+    /// stands. Fail CLOSED there -- present nothing rather than clean pixels. Note the proxy
+    /// frames `imgSize` as a UINT16, so a tile over 65535 bytes truncates on the wire and lands
+    /// in precisely this branch; before this flag that silently produced an unwatermarked session.
+    watermark_required: bool,
     /// Latches once the proxy flags any surface capture-protected, so the
     /// fail-closed refusal is signalled exactly once (the proxy re-sends the
     /// PROTECT_SURFACE PDU after every surface map).
@@ -754,6 +762,7 @@ impl WasmGraphicsHandler {
             output_width: 0,
             output_height: 0,
             watermark: None,
+            watermark_required: false,
             capture_protected: false,
             avc_region_log_count: 0,
             last_path_a_layout: None,
@@ -782,6 +791,30 @@ impl WasmGraphicsHandler {
     /// own flush. The QR is a white module mask; the shared [`blend_watermark_into`] applies a
     /// neutral luminance delta whose sign opposes the background so it stays legible on light *and*
     /// dark content. No-op when no watermark is set.
+    /// True when a watermark was mandated but none is usable — present nothing.
+    fn watermark_blocked(&self) -> bool {
+        self.watermark_required && self.watermark.is_none()
+    }
+
+    /// Tell JS a watermark was mandated and could not be prepared, so it can explain the blank
+    /// screen instead of leaving the user staring at black.
+    ///
+    /// CONTRACT with `SurfaceRenderer.setWatermark`: a zero-width tile means "required but
+    /// unavailable", never "clear the watermark". Rust only ever sends real tiles otherwise, so
+    /// the zero case is free to carry this meaning.
+    fn notify_watermark_blocked(&self) {
+        self.proxy.send_watermark(Watermark {
+            rgba: Vec::new(),
+            width: 0,
+            height: 0,
+            cell_w: 0,
+            cell_h: 0,
+            off_x: 0,
+            off_y: 0,
+            opacity: 0,
+        });
+    }
+
     fn blend_watermark(&self, data: &mut [u8], out_x: u32, out_y: u32, w: u32, h: u32) {
         if let Some(wm) = &self.watermark {
             blend_watermark_into(wm, data, out_x, out_y, w, h);
@@ -915,7 +948,7 @@ impl WasmGraphicsHandler {
                 };
                 let (px, py, pw, ph) = (x + bx, y + by, bw, bh);
                 // Crop the block we already extracted rather than extracting a second time.
-                let mut data = if (bx, by, bw, bh) == (0, 0, w, h) {
+                let data = if (bx, by, bw, bh) == (0, 0, w, h) {
                     probe
                 } else {
                     let mut cropped = Vec::with_capacity((pw * ph * 4) as usize);
@@ -932,7 +965,11 @@ impl WasmGraphicsHandler {
                     }
                     cropped
                 };
-                self.blend_watermark(&mut data, ox + px, oy + py, pw, ph);
+                // NO watermark blend here. On this path JS owns the watermark, as a sibling canvas
+                // layered above the present canvas (`SurfaceRenderer.setWatermark`) -- which is the
+                // only way to cover AVC pixels, since those are decoded in JS and never reach this
+                // buffer. Blending here as well would watermark the non-AVC chrome TWICE, showing
+                // as darker patches exactly where the two overlap.
                 self.proxy.send(GraphicsRegion {
                     x: ox + px,
                     y: oy + py,
@@ -979,9 +1016,15 @@ impl WasmGraphicsHandler {
                 continue;
             }
             let (iw, ih) = (ix1 - ix0, iy1 - iy0);
-            let Some(data) = self.surfaces.get(&id).map(|s| s.extract(ix0 - ox, iy0 - oy, iw, ih)) else {
+            let Some(mut data) = self.surfaces.get(&id).map(|s| s.extract(ix0 - ox, iy0 - oy, iw, ih)) else {
                 continue;
             };
+            // Path A has NEVER blended the watermark -- checked against the parent of the
+            // multi-monitor commit, so this is an original gap, not a regression. It matters
+            // because this path is reachable from the URL (`?ironwebgl=0`), and a watermark a user
+            // can switch off by editing the address bar is not a control. The WebGL path gets its
+            // watermark from the JS layer instead; only this CPU path needs the blend.
+            self.blend_watermark(&mut data, ix0, iy0, iw, ih);
             self.proxy.send(GraphicsRegion {
                 x: ix0,
                 y: iy0,
@@ -1689,8 +1732,18 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
                 width,
                 height,
                 image_len = pdu.image.len(),
-                "ignoring malformed watermark PDU"
+                "malformed watermark PDU — BLOCKING the session (fail closed)"
             );
+            // THE single enforcement point. `WatermarkPdu::decode` is deliberately lenient so that
+            // every malformation -- truncated body, wrapped UINT16 imgSize, header too short to
+            // parse -- arrives HERE as a short image or a zero width, instead of failing to decode
+            // and being dropped by the shared eGFX loop (which would present an unwatermarked
+            // session). Do not "fix" that leniency without moving this check with it.
+            // Do NOT just return: that would present an unwatermarked session, which is the one
+            // outcome a watermark exists to prevent. Keep the requirement, leave `watermark` None,
+            // and let `watermark_blocked` stop the present paths.
+            self.watermark_required = true;
+            self.notify_watermark_blocked();
             return;
         }
         // Convert the tile from ARGB8888 (wire byte order B,G,R,A) to RGBA8888.
@@ -1730,6 +1783,7 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         // Forward to the run loop so it can re-blend the mark onto out-of-band
         // AVC regions (which composite outside this handler's surface buffers and
         // therefore miss the flush-time re-blend below).
+        self.watermark_required = true;
         self.proxy.send_watermark(wm.clone());
         self.watermark = Some(wm);
         // Repaint mapped surfaces fully so the watermark shows without waiting for
@@ -1767,6 +1821,22 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
     }
 
     fn on_frame_complete(&mut self, _frame_id: u32) {
+        // FAIL CLOSED. One guard ahead of all three present paths (webgl / path A / CPU flush), so
+        // no path can be added later that quietly presents unwatermarked pixels.
+        if self.watermark_blocked() {
+            if self.output_width > 0 && self.output_height > 0 {
+                self.proxy.send(GraphicsRegion {
+                    x: 0,
+                    y: 0,
+                    width: self.output_width,
+                    height: self.output_height,
+                    data: vec![0u8; (self.output_width * self.output_height * 4) as usize],
+                    preserve_alpha: false,
+                });
+            }
+            return;
+        }
+
         // Latch a RAIL/RemoteApp session on the first window-map or RAIL window position. From
         // then on we present ONLY via the per-window compositor below and NEVER flush the
         // output-mapped desktop — so the host's partially-painted welcome/shell surface can't
@@ -2236,7 +2306,13 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         self.rail.clear();
         self.last_layout = None;
         self.dirty.clear();
+        // BOTH, and the pairing matters. Clearing only the tile would leave `watermark_required`
+        // latched with no watermark to satisfy it, i.e. `watermark_blocked()` true forever -- the
+        // session would go blank on channel close and stay blank until a new watermark PDU
+        // happened to arrive. The requirement is SESSION state, and this is where a session ends,
+        // so it resets with everything else; the next session re-establishes it from its own PDU.
         self.watermark = None;
+        self.watermark_required = false;
         self.rail_session = false;
         self.scaled_cache.clear();
         self.last_path_a_layout = None;

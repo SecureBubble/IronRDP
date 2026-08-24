@@ -185,9 +185,16 @@ export class AvcDecoder {
                     );
                 }
             }),
-            avcWatermarkCallback(() => {
-                // The watermark is re-blended by the WASM surface flush in the CPU composite path;
-                // the old GPU-overlay watermark went away with the GPU direct-draw path. No-op.
+            avcWatermarkCallback((rgba, width, height, cellW, cellH, offX, offY, opacity) => {
+                // Hand the tile to the renderer's watermark LAYER (a sibling canvas above the
+                // present canvas). This is the only path that can watermark AVC pixels: those are
+                // decoded here in JS and live solely in the GPU texture, so the Rust CPU blend --
+                // which works per extracted region -- structurally never sees them. On the
+                // worker/2D path there is no SurfaceRenderer and the Rust blend still applies.
+                this.renderer?.setWatermark(rgba, width, height, cellW, cellH, offX, offY, opacity);
+                this.pendingWatermark = this.renderer
+                    ? null
+                    : ([rgba, width, height, cellW, cellH, offX, offY, opacity] as const);
             }),
             // WebGL path only. Two halves of one contract with the Rust compositor:
             //  - `surfacePresentCallback` delivers ONLY pixels a non-AVC codec just decoded (the
@@ -224,6 +231,10 @@ export class AvcDecoder {
     setCanvas(canvas: HTMLCanvasElement): void {
         if (this.useWebGl && !this.renderer) {
             this.renderer = new SurfaceRenderer(canvas);
+            if (this.pendingWatermark) {
+                this.renderer.setWatermark(...this.pendingWatermark);
+                this.pendingWatermark = null;
+            }
         }
     }
 
@@ -232,7 +243,16 @@ export class AvcDecoder {
         this.canvasUpdated = cb;
     }
 
-    /** Retained for API compatibility. Watermark is handled by the WASM flush now. */
+    /**
+     * A watermark that arrived before the renderer existed. The WATERMARK pdu lands right after
+     * the surface is mapped to output and BEFORE the first frame (Microsoft's client presents it
+     * ~80ms before WebCodecs even initializes), so on a cold connect it can easily beat
+     * `setRenderCanvas`. Dropping it there would leave the session silently unwatermarked.
+     */
+    private pendingWatermark: readonly [Uint8Array, number, number, number, number, number, number, number] | null =
+        null;
+
+    /** Retained for API compatibility; the layer lives in SurfaceRenderer now. */
     setWatermark(): void {}
 
     dispose(): void {

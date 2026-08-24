@@ -80,11 +80,15 @@ class PresentStats {
     private frames = 0;
     private sumMs = 0;
     private maxMs = 0;
+    private wmSum = 0;
+    private wmMax = 0;
     private windowStart = 0;
-    record(ms: number, now: number): void {
+    record(ms: number, wmMs: number, now: number): void {
         if (this.windowStart === 0) this.windowStart = now;
         this.frames++;
         this.sumMs += ms;
+        this.wmSum += wmMs;
+        this.wmMax = Math.max(this.wmMax, wmMs);
         this.maxMs = Math.max(this.maxMs, ms);
         const elapsed = now - this.windowStart;
         if (elapsed >= 2000) {
@@ -93,12 +97,15 @@ class PresentStats {
             // flooder. `?ironstats=1` brings it back when measuring present cost.
             if (STATS_ENABLED) {
                 console.info(
-                    `[SurfaceRenderer] fps=${fps.toFixed(1)} present(avg/max)=${(this.sumMs / this.frames).toFixed(2)}/${this.maxMs.toFixed(2)}ms`,
+                    `[SurfaceRenderer] fps=${fps.toFixed(1)} present(avg/max)=${(this.sumMs / this.frames).toFixed(2)}/${this.maxMs.toFixed(2)}ms ` +
+                        `wm=${((this.wmSum / elapsed) * 1000).toFixed(1)}ms/s (avg=${(this.wmSum / this.frames).toFixed(2)} max=${this.wmMax.toFixed(2)})`,
                 );
             }
             this.frames = 0;
             this.sumMs = 0;
             this.maxMs = 0;
+            this.wmSum = 0;
+            this.wmMax = 0;
             this.windowStart = now;
         }
     }
@@ -217,6 +224,27 @@ export class SurfaceRenderer {
     private rafScheduled = false;
     private pending = false;
     private readonly stats = new PresentStats();
+
+    // ---- session watermark (RDPGFX_CMDID_WATERMARK), drawn on its own canvas above the present
+    // canvas. See `setWatermark` for why it is a sibling layer and not blended into the pixels.
+    private wmCanvas: HTMLCanvasElement | null = null;
+    private wm: {
+        rgba: Uint8Array;
+        width: number;
+        height: number;
+        cellW: number;
+        cellH: number;
+        offX: number;
+        offY: number;
+        opacity: number;
+    } | null = null;
+    private wmPattern: CanvasPattern | null = null;
+    private wmDrawnW = 0;
+    private wmDrawnH = 0;
+    private wmDrawnClip = '';
+    /** A watermark is mandated but unavailable — present nothing. See `setWatermark`. */
+    private wmBlocked = false;
+    private wmBlockedPainted = false;
     private readonly upStats = new AvcUploadStats();
 
     constructor(baseCanvas: HTMLCanvasElement) {
@@ -494,7 +522,19 @@ export class SurfaceRenderer {
             }
         }
 
-        this.stats.record(performance.now() - t0, performance.now());
+        // Watermark last, above everything just composited. Idempotent -- it only repaints when
+        // the canvas size or the RAIL clip changed, so calling it every frame costs a comparison.
+        //
+        // TIMED SEPARATELY, and inside the present measurement rather than after it: dragging a
+        // RAIL window changes the clip EVERY frame, so this is the one input that can turn an
+        // idempotent call into a per-frame full repaint. Leaving it outside the timer would have
+        // hidden exactly the cost worth watching.
+        const wmT0 = STATS_ENABLED ? performance.now() : 0;
+        this.drawWatermark();
+        // drawWatermark can DISCOVER a block (no layer, no 2D context), so test after it runs.
+        if (this.wmBlocked) this.paintBlocked();
+        const now = performance.now();
+        this.stats.record(now - t0, STATS_ENABLED ? now - wmT0 : 0, now);
     }
 
     // ------------------------------------------------------------------ setup
@@ -595,6 +635,223 @@ export class SurfaceRenderer {
      *
      * Falls back to the canvas only until the first layout arrives.
      */
+    /**
+     * Install the session watermark (`RDPGFX_CMDID_WATERMARK`, a proxy extension).
+     *
+     * WHY A SEPARATE CANVAS, and not a blend into the pixels. The watermark used to be a CPU
+     * blend in Rust, applied per extracted region. That structurally cannot reach two things:
+     *   - AVC-painted pixels, which are decoded in JS and live only in the GPU texture. They
+     *     never traverse WASM, so on AVD -- where the app content IS AVC -- most of the screen
+     *     went unwatermarked even in full-desktop.
+     *   - RAIL Path A, whose `send_output_rect` never called the blend at all.
+     * A sibling layer above the composited canvas is immune to both: it does not care which codec
+     * produced the pixels underneath, or which present path drew them. It is also how the
+     * Microsoft AVD web client does it -- a `#watermarkingCanvas` sized to the session, and its
+     * "Watermark presented" trace fires ~80ms BEFORE WebCodecs initializes, i.e. entirely outside
+     * the codec pipeline.
+     *
+     * The tile repeats on a `cellW`x`cellH` grid (382x205 from the PDU) with the QR at
+     * (`offX`,`offY`) in each cell, matching the Rust `blend_watermark_into` placement.
+     *
+     * `difference` blending reproduces the Rust intent: that blend applied a luminance delta whose
+     * SIGN opposed the background, so the QR stays legible on light and dark content alike. A flat
+     * translucent draw cannot do that -- it vanishes against one end of the range. Drawing the tile
+     * at intensity `opacity` under `difference` darkens light backgrounds and lightens dark ones by
+     * that amount, which is the same behaviour on the GPU and for free.
+     */
+    setWatermark(
+        rgba: Uint8Array,
+        width: number,
+        height: number,
+        cellW: number,
+        cellH: number,
+        offX: number,
+        offY: number,
+        opacity: number,
+    ): void {
+        // CONTRACT with the Rust side (`notify_watermark_blocked`): a zero-sized tile means a
+        // watermark was MANDATED and could not be prepared -- a truncated or malformed PDU. It does
+        // not mean "clear the watermark". Fail closed: block the session rather than present clean
+        // pixels, which is the single outcome a watermark exists to prevent.
+        if (width === 0 || height === 0 || cellW === 0 || cellH === 0 || opacity === 0) {
+            this.wm = null;
+            this.wmPattern = null;
+            this.clearWatermark();
+            this.wmBlocked = true;
+            this.pending = true;
+            this.scheduleFrame();
+            return;
+        }
+        this.wmBlocked = false;
+        this.wm = { rgba, width, height, cellW, cellH, offX, offY, opacity };
+        this.wmPattern = null; // rebuilt lazily against the live 2D context
+        this.wmDrawnW = 0; // force a redraw
+        this.pending = true;
+        this.scheduleFrame();
+    }
+
+    /**
+     * Cover the session with an opaque panel explaining WHY it is blank.
+     *
+     * A silent black screen is the wrong failure here -- it is indistinguishable from the render
+     * bugs this client has actually had, and would send whoever hits it debugging graphics instead
+     * of reading the one line that explains it. Painted on the watermark canvas with blending
+     * turned off, so it is opaque rather than differenced against the content underneath.
+     */
+    private paintBlocked(): void {
+        const c = this.ensureWatermarkCanvas();
+        if (!c) return;
+        if (c.width !== this.surfW || c.height !== this.surfH) {
+            c.width = Math.max(1, this.surfW);
+            c.height = Math.max(1, this.surfH);
+            this.wmBlockedPainted = false;
+        }
+        if (this.wmBlockedPainted) return;
+        const ctx = c.getContext('2d');
+        if (!ctx) return;
+        c.style.mixBlendMode = 'normal';
+        // Tells the multi-monitor blit to copy this opaquely instead of differencing it, so the
+        // explanation reaches the secondary displays intact rather than as inverted noise.
+        c.setAttribute('data-iron-watermark-blocked', '1');
+        ctx.clearRect(0, 0, c.width, c.height);
+        ctx.fillStyle = '#0b0b0c';
+        ctx.fillRect(0, 0, c.width, c.height);
+        ctx.fillStyle = '#e5e5e6';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = '600 20px system-ui, sans-serif';
+        ctx.fillText('Session hidden: the security watermark could not be displayed.', c.width / 2, c.height / 2 - 14);
+        ctx.font = '400 15px system-ui, sans-serif';
+        ctx.fillStyle = '#a1a1a6';
+        ctx.fillText(
+            'This session is required to be watermarked. Reconnect, or contact your administrator.',
+            c.width / 2,
+            c.height / 2 + 16,
+        );
+        this.wmBlockedPainted = true;
+    }
+
+    /** Drop the watermark layer (session reset). */
+    private clearWatermark(): void {
+        this.wmBlockedPainted = false;
+        this.wmCanvas?.remove();
+        this.wmCanvas = null;
+        this.wmDrawnW = 0;
+        this.wmDrawnH = 0;
+        this.wmDrawnClip = '';
+    }
+
+    /**
+     * Create the watermark canvas as a sibling ABOVE the present canvas.
+     *
+     * `isolation: isolate` on the parent is required, not cosmetic: without it `mix-blend-mode`
+     * blends against whatever is behind the parent in the page rather than against our own
+     * presented pixels.
+     */
+    private ensureWatermarkCanvas(): HTMLCanvasElement | null {
+        if (this.wmCanvas) return this.wmCanvas;
+        const parent = this.overlay?.parentElement;
+        if (!parent) return null;
+        const c = document.createElement('canvas');
+        c.style.position = 'absolute';
+        c.style.top = '0';
+        c.style.left = '0';
+        c.style.width = '100%';
+        c.style.height = '100%';
+        c.style.pointerEvents = 'none';
+        c.style.mixBlendMode = 'difference';
+        // Lets an external presenter (the multi-monitor controller) find and re-apply this layer.
+        c.setAttribute('data-iron-watermark', '1');
+        parent.style.isolation = 'isolate';
+        parent.appendChild(c);
+        this.wmCanvas = c;
+        return c;
+    }
+
+    /**
+     * Repaint the watermark layer. Cheap and idempotent: it redraws only when the canvas size or
+     * the RAIL clip actually changed, so the per-frame present path can call it unconditionally.
+     */
+    private drawWatermark(): void {
+        const wm = this.wm;
+        if (!wm) return;
+        const c = this.ensureWatermarkCanvas();
+        if (!c) {
+            // The layer is the ONLY thing watermarking AVC pixels. If it cannot be created we are
+            // presenting unmarked content, so stop presenting instead.
+            console.error('[SurfaceRenderer] watermark layer unavailable — blocking the session');
+            this.wmBlocked = true;
+            return;
+        }
+
+        // In RAIL the canvas is desktop-sized and everything outside an app window is transparent,
+        // so a full-canvas watermark would float QR tiles over the user's OWN desktop. Clip to the
+        // app windows -- which is where the remote content, and the thing worth marking, actually
+        // is. Full-desktop has no clip and covers everything.
+        const clip = this.layoutMode === LAYOUT_CLIP ? this.windowRects : null;
+        const clipKey = clip ? clip.map((r) => `${r.x},${r.y},${r.w},${r.h}`).join(';') : '';
+        if (this.surfW === this.wmDrawnW && this.surfH === this.wmDrawnH && clipKey === this.wmDrawnClip) {
+            return;
+        }
+        if (c.width !== this.surfW || c.height !== this.surfH) {
+            c.width = Math.max(1, this.surfW);
+            c.height = Math.max(1, this.surfH);
+            this.wmPattern = null; // a resize drops the context state the pattern belongs to
+        }
+        const ctx = c.getContext('2d');
+        if (!ctx) {
+            console.error('[SurfaceRenderer] watermark 2D context unavailable — blocking the session');
+            this.wmBlocked = true;
+            return;
+        }
+        // Restore the blend mode: `paintBlocked` turns it off to draw an opaque panel, and a
+        // recovered session would otherwise keep rendering its tiles with no blending at all.
+        c.style.mixBlendMode = 'difference';
+        c.removeAttribute('data-iron-watermark-blocked');
+        this.wmBlockedPainted = false;
+        ctx.clearRect(0, 0, c.width, c.height);
+
+        if (!this.wmPattern) {
+            // One cell of the repeating grid: the QR at its offset, transparent elsewhere. The
+            // tile is drawn at intensity `opacity` (a neutral grey) because `difference` turns that
+            // into a +/- delta against the background rather than a fixed colour.
+            const cell = document.createElement('canvas');
+            cell.width = wm.cellW;
+            cell.height = wm.cellH;
+            const cctx = cell.getContext('2d');
+            if (!cctx) return;
+            const img = cctx.createImageData(wm.width, wm.height);
+            const level = Math.min(255, Math.max(0, wm.opacity));
+            for (let i = 0; i < wm.width * wm.height; i++) {
+                const a = wm.rgba[i * 4 + 3] ?? 0;
+                if (a === 0) continue;
+                // Scale the delta by the tile's own alpha so antialiased QR edges stay soft.
+                const v = Math.round((level * a) / 255);
+                img.data[i * 4] = v;
+                img.data[i * 4 + 1] = v;
+                img.data[i * 4 + 2] = v;
+                img.data[i * 4 + 3] = 255;
+            }
+            cctx.putImageData(img, wm.offX, wm.offY);
+            this.wmPattern = ctx.createPattern(cell, 'repeat');
+        }
+        if (!this.wmPattern) return;
+
+        ctx.fillStyle = this.wmPattern;
+        if (clip) {
+            for (const r of clip) {
+                if (r.w <= 0 || r.h <= 0) continue;
+                ctx.fillRect(r.x, r.y, r.w, r.h);
+            }
+        } else {
+            ctx.fillRect(0, 0, c.width, c.height);
+        }
+
+        this.wmDrawnW = this.surfW;
+        this.wmDrawnH = this.surfH;
+        this.wmDrawnClip = clipKey;
+    }
+
     private syncSize(): void {
         const gl = this.gl!;
         const w = Math.max(1, this.wantW || this.base.width);
@@ -648,6 +905,9 @@ export class SurfaceRenderer {
     }
 
     dispose(): void {
+        this.clearWatermark();
+        this.wm = null;
+        this.wmPattern = null;
         this.overlay?.remove();
         this.overlay = null;
         this.gl = null;

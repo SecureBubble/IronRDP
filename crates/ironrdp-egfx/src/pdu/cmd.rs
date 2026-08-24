@@ -2456,8 +2456,41 @@ impl Encode for WatermarkPdu {
 }
 
 impl<'a> Decode<'a> for WatermarkPdu {
+    /// DELIBERATELY LENIENT: this decode does not fail on a malformed body.
+    ///
+    /// A watermark is a security control, so the session must fail CLOSED when one cannot be
+    /// applied. If this returned `Err`, the shared eGFX decode loop would log and drop the PDU, and
+    /// nothing downstream would ever learn a watermark had been mandated -- the session would
+    /// present clean, UNWATERMARKED pixels because a parse failed. That is the same evasion as
+    /// failing to render one, just reached a layer earlier.
+    ///
+    /// Rather than teach the shared loop about this proprietary extension, malformation is carried
+    /// FORWARD as data: a short body yields a short `image`, and a header too small to parse yields
+    /// `width == 0`. Both are caught by the single downstream check in the graphics handler, which
+    /// already blocks the session. One enforcement point, and the leniency stays inside the PDU
+    /// that needs it.
+    ///
+    /// The proxy's `imgSize` is a UINT16, so a tile over 65535 bytes wraps and arrives as a
+    /// self-consistent header with a short body. That case cannot be distinguished at the wire,
+    /// which is why the downstream length check is the authority.
     fn decode(src: &mut ReadCursor<'a>) -> DecodeResult<Self> {
-        ensure_fixed_part_size!(in: src);
+        if src.len() < Self::FIXED_PART_SIZE {
+            // Too short to read the header at all. Report a zero-sized watermark rather than an
+            // error, so the requirement still reaches the handler and blocks the session.
+            src.advance(src.len());
+            return Ok(Self {
+                surface_id: 0,
+                width: 0,
+                height: 0,
+                pixel_format: 0,
+                opacity: 0,
+                reserved_a: 0,
+                reserved_b: 0,
+                h_padding: 0,
+                v_padding: 0,
+                image: Vec::new(),
+            });
+        }
 
         let surface_id = src.read_u16();
         let width = src.read_u16();
@@ -2475,8 +2508,10 @@ impl<'a> Decode<'a> for WatermarkPdu {
         let img_size = usize::from(src.read_u16());
         read_padding!(src, 2);
 
-        ensure_size!(in: src, size: img_size);
-        let image = src.read_slice(img_size).to_vec();
+        // Take what is actually there. A short read is malformation to report downstream, not a
+        // parse error to drop -- see the note on this impl.
+        let available = img_size.min(src.len());
+        let image = src.read_slice(available).to_vec();
 
         Ok(Self {
             surface_id,
@@ -2528,6 +2563,65 @@ mod watermark_tests {
         b.extend_from_slice(&[0u8; 2]);
         b.extend_from_slice(image);
         b
+    }
+
+    /// The proxy's `PROXY_WM_MALFORM=truncate`: an honest header (width/height/imgSize all declare
+    /// the true size) with only half the pixel body.
+    ///
+    /// It must DECODE, carrying the malformation forward as a short image, rather than erroring.
+    /// An error would be logged and dropped by the shared eGFX loop, and the session would present
+    /// clean UNWATERMARKED pixels because a parse failed -- the exact evasion the watermark exists
+    /// to prevent. The downstream `image.len() < w*h*4` check is what blocks it.
+    #[test]
+    fn watermark_with_a_truncated_body_decodes_short_rather_than_erroring() {
+        let full: Vec<u8> = (0..64u8).collect(); // 4x4 ARGB8888
+        let mut bytes = proxy_watermark_bytes(4, 4, &full);
+        // Keep the declared imgSize at 64, drop half the pixels off the end.
+        bytes.truncate(bytes.len() - 32);
+        let decoded = decode::<GfxPdu>(&bytes).expect("must decode so the malformation is REPORTED");
+        let GfxPdu::Watermark(pdu) = decoded else { panic!("wrong variant: {decoded:?}") };
+        assert_eq!((pdu.width, pdu.height), (4, 4), "the header is honest; only the body is short");
+        assert!(
+            pdu.image.len() < usize::from(pdu.width) * usize::from(pdu.height) * 4,
+            "a short body must surface as a short image for the downstream check to catch"
+        );
+    }
+
+    /// A watermark PDU too short to even contain its fixed header still decodes, as a zero-sized
+    /// watermark. Same reason: the requirement has to reach the handler to block the session.
+    #[test]
+    fn watermark_with_a_runt_header_decodes_as_zero_sized() {
+        let bytes = proxy_watermark_bytes(2, 2, &(0..16u8).collect::<Vec<u8>>());
+        // Keep the 8-byte RDPGFX header, cut the body to a few bytes.
+        let mut runt = bytes[..8 + 6].to_vec();
+        // pduLength must match what is actually on the wire or the outer framing rejects it first.
+        let len = u32::try_from(runt.len()).unwrap();
+        runt[4..8].copy_from_slice(&len.to_le_bytes());
+        let decoded = decode::<GfxPdu>(&runt).expect("must decode so the requirement is REPORTED");
+        let GfxPdu::Watermark(pdu) = decoded else { panic!("wrong variant: {decoded:?}") };
+        assert_eq!((pdu.width, pdu.height), (0, 0), "a runt header reports a zero-sized watermark");
+    }
+
+    /// The proxy's `PROXY_WM_MALFORM=overflow`: the authentic UINT16 landmine. width/height say
+    /// 155 (expected 155*155*4 = 96_100) while imgSize has WRAPPED to 96_100 & 0xFFFF = 30_564.
+    ///
+    /// This one DECODES cleanly -- the header is self-consistent -- so the wire layer cannot catch
+    /// it. It is caught downstream by comparing the image length against width*height*4, which is
+    /// why that check exists and why it must stay.
+    #[test]
+    fn watermark_with_a_wrapped_img_size_decodes_but_is_short() {
+        const W: u16 = 155;
+        let wrapped = (usize::from(W) * usize::from(W) * 4) & 0xFFFF;
+        assert_eq!(wrapped, 30_564, "the wrap this test is pinning");
+        let image = vec![0xABu8; wrapped];
+        let bytes = proxy_watermark_bytes(W, W, &image);
+        let decoded = decode::<GfxPdu>(&bytes).expect("a self-consistent header decodes");
+        let GfxPdu::Watermark(pdu) = decoded else { panic!("wrong variant: {decoded:?}") };
+        let expected = usize::from(pdu.width) * usize::from(pdu.height) * 4;
+        assert!(
+            pdu.image.len() < expected,
+            "the downstream length check is the ONLY thing standing between a wrapped imgSize and              an unwatermarked session"
+        );
     }
 
     #[test]
