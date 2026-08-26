@@ -1628,11 +1628,37 @@ fn avc_capable_capsets() -> Vec<RawCapabilitySet> {
         (0x000a_0502, 0),           // V10.5
         (0x000a_0600, 0),           // V10.6
         (0x000a_0701, 0),           // V10.7
-        (0x000b_0101, 0),           // V11.1
-        (0x000b_0200, 0x0000_0400), // V11.2
-        (0x000b_0300, 0x0000_0c00), // V11.3
-        (0x000b_0400, 0),           // V11.4 (real mstsc carries an 8 KB client license here)
-        (0x000b_0500, 0x0000_2c00), // V11.5
+        (0x000b_0101, 0), // V11.1 — DELIBERATE CEILING. Do not raise it.
+        //
+        // V11.2 / V11.3 / V11.4 / V11.5 are deliberately NOT advertised, because what we advertise
+        // decides which PROFILE the AVD host encodes with. Verified three ways -- the host's own
+        // Event Viewer (RdpCoreCDV/Operational), proxy wire capture, and client logs:
+        //
+        //   iron advertising to 0xB0500 -> client mode 0 -> AvcMixedModeProfile -> ARTIFACTS
+        //   Microsoft AVD web client    -> client mode 2 -> Avc444FullScreenProfile
+        //   MSRDC native client         -> client mode 0, 0xB0500 -> AvcMixedMode, renders FINE
+        //
+        // THIS CAP IS A HEDGE, NOT A GUARANTEE. Do not read it as "V11.1 avoids MixedMode".
+        // Wire-verified across several sessions at 0xB0101 with the GPO off, the host's choice is
+        // DYNAMIC: it has produced Balanced, AVC444v2, and AVC420 MixedMode. Capping lowers the
+        // odds of MixedMode; it does not remove them.
+        //
+        // What MixedMode is: AVC420 over part of the surface, plus ClearCodec tiles, plus heavy
+        // tile caching (one capture: 788 AVC-sourced SURFACE_TO_CACHE and 1723 AVC-sourced
+        // CACHE_TO_SURFACE). It is a perfectly renderable stream -- the MSRDC NATIVE client gets
+        // exactly this profile and renders it correctly, with H.264. What makes it hard for US is
+        // that a native client decodes SYNCHRONOUSLY, so its cache always reads real pixels, while
+        // we decode asynchronously via WebCodecs into a GPU texture, where a cache store can race
+        // the decoder.
+        //
+        // So the load-bearing fix is NOT this cap -- it is the GPU-sourced tile cache
+        // (SURFACE_TO_CACHE captures the composited GPU surface, ordered against in-flight
+        // decodes). That is what keeps a 444-off host clean, and because MixedMode carries AVC420
+        // there is no video cost when it holds. Regression-test THAT under MixedMode; this cap
+        // just reduces how often we have to rely on it.
+        //
+        // The comment this replaces claimed the V11.x capsets were needed "to switch the target to
+        // AVC444". Only V11.1 is.
     ];
     CAPS.iter()
         .map(|&(ver, flags)| RawCapabilitySet::new(CapabilityVersion(ver), flags.to_le_bytes().to_vec()))
