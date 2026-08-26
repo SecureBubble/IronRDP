@@ -245,9 +245,7 @@ export function onAvcAck(params: { frameId: number }): Extension {
  *  the affected area on a real pixel change instead of sampling on a blind timer. The AVC
  *  GPU direct-draw path never re-enters the run loop, so it notifies separately via
  *  `AvcDecoder.setCanvasUpdatedCallback`. It never touches frame-ack / present flow. */
-export function canvasUpdatedCallback(
-    cb: (x: number, y: number, width: number, height: number) => void,
-): Extension {
+export function canvasUpdatedCallback(cb: (x: number, y: number, width: number, height: number) => void): Extension {
     return new Extension('canvas_updated_callback', cb as unknown);
 }
 
@@ -287,6 +285,19 @@ export function surfaceCopyCallback(
     cb: (srcX: number, srcY: number, width: number, height: number, points: Int32Array) => void,
 ): Extension {
     return new Extension('surface_copy_callback', cb as unknown);
+}
+
+/** WebGL GPU tile cache (`?ironwebgl=1`). eGFX `SURFACE_TO_CACHE` / `CACHE_TO_SURFACE`.
+ *  `points` empty means STORE the `width`x`height` block at (`srcX`,`srcY`) into `slot`; non-empty
+ *  means RESTORE `slot` to each point (flattened `[x, y, ...]`), all in surface coords.
+ *
+ *  MUST run on the GPU, for the same reason as `surfaceCopyCallback`: a cached block may contain
+ *  AVC video, which on this path exists only in the GPU surface texture. Caching it from the WASM
+ *  buffer stores a transparent hole, and restoring that hole paints opaque black over the video. */
+export function surfaceCacheCallback(
+    cb: (slot: number, srcX: number, srcY: number, width: number, height: number, points: Int32Array) => void,
+): Extension {
+    return new Extension('surface_cache_callback', cb as unknown);
 }
 
 /** RAIL (RemoteApp) active-window rect notification. The run loop calls it when the

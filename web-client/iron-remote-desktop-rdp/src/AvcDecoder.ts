@@ -24,6 +24,7 @@ import {
     avcWatermarkCallback,
     surfacePresentCallback,
     surfaceLayoutCallback,
+    surfaceCacheCallback,
     surfaceCopyCallback,
 } from './extensions';
 import type { Extension } from '../../../crates/ironrdp-web/pkg/ironrdp_web';
@@ -82,6 +83,12 @@ function webGlPresentEnabled(): boolean {
  * Read once at module scope, like the other flags: a decoder is configured per surface at its first
  * keyframe, and re-reading per surface would let a mid-session URL change split one session in two.
  */
+/**
+ * Cap on queued tile-cache ops. Only reachable if decodes stop completing; past it we execute
+ * rather than queue, because a permanently stalled queue would freeze the chrome entirely.
+ */
+const MAX_QUEUED_CACHE_OPS = 512;
+
 const HW_DECODE = (() => {
     try {
         const p = new URLSearchParams(globalThis.location?.search ?? '').get('ironhwdec')?.replace(/^"|"$/g, '');
@@ -216,9 +223,56 @@ export class AvcDecoder {
                       surfaceCopyCallback((srcX, srcY, w, h, points) => {
                           this.renderer?.copyRegion(srcX, srcY, w, h, points);
                       }),
+                      surfaceCacheCallback((slot, srcX, srcY, w, h, points) => {
+                          this.queueCacheOp(slot, srcX, srcY, w, h, points);
+                      }),
                   ]
                 : []),
         ];
+    }
+
+    /**
+     * eGFX tile-cache ops held until in-flight AVC decodes have been drawn.
+     *
+     * WHY. A tile-cache STORE reads the GPU surface texture, but WebCodecs decode is ASYNCHRONOUS
+     * and its latency exceeds one frame interval. Measured on a live session: the host stored
+     * slot 2971 in frame 228 while frame 227's AVC picture was still decoding, so the capture took
+     * whatever was underneath -- wallpaper. That slot is a SOLID-FILL block the host then stamps
+     * across a window (32 restores of that one slot, and 67 of another), which is why one bad
+     * capture shows up as wallpaper-coloured bands all over a window rather than a single wrong tile.
+     *
+     * BOTH kinds are queued, and that is the whole point. An earlier attempt queued only stores,
+     * which INVERTED their order against the restores the host interleaves with them
+     * (`CacheToSurface x19 -> SurfaceToCache x10` in one frame) and made the artifacts worse. The
+     * invariant is: cache ops execute in ARRIVAL ORDER, delayed only as a group.
+     *
+     * Once anything is queued, everything queues behind it until the queue drains -- otherwise a
+     * later op could overtake an earlier one and reintroduce exactly that inversion.
+     */
+    private cacheOps: Array<[number, number, number, number, number, Int32Array]> = [];
+    private pendingDecodes = 0;
+
+    private queueCacheOp(slot: number, sx: number, sy: number, w: number, h: number, points: Int32Array): void {
+        if (this.pendingDecodes > 0 && this.cacheOps.length < MAX_QUEUED_CACHE_OPS) {
+            this.cacheOps.push([slot, sx, sy, w, h, points]);
+            return;
+        }
+        if (this.cacheOps.length > 0) {
+            // Never overtake queued work.
+            this.cacheOps.push([slot, sx, sy, w, h, points]);
+            this.drainCacheOps();
+            return;
+        }
+        this.renderer?.cacheRegion(slot, sx, sy, w, h, points);
+    }
+
+    private drainCacheOps(): void {
+        if (this.cacheOps.length === 0) return;
+        const ops = this.cacheOps;
+        this.cacheOps = [];
+        for (const [slot, sx, sy, w, h, points] of ops) {
+            this.renderer?.cacheRegion(slot, sx, sy, w, h, points);
+        }
     }
 
     /** Give us the live session (its `invokeExtension` is our RGBA/ack return path). */
@@ -326,6 +380,9 @@ export class AvcDecoder {
                     // one, drop this surface back to software and rebuild on the next keyframe --
                     // otherwise a machine with a broken hardware decoder gets a dead surface, which
                     // would be a far worse regression than the CPU we are trying to save.
+                    // Decodes that will never complete must not strand queued ops.
+                    this.pendingDecodes = 0;
+                    this.drainCacheOps();
                     this.fallBackToSoftware(surfaceId);
                 },
             });
@@ -378,9 +435,12 @@ export class AvcDecoder {
         // rect, and the canvas-update notification).
         sd.geom.set(ts, { frameId, rects: unflatten(regions), originX, originY });
         try {
+            this.pendingDecodes++;
             sd.decoder.decode(new EncodedVideoChunk({ type: hasKey ? 'key' : 'delta', timestamp: ts, data }));
         } catch (e) {
             console.error('[AVC] decode() threw (surface', surfaceId, ')', e);
+            this.pendingDecodes = Math.max(0, this.pendingDecodes - 1);
+            this.drainCacheOps();
             sd.geom.delete(ts);
         }
     }
@@ -423,6 +483,9 @@ export class AvcDecoder {
             for (const r of meta.rects) {
                 this.canvasUpdated?.(r.x + meta.originX, r.y + meta.originY, r.w, r.h);
             }
+            // The picture is in the texture now, so queued cache ops can run against real pixels.
+            this.pendingDecodes = Math.max(0, this.pendingDecodes - 1);
+            if (this.pendingDecodes === 0) this.drainCacheOps();
         } else {
             frame.close();
         }

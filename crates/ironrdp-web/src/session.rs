@@ -139,6 +139,10 @@ struct SessionBuilderInner {
     /// WebGL GPU copy callback (extension `surface_copy_callback`). Executes eGFX
     /// SurfaceToSurface copies inside the GPU surface texture.
     surface_copy_callback: Option<js_sys::Function>,
+    /// WebGL GPU tile-cache callback (extension `surface_cache_callback`). Executes eGFX
+    /// `SURFACE_TO_CACHE` / `CACHE_TO_SURFACE` on the GPU, for the same reason as
+    /// `surface_copy_callback`: cached pixels may be AVC video that never reaches WASM.
+    surface_cache_callback: Option<js_sys::Function>,
     /// RAIL active-window notification (extension `rail_window_callback`). Fired
     /// when the presentation rect of the active RAIL (RemoteApp) top-level window
     /// changes, with `(x, y, width, height)` in virtual-desktop coordinates. The
@@ -218,6 +222,7 @@ impl Default for SessionBuilderInner {
             surface_layout_callback: None,
             rail_windows_callback: None,
             surface_copy_callback: None,
+            surface_cache_callback: None,
             rail_window_callback: None,
             canvas_resized_callback: None,
 
@@ -486,6 +491,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             // webapp can crop/scale to just that window (see field docs). Passive: it
             // never affects protocol / frame-ack state and never fires for a full desktop.
             // WebGL GPU copy: executes SurfaceToSurface inside the GPU surface texture.
+            |surface_cache_callback: JsValue| {
+                self.0.borrow_mut().surface_cache_callback = surface_cache_callback.dyn_into::<js_sys::Function>().ok();
+            };
+            // WebGL GPU tile cache: executes SurfaceToCache / CacheToSurface on the GPU texture.
             |surface_copy_callback: JsValue| {
                 self.0.borrow_mut().surface_copy_callback = surface_copy_callback.dyn_into::<js_sys::Function>().ok();
             };
@@ -528,6 +537,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             surface_layout_callback,
             rail_windows_callback,
             surface_copy_callback,
+            surface_cache_callback,
             rail_window_callback,
             canvas_resized_callback,
             invalid_print_job_stream_callbacks,
@@ -580,6 +590,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             surface_layout_callback = inner.surface_layout_callback.clone();
             rail_windows_callback = inner.rail_windows_callback.clone();
             surface_copy_callback = inner.surface_copy_callback.clone();
+            surface_cache_callback = inner.surface_cache_callback.clone();
             rail_window_callback = inner.rail_window_callback.clone();
             canvas_resized_callback = inner.canvas_resized_callback.clone();
             invalid_print_job_stream_callbacks = inner.invalid_print_job_stream_callbacks;
@@ -814,6 +825,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             surface_layout_callback,
             rail_windows_callback,
             surface_copy_callback,
+            surface_cache_callback,
             rail_window_callback,
             canvas_resized_callback,
 
@@ -889,6 +901,23 @@ pub(crate) enum RdpInputEvent {
         src_y: u32,
         width: u32,
         height: u32,
+        points: Vec<(u32, u32)>,
+    },
+    /// eGFX `SURFACE_TO_CACHE` on the WebGL path: snapshot a surface rect into a GPU cache slot.
+    ///
+    /// Must happen on the GPU for the same reason as [`Self::SurfaceCopy`]: the pixels being cached
+    /// may be AVC video, which lives ONLY in the GPU texture. Reading them from the WASM `SurfaceBuf`
+    /// caches a transparent HOLE, and restoring that hole later paints opaque black over the video.
+    SurfaceCacheStore {
+        cache_slot: u16,
+        src_x: u32,
+        src_y: u32,
+        width: u32,
+        height: u32,
+    },
+    /// eGFX `CACHE_TO_SURFACE` on the WebGL path: blit a GPU cache slot to each destination point.
+    SurfaceCacheRestore {
+        cache_slot: u16,
         points: Vec<(u32, u32)>,
     },
     /// The current session watermark, forwarded by the graphics handler so the run
@@ -1028,6 +1057,7 @@ pub(crate) struct Session {
     rail_windows_callback: Option<js_sys::Function>,
     /// WebGL GPU copy callback; executes eGFX SurfaceToSurface inside the GPU surface texture.
     surface_copy_callback: Option<js_sys::Function>,
+    surface_cache_callback: Option<js_sys::Function>,
     /// RAIL active-window rect notification; `None` if the webapp registered none.
     rail_window_callback: Option<js_sys::Function>,
     /// Render-canvas backing-store resize notification; fired after the run loop resizes the
@@ -1214,6 +1244,50 @@ impl Session {
         ]);
         if let Err(err) = cb.apply(&JsValue::NULL, &args) {
             warn!(?err, "surface_copy callback threw");
+        }
+    }
+
+    /// eGFX `SURFACE_TO_CACHE` on the WebGL path — snapshot a surface rect into a GPU cache slot.
+    fn notify_surface_cache_store(&self, cache_slot: u16, src_x: u32, src_y: u32, width: u32, height: u32) {
+        let Some(cb) = &self.surface_cache_callback else {
+            return;
+        };
+        // `points` empty == STORE; a non-empty list == RESTORE. One callback carries both so the
+        // extension surface stays small and the two can never disagree about slot semantics.
+        let args = js_sys::Array::from_iter([
+            JsValue::from_f64(f64::from(cache_slot)),
+            JsValue::from_f64(f64::from(src_x)),
+            JsValue::from_f64(f64::from(src_y)),
+            JsValue::from_f64(f64::from(width)),
+            JsValue::from_f64(f64::from(height)),
+            js_sys::Int32Array::new_with_length(0).into(),
+        ]);
+        if let Err(err) = cb.apply(&JsValue::NULL, &args) {
+            warn!(?err, "surface_cache callback threw (store)");
+        }
+    }
+
+    /// eGFX `CACHE_TO_SURFACE` on the WebGL path — blit a GPU cache slot to each destination point.
+    fn notify_surface_cache_restore(&self, cache_slot: u16, points: &[(u32, u32)]) {
+        let Some(cb) = &self.surface_cache_callback else {
+            return;
+        };
+        let flat = js_sys::Int32Array::new_with_length(u32::try_from(points.len() * 2).unwrap_or(0));
+        for (i, &(x, y)) in points.iter().enumerate() {
+            let base = u32::try_from(i * 2).unwrap_or(0);
+            flat.set_index(base, i32::try_from(x).unwrap_or(0));
+            flat.set_index(base + 1, i32::try_from(y).unwrap_or(0));
+        }
+        let args = js_sys::Array::from_iter([
+            JsValue::from_f64(f64::from(cache_slot)),
+            JsValue::from_f64(0.0),
+            JsValue::from_f64(0.0),
+            JsValue::from_f64(0.0),
+            JsValue::from_f64(0.0),
+            flat.into(),
+        ]);
+        if let Err(err) = cb.apply(&JsValue::NULL, &args) {
+            warn!(?err, "surface_cache callback threw (restore)");
         }
     }
 
@@ -1562,6 +1636,17 @@ impl iron_remote_desktop::Session for Session {
                         RdpInputEvent::SurfaceCopy { src_x, src_y, width, height, points } => {
                             // GPU screen-to-screen copy (window relocation). No WASM pixels move.
                             self.notify_surface_copy(src_x, src_y, width, height, &points);
+                            Vec::new()
+                        }
+                        RdpInputEvent::SurfaceCacheStore { cache_slot, src_x, src_y, width, height } => {
+                            // GPU-side tile cache store. No WASM pixels are read.
+                            self.notify_surface_cache_store(cache_slot, src_x, src_y, width, height);
+                            Vec::new()
+                        }
+                        RdpInputEvent::SurfaceCacheRestore { cache_slot, points } => {
+                            // GPU-side tile cache restore. No WASM pixels are written, and crucially
+                            // no dirty region is marked -- an upload would re-paint the hole.
+                            self.notify_surface_cache_restore(cache_slot, &points);
                             Vec::new()
                         }
                         RdpInputEvent::SurfaceLayout { mode, surface_w, surface_h, rects } => {

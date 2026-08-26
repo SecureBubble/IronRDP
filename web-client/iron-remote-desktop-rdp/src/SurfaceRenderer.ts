@@ -38,6 +38,21 @@ interface Rect {
  * and not one stat line was written. The webapp latches the flag into sessionStorage on first
  * sighting; this reads the same latch so the vendor and the app arm together.
  */
+/**
+ * Per-restore tile-cache tracing (`?irontc=1`). SEPARATE from `?ironstats=1` on purpose: a RAIL
+ * session produced 53,093 restores, and one console line each would drown the perf meter that
+ * `ironstats` exists for -- the instrument would distort the thing it measures. Aggregate cache
+ * counters stay under `ironstats`; only the per-restore `dst <- src` line needs this.
+ */
+const TILECACHE_TRACE = (() => {
+    try {
+        const p = new URLSearchParams(globalThis.location?.search ?? '').get('irontc')?.replace(/^"|"$/g, '');
+        return p === '1';
+    } catch {
+        return false;
+    }
+})();
+
 const STATS_ENABLED = (() => {
     try {
         // Tolerant of both `ironstats=1` and `ironstats="1"` -- the app router JSON-serializes
@@ -224,6 +239,17 @@ export class SurfaceRenderer {
     private rafScheduled = false;
     private pending = false;
     private readonly stats = new PresentStats();
+    /** eGFX tile cache, GPU-side. See `cacheRegion` for why the CPU cache cannot serve this path. */
+    private readonly tileCache = new Map<number, { tex: WebGLTexture; w: number; h: number }>();
+    // Tile-cache diagnostics. Stale tiles look the same whether the slot was never stored (a miss)
+    // or was stored with the wrong pixels; these separate the two.
+    private tcStores = 0;
+    private tcRestores = 0;
+    private tcMisses = 0;
+    private readonly tcMissedSlots = new Set<number>();
+    private tcReportAt = 0;
+    /** slot -> "sx,sy WxH" it was captured from. Diagnostics only (?ironstats=1). */
+    private readonly tcOrigin = new Map<number, string>();
 
     // ---- session watermark (RDPGFX_CMDID_WATERMARK), drawn on its own canvas above the present
     // canvas. See `setWatermark` for why it is a sibling layer and not blended into the pixels.
@@ -428,6 +454,107 @@ export class SurfaceRenderer {
     }
 
     /**
+     * eGFX tile cache on the GPU: `SURFACE_TO_CACHE` (store) and `CACHE_TO_SURFACE` (restore).
+     *
+     * WHY THIS EXISTS. The Rust compositor also keeps a CPU tile cache, but on this path that cache
+     * is worthless and actively harmful: it snapshots the WASM `SurfaceBuf`, which has a
+     * video-shaped HOLE wherever AVC painted, because AVC frames are decoded in JS and live only in
+     * the GPU texture. Caching a block that straddles video stores transparency, and restoring it
+     * later punches an opaque black rectangle through the live video.
+     *
+     * This is the same failure `copyRegion` was written to fix for `SurfaceToSurface`. The cache
+     * commands were left on the CPU at the time because they were wire-confirmed unused -- true
+     * while the host had the AVC444 GPO on, since it then encodes the whole surface as AVC444 and
+     * has nothing to cache. With that GPO off the host switches to AVC420 plus heavy tile caching,
+     * and the black rectangles came back everywhere.
+     *
+     * `points` empty means STORE (snapshot `w`x`h` at `sx`,`sy` into `slot`); non-empty means
+     * RESTORE (blit `slot` to each point). One entry point so the two can never disagree.
+     *
+     * Slots are whole textures rather than an atlas: the host reuses a bounded set of slots and
+     * re-stores them constantly, so per-slot textures keep each store a single `copyTexImage2D`
+     * with no packing, and a re-store of a different size just reallocates that one texture.
+     */
+    cacheRegion(slot: number, sx: number, sy: number, w: number, h: number, points: Int32Array): void {
+        if (!this.ensure()) return;
+        this.syncSize();
+        const gl = this.gl!;
+
+        if (points.length === 0) {
+            // STORE
+            if (w <= 0 || h <= 0) return;
+            this.tcStores++;
+            let entry = this.tileCache.get(slot);
+            if (!entry) {
+                const tex = this.makeTexture(gl);
+                if (!tex) return;
+                entry = { tex, w: 0, h: 0 };
+                this.tileCache.set(slot, entry);
+            }
+            gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+            gl.bindTexture(gl.TEXTURE_2D, entry.tex);
+            // Reads from the FBO's colour attachment (the surface texture), so it captures whatever
+            // is really on screen there -- chrome AND decoded video alike.
+            gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, sx, sy, w, h, 0);
+            entry.w = w;
+            entry.h = h;
+            // Record WHERE this slot was captured from. A wrong tile on screen is otherwise
+            // untraceable: the restore looks correct and the bad pixels came from a store that
+            // happened earlier, somewhere else. With this, a visible artifact at (x,y) can be
+            // looked up rather than guessed at.
+            if (TILECACHE_TRACE) this.tcOrigin.set(slot, `${sx},${sy} ${w}x${h}`);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            return;
+        }
+
+        // RESTORE
+        this.tcRestores++;
+        const entry = this.tileCache.get(slot);
+        if (!entry || entry.w <= 0 || entry.h <= 0) {
+            // Cache miss. Leave the destination alone rather than painting garbage -- same choice
+            // the Rust compositor makes for an unfilled slot.
+            //
+            // A miss is NOT benign: it leaves whatever was on screen, which is how a stale tile
+            // survives. Counted, and each missing slot warns once, because "is the GPU cache
+            // missing entries?" and "is it storing the wrong pixels?" produce identical artifacts
+            // on screen and need opposite fixes.
+            this.tcMisses++;
+            if (!this.tcMissedSlots.has(slot)) {
+                this.tcMissedSlots.add(slot);
+                console.warn(
+                    `[tilecache] MISS slot=${slot} never stored on the GPU; ` +
+                        `${points.length / 2} destination(s) left stale`,
+                );
+            }
+            return;
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+        gl.bindTexture(gl.TEXTURE_2D, entry.tex);
+        gl.viewport(0, 0, this.surfW, this.surfH);
+        const W = this.surfW;
+        const H = this.surfH;
+        for (let i = 0; i + 1 < points.length; i += 2) {
+            const dx = points[i]!;
+            const dy = points[i + 1]!;
+            // `dst <- src` for every restore, so an artifact's screen position maps straight back to
+            // the source rect it was captured from. Behind ?ironstats=1 -- it is one line per
+            // restore and there are thousands.
+            if (TILECACHE_TRACE) {
+                console.info(
+                    `[tilecache] restore slot=${slot} dst=${dx},${dy} ${entry.w}x${entry.h} ` +
+                        `src=${this.tcOrigin.get(slot) ?? '?'}`,
+                );
+            }
+            gl.uniform4f(this.uDst, (dx / W) * 2 - 1, (dy / H) * 2 - 1, (entry.w / W) * 2, (entry.h / H) * 2);
+            gl.uniform4f(this.uSrc, 0, 0, 1, 1);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        this.pending = true;
+        this.scheduleFrame();
+    }
+
+    /**
      * Path A presentation layout, pushed by the Rust compositor whenever it changes.
      *
      * `rects` is flattened `[x, y, w, h, ...]` in surface (== desktop) coords. In CLIP mode we
@@ -535,6 +662,13 @@ export class SurfaceRenderer {
         if (this.wmBlocked) this.paintBlocked();
         const now = performance.now();
         this.stats.record(now - t0, STATS_ENABLED ? now - wmT0 : 0, now);
+        if (STATS_ENABLED && now - this.tcReportAt > 2000) {
+            this.tcReportAt = now;
+            console.info(
+                `[tilecache] stores=${this.tcStores} restores=${this.tcRestores} ` +
+                    `misses=${this.tcMisses} live_slots=${this.tileCache.size}`,
+            );
+        }
     }
 
     // ------------------------------------------------------------------ setup
@@ -919,6 +1053,11 @@ export class SurfaceRenderer {
     }
 
     dispose(): void {
+        const gl = this.gl;
+        if (gl) {
+            for (const entry of this.tileCache.values()) gl.deleteTexture(entry.tex);
+        }
+        this.tileCache.clear();
         this.clearWatermark();
         this.wm = null;
         this.wmPattern = null;

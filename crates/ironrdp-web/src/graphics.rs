@@ -274,6 +274,26 @@ impl WasmGraphicsMessageProxy {
 
     /// Hand a SurfaceToSurface copy to the run loop for GPU execution (WebGL path). The pixels
     /// being moved live only in the GPU texture, so the copy cannot be done here.
+    fn send_cache_store(&self, cache_slot: u16, src_x: u32, src_y: u32, width: u32, height: u32) {
+        if self
+            .tx
+            .unbounded_send(RdpInputEvent::SurfaceCacheStore { cache_slot, src_x, src_y, width, height })
+            .is_err()
+        {
+            warn!("Failed to send surface cache store, receiver is closed");
+        }
+    }
+
+    fn send_cache_restore(&self, cache_slot: u16, points: Vec<(u32, u32)>) {
+        if self
+            .tx
+            .unbounded_send(RdpInputEvent::SurfaceCacheRestore { cache_slot, points })
+            .is_err()
+        {
+            warn!("Failed to send surface cache restore, receiver is closed");
+        }
+    }
+
     fn send_copy(&self, src_x: u32, src_y: u32, width: u32, height: u32, points: Vec<(u32, u32)>) {
         if self
             .tx
@@ -641,7 +661,10 @@ const WEBGL_MAX_RECTS: usize = 256;
 pub(crate) struct WasmGraphicsHandler {
     proxy: WasmGraphicsMessageProxy,
     surfaces: HashMap<u16, SurfaceBuf>,
-    cache: HashMap<u16, SurfaceBuf>,
+    /// eGFX tile cache. The bool records whether the cached block contains a TRANSPARENT HOLE,
+    /// i.e. whether it straddles AVC-covered pixels that never reach the WASM buffer. That decides
+    /// which restore path is correct on the WebGL path — see `on_cache_to_surface`.
+    cache: HashMap<u16, (SurfaceBuf, bool)>,
     /// surface_id -> output origin (x, y) for surfaces mapped to the output.
     mapped: HashMap<u16, (u32, u32)>,
     /// Added to a RAIL window rect to move it from the host's DESKTOP space (primary-relative,
@@ -906,6 +929,17 @@ impl WasmGraphicsHandler {
         }
 
         // --- 2. Upload this frame's freshly decoded non-AVC rects, and nothing else. ---
+        self.flush_webgl_uploads();
+    }
+
+    /// Push this surface's freshly decoded non-AVC rects to the GPU.
+    ///
+    /// Split out of `present_webgl` because MS-RDPEGFX applies the commands inside a frame IN
+    /// ORDER, and two of them (`SURFACE_TO_CACHE`, `SURFACE_TO_SURFACE`) READ the surface. Batching
+    /// every upload to frame-complete breaks that: a cache store running mid-frame would snapshot
+    /// a GPU texture that does not yet contain the paints which preceded it in the same frame, and
+    /// silently cache stale pixels. So a reader flushes first, then reads.
+    fn flush_webgl_uploads(&mut self) {
         let mapped_ids: Vec<u16> = self.mapped.keys().copied().collect();
         for surface_id in mapped_ids {
             let mut rects = self.webgl_rects.remove(&surface_id).unwrap_or_default();
@@ -1659,6 +1693,9 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         // Note this is NOT the tile cache — SurfaceToCache/CacheToSurface are unused in this
         // session (wire-confirmed); SurfaceToSurface is a separate primitive.
         if self.webgl_present {
+            // Flush first, for the same reason as the cache store: this copy READS the GPU texture,
+            // and a frame's paints are otherwise not there yet when a mid-frame command runs.
+            self.flush_webgl_uploads();
             // The GPU texture is ONE output-space framebuffer, but these coordinates are
             // SURFACE-local. They coincide only when the surface's output origin is (0,0) --
             // i.e. single monitor. Under multi-monitor each screen is its own surface, so a copy
@@ -1698,15 +1735,42 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
         if let Some(src) = self.surfaces.get(&pdu.surface_id) {
             let mut buf = SurfaceBuf::new(w, h);
             buf.data = src.extract(sx, sy, w, h);
-            self.cache.insert(pdu.cache_slot, buf);
+            // Computed HERE, once per store, rather than per restore: restores outnumber stores
+            // roughly 2:1 in a live session (measured 1047 vs 440).
+            let has_hole = buf.data.chunks_exact(4).any(|px| px[3] == 0);
+            self.cache.insert(pdu.cache_slot, (buf, has_hole));
+        }
+        // FLUSH FIRST. MS-RDPEGFX applies a frame's commands in order, so this store must capture
+        // the paints that preceded it in this same frame. The WebGL path batches uploads to
+        // frame-complete, so without this the GPU texture is one frame stale here and we would
+        // cache the wrong pixels -- which showed up as small wrong blocks in window title bars.
+        if self.webgl_present {
+            self.flush_webgl_uploads();
+        }
+        // WebGL path: ALSO snapshot on the GPU, and treat that copy as authoritative.
+        //
+        // The CPU cache above is caching whatever the WASM SurfaceBuf holds -- and where AVC video
+        // painted, that buffer holds a transparent HOLE, not the picture. Restoring such a block
+        // later paints the hole back, which uploads as opaque black over live video.
+        //
+        // An older comment on `on_surface_to_surface` recorded that these cache commands were
+        // "unused in this session (wire-confirmed)". That was true with the AVC444 GPO on -- the
+        // host then encodes the whole surface as AVC444 and has nothing to cache. With that GPO
+        // OFF the host switches to AVC420 plus heavy tile caching (measured: 902 CacheToSurface /
+        // 491 SurfaceToCache against 104 AVC420 frames in one short session), which is exactly the
+        // configuration that produced black rectangles all over the desktop.
+        if self.webgl_present {
+            let (ox, oy) = self.mapped.get(&pdu.surface_id).copied().unwrap_or((0, 0));
+            self.proxy
+                .send_cache_store(pdu.cache_slot, sx.saturating_add(ox), sy.saturating_add(oy), w, h);
         }
     }
 
     fn on_cache_to_surface(&mut self, pdu: &CacheToSurfacePdu) {
-        let Some((w, h, block)) = self
+        let Some((w, h, block, has_hole)) = self
             .cache
             .get(&pdu.cache_slot)
-            .map(|c| (c.width, c.height, c.data.clone()))
+            .map(|(c, hole)| (c.width, c.height, c.data.clone(), *hole))
         else {
             // Cache miss: the server referenced a slot this (fresh) client never
             // filled. Leave the destination region as-is rather than painting garbage.
@@ -1717,6 +1781,29 @@ impl GraphicsPipelineHandler for WasmGraphicsHandler {
             for p in &points {
                 dst.blit(u32::from(p.x), u32::from(p.y), w, h, &block, w);
             }
+        }
+        // WebGL path: restore from the GPU cache and DO NOT mark dirty.
+        //
+        // `mark_dirty` also pushes to `webgl_rects`, and a restore-heavy session (measured 1047
+        // restores) would blow past WEBGL_MAX_RECTS, which swaps the exact rects for ONE
+        // dirty-bbox-sized upload -- a box that spans the AVC hole and paints it black. That is a
+        // large black rectangle, i.e. a worse version of the bug being fixed here.
+        let _ = has_hole;
+        if self.webgl_present {
+            let (ox, oy) = self.mapped.get(&pdu.surface_id).copied().unwrap_or((0, 0));
+            self.proxy.send_cache_restore(
+                pdu.cache_slot,
+                points
+                    .iter()
+                    .map(|p| {
+                        (
+                            u32::from(p.x).saturating_add(ox),
+                            u32::from(p.y).saturating_add(oy),
+                        )
+                    })
+                    .collect(),
+            );
+            return;
         }
         for p in &points {
             self.mark_dirty(pdu.surface_id, u32::from(p.x), u32::from(p.y), w, h);
