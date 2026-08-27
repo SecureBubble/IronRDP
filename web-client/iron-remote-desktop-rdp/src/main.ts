@@ -173,6 +173,8 @@ export {
     avcWatermarkCallback,
     canvasUpdatedCallback,
     railActivate,
+    railLaunchApp,
+    railWindowMove,
     railSysCommand,
     SC_MINIMIZE,
     SC_MAXIMIZE,

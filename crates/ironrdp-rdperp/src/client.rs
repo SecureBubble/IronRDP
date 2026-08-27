@@ -92,6 +92,25 @@ impl RailChannel {
         SvcMessage::from(RailPdu::Activate(Activate { window_id, enabled }))
     }
 
+    /// Launch an ADDITIONAL RemoteApp on the live session (§2.2.2.3.1), without reconnecting.
+    ///
+    /// Same PDU as the initial launch, just sent later. The initial one rides `with_app` at
+    /// handshake because there is nothing to send it on before that; nothing in MS-RDPERP limits a
+    /// session to one Execute, and the Microsoft AVD web client relies on that -- a captured
+    /// session shows three different app GUIDs launched over ONE connection.
+    ///
+    /// On AVD `exe_or_file` is the published-app resource id in the `||<guid>` form, not a path,
+    /// so the caller passes what the workspace API returned.
+    pub fn launch_app(&self, app: RemoteApp) -> SvcMessage {
+        SvcMessage::from(RailPdu::ClientExecute(ClientExecute {
+            flags: crate::pdu::ClientExecuteFlags::EXPAND_WORKING_DIRECTORY
+                | crate::pdu::ClientExecuteFlags::EXPAND_ARGUMENTS,
+            exe_or_file: app.exe_or_file,
+            working_dir: app.working_dir,
+            arguments: app.arguments,
+        }))
+    }
+
     /// Build a `TS_RAIL_ORDER_SYSCOMMAND` (§2.2.2.6.2): minimise / maximise / restore / close.
     ///
     /// `command` is one of the `SC_*` constants. Note `SC_RESTORE` is NOT safe to send blindly —

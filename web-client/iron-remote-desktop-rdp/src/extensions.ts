@@ -235,6 +235,38 @@ export function railActivate(params: { window_id: number }): Extension {
     return new Extension('rail_activate', params as unknown);
 }
 
+/** `TS_RAIL_ORDER_EXEC` — launch an ADDITIONAL RemoteApp on the LIVE session, no reconnect.
+ *
+ *  Nothing in MS-RDPERP limits a session to one Execute; the initial launch only rides the
+ *  handshake because there is no channel to send it on before that. The Microsoft AVD web client
+ *  relies on this for its app launcher — a captured session shows three app GUIDs launched over a
+ *  single connection.
+ *
+ *  On AVD `exe_or_file` is the published-app RESOURCE ID in `||<guid>` form, not a path — pass
+ *  through whatever the workspace API returned. `working_dir` and `arguments` are optional. */
+/** `TS_RAIL_ORDER_WINDOW_MOVE` — report a window's FINAL rect after a client-side move or resize.
+ *
+ *  We advertise ALLOWLOCALMOVESIZE, so the host delegates move/size to the client: it neither
+ *  sends resize cursors nor resizes on its own. The client drags locally and reports the result
+ *  here, in DESKTOP coordinates. */
+export function railWindowMove(params: {
+    window_id: number;
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+}): Extension {
+    return new Extension('rail_window_move', params as unknown);
+}
+
+export function railLaunchApp(params: { exe_or_file: string; working_dir?: string; arguments?: string }): Extension {
+    return new Extension('rail_launch_app', {
+        working_dir: '',
+        arguments: '',
+        ...params,
+    } as unknown);
+}
+
 export function onAvcAck(params: { frameId: number }): Extension {
     return new Extension('on_avc_ack', params as unknown);
 }

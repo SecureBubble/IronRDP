@@ -66,6 +66,20 @@ const STATS_ENABLED = (() => {
 })();
 
 /** Present modes from the Rust compositor (`WEBGL_LAYOUT_*` in graphics.rs — keep in sync). */
+/** Which edge of which RAIL window the pointer is over, and the cursor for it. */
+export interface RailEdgeHit {
+    cursor: string;
+    /** 'l' | 'r' | 't' | 'b' | 'tl' | 'tr' | 'bl' | 'br' */
+    edge: string;
+    /** RAIL window id — what a resulting `WindowMove` is addressed to. */
+    id: number;
+    /** The window's current rect in SURFACE coords, the basis for the new rect. */
+    rect: { x: number; y: number; w: number; h: number };
+}
+
+/** Grab margin around a RAIL window edge, in surface pixels. Matches the feel of a native frame. */
+const RESIZE_EDGE_PX = 6;
+
 const LAYOUT_BLANK = 0;
 const LAYOUT_FULLSCREEN = 1;
 const LAYOUT_CLIP = 2;
@@ -235,6 +249,8 @@ export class SurfaceRenderer {
     // (no Window List orders → the callback never fires).
     private layoutMode: number = LAYOUT_FULLSCREEN;
     private windowRects: Rect[] = [];
+    /** Parallel to `windowRects`: the RAIL window id for each rect. */
+    private windowIds: number[] = [];
 
     private rafScheduled = false;
     private pending = false;
@@ -555,6 +571,56 @@ export class SurfaceRenderer {
     }
 
     /**
+     * Hit-test a point against the RAIL window edges and return the CSS cursor for it, or null.
+     *
+     * WHY THIS EXISTS AT ALL. We advertise `ALLOWLOCALMOVESIZE` in the RAIL Client Status PDU, so
+     * the host hands window move/resize to the client and DELIBERATELY STOPS SENDING RESIZE
+     * CURSORS -- it expects the client's own window manager to draw them. Measured: a whole RAIL
+     * session produced ZERO pointer updates of any kind while the host emitted
+     * RAIL_ORDER_LOCALMOVESIZE. So the missing resize cursor was never a broken pipeline; there was
+     * simply nothing upstream to render, and the affordance is ours to provide. The Microsoft AVD
+     * web client draws its own for the same reason.
+     *
+     * QUERIED, NOT PUSHED. The window rects change on every drag frame. The taskbar payload
+     * deliberately omits them for exactly that reason (carrying them re-rendered the React list on
+     * every position update), so this is a pull: the caller asks on mousemove and nothing is
+     * broadcast.
+     *
+     * `sx`,`sy` are SURFACE coordinates. Returns one of the eight resize cursors, or null when the
+     * point is not near an edge of a presented window.
+     */
+    hitTestWindowEdge(sx: number, sy: number): RailEdgeHit | null {
+        if (this.layoutMode !== LAYOUT_CLIP) return null;
+        // Topmost first: `windowRects` is bottom-to-top by z, and the window a user means is the
+        // one drawn last.
+        for (let i = this.windowRects.length - 1; i >= 0; i--) {
+            const r = this.windowRects[i]!;
+            if (r.w <= 0 || r.h <= 0) continue;
+            const m = RESIZE_EDGE_PX;
+            // Outside the window plus its grab margin -> not this window. Checked before the inner
+            // test so a window stacked on top cannot claim a neighbour's edge.
+            if (sx < r.x - m || sx > r.x + r.w + m || sy < r.y - m || sy > r.y + r.h + m) continue;
+            const left = sx <= r.x + m;
+            const right = sx >= r.x + r.w - m;
+            const top = sy <= r.y + m;
+            const bottom = sy >= r.y + r.h - m;
+            const hit = (cursor: string, edge: string) => ({ cursor, edge, id: this.windowIds[i] ?? 0, rect: r });
+            if (top && left) return hit('nwse-resize', 'tl');
+            if (top && right) return hit('nesw-resize', 'tr');
+            if (bottom && left) return hit('nesw-resize', 'bl');
+            if (bottom && right) return hit('nwse-resize', 'br');
+            if (left) return hit('ew-resize', 'l');
+            if (right) return hit('ew-resize', 'r');
+            if (top) return hit('ns-resize', 't');
+            if (bottom) return hit('ns-resize', 'b');
+            // Inside this window and away from its edges: stop, do not fall through to a window
+            // underneath whose edge happens to pass beneath this one.
+            return null;
+        }
+        return null;
+    }
+
+    /**
      * Path A presentation layout, pushed by the Rust compositor whenever it changes.
      *
      * `rects` is flattened `[x, y, w, h, ...]` in surface (== desktop) coords. In CLIP mode we
@@ -568,10 +634,15 @@ export class SurfaceRenderer {
      * doesn't own.
      */
     setLayout(mode: number, surfaceW: number, surfaceH: number, rects: Int32Array): void {
+        // FIVE ints per window: id, x, y, w, h. The id is carried so a client-side resize can be
+        // addressed back to the right window -- `WindowMove` is keyed by window id.
         const next: Rect[] = [];
-        for (let i = 0; i + 3 < rects.length; i += 4) {
-            next.push({ x: rects[i]!, y: rects[i + 1]!, w: rects[i + 2]!, h: rects[i + 3]! });
+        const ids: number[] = [];
+        for (let i = 0; i + 4 < rects.length; i += 5) {
+            ids.push(rects[i]!);
+            next.push({ x: rects[i + 1]!, y: rects[i + 2]!, w: rects[i + 3]!, h: rects[i + 4]! });
         }
+        this.windowIds = ids;
         this.layoutMode = mode;
         this.windowRects = next;
         // THE authoritative surface size (eGFX CreateSurface), not the DOM canvas. See `syncSize`.

@@ -890,7 +890,7 @@ pub(crate) enum RdpInputEvent {
         /// The eGFX surface's real size — the authoritative dimension for the JS GPU texture.
         surface_w: u32,
         surface_h: u32,
-        rects: Vec<(i32, i32, u32, u32)>,
+        rects: Vec<(u32, i32, i32, u32, u32)>,
     },
     /// WebGL present: an eGFX `SURFACE_TO_SURFACE` screen-to-screen copy that must be executed on
     /// the GPU, because the pixels it moves live only in the JS surface texture (AVC never reaches
@@ -966,6 +966,16 @@ pub(crate) enum RdpInputEvent {
     RailSysCommand {
         window_id: u32,
         command: u16,
+    },
+    /// `TS_RAIL_ORDER_EXEC`: launch an ADDITIONAL RemoteApp on the live session.
+    ///
+    /// Lets a RemoteApp session open a second app without reconnecting, which is what the
+    /// Microsoft AVD web client's app launcher does -- one captured session shows three app GUIDs
+    /// launched over a single connection. On AVD `exe_or_file` is the `||<guid>` resource id.
+    RailLaunchApp {
+        exe_or_file: String,
+        working_dir: String,
+        arguments: String,
     },
     /// The server marked a surface capture-protected (proxy `PROTECT_SURFACE`).
     /// A browser cannot enforce capture protection, so the session is refused
@@ -1087,6 +1097,29 @@ impl Session {
     }
 
     fn set_cursor_style(&self, style: CursorStyle) -> Result<(), IronError> {
+        // Logged because a MISSING cursor change is otherwise indistinguishable from a cursor
+        // change we mishandled, and the two need opposite fixes. Specifically: hovering a RAIL
+        // window's resize border shows no resize arrow, and every layer of the pipeline reads as
+        // correct on inspection (pointer caps negotiate, all seven PointerUpdateData variants are
+        // handled, the CSS lands on the element the mouse is actually over). This says whether the
+        // host is sending anything at all.
+        //
+        // One line per cursor CHANGE, not per mouse move, so it is cheap.
+        match &style {
+            CursorStyle::Default => debug!(target: "cursor_diag", "cursor -> default"),
+            CursorStyle::Hidden => debug!(target: "cursor_diag", "cursor -> hidden"),
+            CursorStyle::Url {
+                data,
+                hotspot_x,
+                hotspot_y,
+            } => debug!(
+                target: "cursor_diag",
+                bytes = data.len(),
+                hotspot_x,
+                hotspot_y,
+                "cursor -> bitmap"
+            ),
+        }
         let (kind, data, hotspot_x, hotspot_y) = match style {
             CursorStyle::Default => ("default", None, None, None),
             CursorStyle::Hidden => ("hidden", None, None, None),
@@ -1200,17 +1233,20 @@ impl Session {
         }
     }
 
-    fn notify_surface_layout(&self, mode: u8, surface_w: u32, surface_h: u32, rects: &[(i32, i32, u32, u32)]) {
+    fn notify_surface_layout(&self, mode: u8, surface_w: u32, surface_h: u32, rects: &[(u32, i32, i32, u32, u32)]) {
         let Some(cb) = &self.surface_layout_callback else {
             return;
         };
-        let flat = js_sys::Int32Array::new_with_length(u32::try_from(rects.len() * 4).unwrap_or(0));
-        for (i, &(x, y, w, h)) in rects.iter().enumerate() {
-            let base = u32::try_from(i * 4).unwrap_or(0);
-            flat.set_index(base, x);
-            flat.set_index(base + 1, y);
-            flat.set_index(base + 2, i32::try_from(w).unwrap_or(0));
-            flat.set_index(base + 3, i32::try_from(h).unwrap_or(0));
+        // FIVE ints per window now: id, x, y, w, h. The id is what lets the client address a
+        // resize back to the right window (`WindowMove` is keyed by window id).
+        let flat = js_sys::Int32Array::new_with_length(u32::try_from(rects.len() * 5).unwrap_or(0));
+        for (i, &(id, x, y, w, h)) in rects.iter().enumerate() {
+            let base = u32::try_from(i * 5).unwrap_or(0);
+            flat.set_index(base, i32::try_from(id).unwrap_or(0));
+            flat.set_index(base + 1, x);
+            flat.set_index(base + 2, y);
+            flat.set_index(base + 3, i32::try_from(w).unwrap_or(0));
+            flat.set_index(base + 4, i32::try_from(h).unwrap_or(0));
         }
         let args = js_sys::Array::from_iter([
             JsValue::from_f64(f64::from(mode)),
@@ -1396,6 +1432,14 @@ impl iron_remote_desktop::Session for Session {
         let mut rail_server_zorder: Vec<u32> = Vec::new();
         // Last list pushed to JS, so the taskbar only re-renders on a REAL change.
         let mut rail_last_taskbar: Vec<RailTaskbarWindow> = Vec::new();
+        /// Set when we send a RAIL Execute, cleared when we activate the window it produced.
+        ///
+        /// The host does NOT bring an app launched this way to the front. Measured against a
+        /// Microsoft AVD web client capture on the same host: there the Window List order PREPENDS
+        /// the new window (`ZOrderChanged [66342, 66180, 65948]`), i.e. the host fronts it, and
+        /// their client sends no Activate at all. For us the new window settled at zpos=4 while
+        /// the previously active app stayed at 3 and kept focus — so we have to ask.
+        let mut rail_pending_launch = false;
         // Icon cache keyed by (cacheId, cacheEntry). The host sends the bits ONCE per slot and
         // then refers back to it with CACHED_ICON orders, so without this the later windows in a
         // session would have no icon at all. We advertise 3 caches x 12 entries.
@@ -1823,6 +1867,37 @@ impl iron_remote_desktop::Session for Session {
                             force_gfx_present(&mut active_stage);
                             Vec::new()
                         }
+                        RdpInputEvent::RailLaunchApp {
+                            exe_or_file,
+                            working_dir,
+                            arguments,
+                        } => {
+                            let app = RemoteApp {
+                                exe_or_file: exe_or_file.clone(),
+                                working_dir,
+                                arguments,
+                            };
+                            let msg = active_stage
+                                .get_svc_processor::<RailChannel>()
+                                .map(|r| r.launch_app(app));
+                            let mut outs = Vec::new();
+                            if let Some(msg) = msg {
+                                match active_stage.process_svc_processor_messages(
+                                    SvcProcessorMessages::<RailChannel>::from(vec![msg]),
+                                ) {
+                                    Ok(frame) if !frame.is_empty() => {
+                                        info!(target: "rail_diag", exe = %exe_or_file, "RAIL: sent client Execute for an additional app");
+                                        rail_pending_launch = true;
+                                        outs.push(ActiveStageOutput::ResponseFrame(frame));
+                                    }
+                                    Ok(_) => warn!(exe = %exe_or_file, "RAIL Execute produced no frame"),
+                                    Err(e) => warn!(error = %e, "RAIL Execute send failed"),
+                                }
+                            } else {
+                                warn!("RAIL Execute: no RailChannel processor attached");
+                            }
+                            outs
+                        }
                         RdpInputEvent::RailActivate { window_id } => {
                             let msg = active_stage
                                 .get_svc_processor::<RailChannel>()
@@ -2083,6 +2158,10 @@ impl iron_remote_desktop::Session for Session {
                             }
                             if !window_ids.is_empty() {
                                 rail_server_zorder = window_ids.clone();
+                                // Also drives PRESENTATION order and the resize-edge hit-test, not
+                                // just the taskbar. Without it both fall back to "most recently
+                                // updated wins", which is not the same thing as "on top".
+                                self.rail_store.set_server_zorder(&window_ids);
                             }
                             // Non-Monitored Desktop = the input desktop switched to one RAIL isn't
                             // tracking (Ctrl+Alt+Del / lock / UAC secure desktop). The host paints
@@ -2126,6 +2205,27 @@ impl iron_remote_desktop::Session for Session {
                                 w.id,
                             )
                         });
+                        // Per-window diagnosis, emitted only when the LIST CHANGES (never per
+                        // order). Two questions need it and neither is answerable from `count=`:
+                        // why a given app is missing from the taskbar (three different exclusions
+                        // in `is_taskbar_listed` and they look identical from outside), and where
+                        // a window actually sits in the host's z-order.
+                        if listed != rail_last_taskbar {
+                            for (id, g) in rail_windows.iter() {
+                                debug!(
+                                    target: "rail_diag",
+                                    id = format!("{id:#x}"),
+                                    title = g.title.as_deref().unwrap_or("<none>"),
+                                    owner = g.owner_window_id.map_or(-1i64, i64::from),
+                                    taskbar_button = g.taskbar_button.map_or(-1i64, i64::from),
+                                    style = g.style.map_or(0, |s| s),
+                                    listed = g.is_taskbar_listed(),
+                                    has_rect = g.rect().is_some(),
+                                    zpos = rail_server_zorder.iter().position(|&z| z == *id).map_or(-1i64, |p| p as i64),
+                                    "RAIL window"
+                                );
+                            }
+                        }
                         if listed != rail_last_taskbar {
                             // Ship the pixels for any icon these windows reference that JS has not
                             // seen yet — once per cache slot, not once per push.
@@ -2151,6 +2251,34 @@ impl iron_remote_desktop::Session for Session {
                             }
                             debug!(target: "rail_diag", count = listed.len(), new_icons = new_icons.len(), "RAIL: taskbar list -> JS");
                             self.notify_rail_windows(&listed, &new_icons);
+                            // A launch we asked for has produced a window: bring it to the front,
+                            // because the host will not. Only the FIRST new window after an
+                            // Execute, and only one -- an app can open several (splash, main,
+                            // helpers) and activating each in turn would fight itself.
+                            if rail_pending_launch {
+                                let known: Vec<u32> = rail_last_taskbar.iter().map(|w| w.id).collect();
+                                // Logged unconditionally while a launch is pending: the previous
+                                // build's activate never fired and reading the code could not say
+                                // why -- the flag, the known set and the new set are the three
+                                // things that decide it.
+                                debug!(
+                                    target: "rail_diag",
+                                    known = ?known,
+                                    listed = ?listed.iter().map(|w| w.id).collect::<Vec<_>>(),
+                                    "RAIL: launch pending, diffing taskbar list"
+                                );
+                                if let Some(new_id) = listed.iter().map(|w| w.id).find(|id| !known.contains(id)) {
+                                    rail_pending_launch = false;
+                                    if let Err(err) = self
+                                        .input_events_tx
+                                        .unbounded_send(RdpInputEvent::RailActivate { window_id: new_id })
+                                    {
+                                        warn!(?err, "failed to queue Activate for the launched window");
+                                    } else {
+                                        info!(target: "rail_diag", window_id = format!("{new_id:#x}"), "RAIL: activating the launched window");
+                                    }
+                                }
+                            }
                             rail_last_taskbar = listed;
                         }
                     }
@@ -2624,6 +2752,43 @@ impl iron_remote_desktop::Session for Session {
                     .map_err(IronError::from)?;
                 return Ok(JsValue::NULL);
             };
+            |rail_window_move: JsValue| {
+                // Client-side resize/move result. With ALLOWLOCALMOVESIZE the host delegates
+                // move/size to us, so the client drags locally and reports the FINAL rect here.
+                let obj = into_object(rail_window_move)?;
+                let window_id = get_u32(&obj, "window_id")?;
+                let left = get_i32(&obj, "left")?;
+                let top = get_i32(&obj, "top")?;
+                let right = get_i32(&obj, "right")?;
+                let bottom = get_i32(&obj, "bottom")?;
+                self.input_events_tx
+                    .unbounded_send(RdpInputEvent::RailWindowMove {
+                        window_id,
+                        left: i16::try_from(left).unwrap_or(0),
+                        top: i16::try_from(top).unwrap_or(0),
+                        right: i16::try_from(right).unwrap_or(0),
+                        bottom: i16::try_from(bottom).unwrap_or(0),
+                    })
+                    .context("send RAIL window move")
+                    .map_err(IronError::from)?;
+                return Ok(JsValue::NULL);
+            };
+            |rail_launch_app: JsValue| {
+                let obj = into_object(rail_launch_app)?;
+                // On AVD `exe_or_file` is the published-app resource id (`||<guid>`), not a path.
+                let exe_or_file = get_string(&obj, "exe_or_file")?;
+                let working_dir = get_string(&obj, "working_dir").unwrap_or_default();
+                let arguments = get_string(&obj, "arguments").unwrap_or_default();
+                self.input_events_tx
+                    .unbounded_send(RdpInputEvent::RailLaunchApp {
+                        exe_or_file,
+                        working_dir,
+                        arguments,
+                    })
+                    .context("send RAIL launch app")
+                    .map_err(IronError::from)?;
+                return Ok(JsValue::NULL);
+            };
             |rail_activate: JsValue| {
                 let obj = into_object(rail_activate)?;
                 let window_id = get_u32(&obj, "window_id")?;
@@ -2829,6 +2994,14 @@ fn encode_avc_frame_ack(active_stage: &mut ActiveStage, frame_id: u32) -> anyhow
 fn into_object(val: JsValue) -> Result<js_sys::Object, IronError> {
     val.dyn_into::<js_sys::Object>()
         .map_err(|_| anyhow::anyhow!("expected object").into())
+}
+
+fn get_string(obj: &js_sys::Object, key: &str) -> Result<String, IronError> {
+    let val = js_sys::Reflect::get(obj, &JsValue::from_str(key))
+        .map_err(|e| anyhow::anyhow!("get property `{key}`: {e:?}"))?;
+    val.as_string()
+        .with_context(|| format!("invalid type for property `{key}`"))
+        .map_err(IronError::from)
 }
 
 fn get_u32(obj: &js_sys::Object, key: &str) -> Result<u32, IronError> {

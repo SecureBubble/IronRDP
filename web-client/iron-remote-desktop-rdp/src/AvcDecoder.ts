@@ -28,7 +28,7 @@ import {
     surfaceCopyCallback,
 } from './extensions';
 import type { Extension } from '../../../crates/ironrdp-web/pkg/ironrdp_web';
-import { SurfaceRenderer } from './SurfaceRenderer';
+import { type RailEdgeHit, SurfaceRenderer } from './SurfaceRenderer';
 import { analyzeAnnexB, codecStringFromSps, unflatten, type RegionRect } from './avc-annexb';
 // Inline worker: bundled into this module as a Blob so the single vendor bundle stays self-contained.
 import AvcWorker from './avc-worker?worker&inline';
@@ -273,6 +273,20 @@ export class AvcDecoder {
         for (const [slot, sx, sy, w, h, points] of ops) {
             this.renderer?.cacheRegion(slot, sx, sy, w, h, points);
         }
+    }
+
+    /**
+     * Hit-test a SURFACE-space point against the RAIL window edges; returns a CSS cursor or null.
+     *
+     * Exposed here because the renderer owns the window rects and the webapp owns the DOM. Pull,
+     * not push: the rects change every drag frame, and broadcasting them would re-render the
+     * taskbar list continuously (the reason the taskbar payload omits geometry).
+     *
+     * Always null on the worker/2D path, where there is no SurfaceRenderer -- the caller simply
+     * gets no resize affordance there, which is the existing behaviour.
+     */
+    hitTestWindowEdge(sx: number, sy: number): RailEdgeHit | null {
+        return this.renderer?.hitTestWindowEdge(sx, sy) ?? null;
     }
 
     /** Give us the live session (its `invokeExtension` is our RGBA/ack return path). */

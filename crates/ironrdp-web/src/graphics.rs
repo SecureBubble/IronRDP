@@ -257,7 +257,7 @@ impl WasmGraphicsMessageProxy {
     /// Hand the WebGL present layout (mode + app-window rects) to the run loop, which forwards it
     /// to the JS renderer. Only the `?ironwebgl=1` path emits these; JS clips the presented surface
     /// to `rects` (or blanks / presents full-screen per `mode`).
-    fn send_layout(&self, mode: u8, surface_w: u32, surface_h: u32, rects: Vec<(i32, i32, u32, u32)>) {
+    fn send_layout(&self, mode: u8, surface_w: u32, surface_h: u32, rects: Vec<(u32, i32, i32, u32, u32)>) {
         if self
             .tx
             .unbounded_send(RdpInputEvent::SurfaceLayout {
@@ -372,6 +372,9 @@ pub(crate) struct RailWindowPos {
 struct RailSharedInner {
     /// RAIL `window_id` (u32 value widened to u64) -> its desktop position + z-order.
     positions: HashMap<u64, RailWindowPos>,
+    /// The HOST's actual z-order, TOP-MOST FIRST, from the Window List order's window id list.
+    /// Empty until the host sends one.
+    server_zorder: Vec<u32>,
     /// Desktop-space top-left of the last composited bounding box (0,0 in desktop mode).
     bbox_origin: (i32, i32),
     /// Active HiDef-RAIL local move/size drag (MS-RDPERP ServerLocalMoveSize). While `Some`,
@@ -423,19 +426,44 @@ impl RailWindowStore {
     /// The presentable app-window rects `(x, y, w, h, z)` for Path A clipping, sorted **bottom→top**
     /// by z-order. Windows with a zero dimension are skipped (they carry no pixels). The caller
     /// additionally drops the full-desktop shell window (a rect that spans the whole surface).
-    pub(crate) fn app_windows(&self) -> Vec<(i32, i32, u32, u32, u32)> {
+    pub(crate) fn app_windows(&self) -> Vec<(u32, i32, i32, u32, u32, u32)> {
         let Ok(inner) = self.0.lock() else {
             return Vec::new();
         };
-        let mut wins: Vec<(i32, i32, u32, u32, u32)> = inner
+        let zorder = &inner.server_zorder;
+        // Rank by the HOST's z-order, not by `p.z`.
+        //
+        // `p.z` is a counter bumped on every window order, so it means "most recently updated",
+        // not "on top". Two user-visible bugs came from that: a newly launched app dropped behind
+        // as soon as any other window repainted (a blinking caret is enough), and the resize-edge
+        // hit-test resolved against the wrong window where two overlap, because it walks this same
+        // list. The host tells us the truth -- `active=Some(id) count=11` on every Window List
+        // order -- and we were using it only to sort taskbar buttons.
+        //
+        // `server_zorder` is TOP-MOST FIRST and we need BOTTOM-FIRST for painting, hence the
+        // inversion. Windows the host has not ranked get 0, i.e. the bottom, with `p.z` breaking
+        // ties among them so their relative order stays stable rather than jittering.
+        let rank = |id: u64| -> usize {
+            u32::try_from(id)
+                .ok()
+                .and_then(|id| zorder.iter().position(|&z| z == id))
+                .map_or(0, |pos| zorder.len() - pos)
+        };
+        let mut wins: Vec<(usize, u32, i32, i32, u32, u32, u32)> = inner
             .positions
-            .values()
-            .filter(|p| p.w > 0 && p.h > 0)
-            .map(|p| (p.x, p.y, p.w, p.h, p.z))
+            .iter()
+            .filter(|(_, p)| p.w > 0 && p.h > 0)
+            .map(|(&id, p)| (rank(id), u32::try_from(id).unwrap_or(0), p.x, p.y, p.w, p.h, p.z))
             .collect();
-        // Ascending z = bottom first, so a later (higher) window overwrites in overlaps.
-        wins.sort_by_key(|&(.., z)| z);
-        wins
+        wins.sort_by_key(|&(rank, .., z)| (rank, z));
+        wins.into_iter().map(|(_, id, x, y, w, h, z)| (id, x, y, w, h, z)).collect()
+    }
+
+    /// Record the host's real z-order (top-most first), as carried by the Window List order.
+    pub(crate) fn set_server_zorder(&self, ids: &[u32]) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.server_zorder = ids.to_vec();
+        }
     }
 
     /// Move a RAIL window to a new desktop top-left, keeping its z-order. Used during a local
@@ -710,7 +738,7 @@ pub(crate) struct WasmGraphicsHandler {
     /// Path A (non-HiDef RAIL): the app-window rects `(x, y, w, h)` presented last frame, so a
     /// moved/closed window's vacated area can be cleared. `None` until the first Path A composite.
     /// An empty vec means the last present was the full-screen secure desktop or the blank welcome.
-    last_path_a_layout: Option<Vec<(i32, i32, u32, u32)>>,
+    last_path_a_layout: Option<Vec<(u32, i32, i32, u32, u32)>>,
     /// Path A: has a real app window ever been presentable this session? The pre-first-app logon /
     /// "Preparing Windows" desktop is ITSELF a Non-Monitored (secure) desktop, so the DESKTOP_NONE
     /// flag alone can't tell it apart from a real Ctrl+Alt+Del. This latch is the discriminator:
@@ -745,7 +773,7 @@ pub(crate) struct WasmGraphicsHandler {
     /// WebGL path: the last (mode, window rects) layout handed to JS, to dedupe the callback.
     /// JS clips the presented surface to these rects, which is what makes a dragged window leave
     /// no ghost — the vacated area simply stops being presented (no clear plumbing needed).
-    last_webgl_layout: Option<(u8, u32, u32, Vec<(i32, i32, u32, u32)>)>,
+    last_webgl_layout: Option<(u8, u32, u32, Vec<(u32, i32, i32, u32, u32)>)>,
     /// Per-window cache of the last bilinear-scaled RGBA buffer, keyed by surface id. During a
     /// local drag a window is recomposited every mouse-move but its CONTENT is unchanged (only
     /// its position moves), so re-running bilinear on identical pixels each frame is what made
@@ -887,7 +915,7 @@ impl WasmGraphicsHandler {
         //
         // Sent for NON-RAIL sessions too (mode FULLSCREEN, no window rects) — a plain desktop needs
         // the size just as much; only the clipping is RAIL-specific.
-        let wins: Vec<(i32, i32, u32, u32)> = if self.rail_session {
+        let wins: Vec<(u32, i32, i32, u32, u32)> = if self.rail_session {
             self.app_windows_in_output_space()
         } else {
             Vec::new()
@@ -1019,12 +1047,18 @@ impl WasmGraphicsHandler {
     /// Presentable RAIL app-window rects, translated from the host's DESKTOP space into eGFX
     /// OUTPUT space so they can be compared with and clipped against surface geometry. Bottom→top
     /// by z, exactly as `RailWindowStore::app_windows` returns them.
-    fn app_windows_in_output_space(&self) -> Vec<(i32, i32, u32, u32)> {
+    /// Presentable RAIL app-window rects in OUTPUT space, each with its window id.
+    ///
+    /// The id rides along because the client needs to know WHICH window an edge belongs to in
+    /// order to resize it: the resize affordance is drawn client-side (the host delegates
+    /// move/size to us via ALLOWLOCALMOVESIZE and sends no resize cursors), and the resulting
+    /// `WindowMove` PDU is addressed by window id.
+    fn app_windows_in_output_space(&self) -> Vec<(u32, i32, i32, u32, u32)> {
         let (dx, dy) = self.desktop_origin;
         self.rail
             .app_windows()
             .into_iter()
-            .map(|(x, y, w, h, _z)| (x.saturating_add(dx), y.saturating_add(dy), w, h))
+            .map(|(id, x, y, w, h, _z)| (id, x.saturating_add(dx), y.saturating_add(dy), w, h))
             .collect()
     }
 
@@ -1095,7 +1129,7 @@ impl WasmGraphicsHandler {
         // chrome, non-zero size — and DELIBERATELY not gated on WS_VISIBLE, which the wire toggles
         // as noise). A live app window therefore stays in this set continuously; it leaves only on
         // DeleteWindow. When the set is empty no real app is up (startup / app closed) → blank.
-        let wins: Vec<(i32, i32, u32, u32)> = self.app_windows_in_output_space();
+        let wins: Vec<(u32, i32, i32, u32, u32)> = self.app_windows_in_output_space();
         if !wins.is_empty() {
             self.path_a_had_windows = true;
         }
@@ -1199,8 +1233,8 @@ impl WasmGraphicsHandler {
         // Clear the area vacated by any window that moved or closed, so it leaves no trail.
         if layout_changed {
             if let Some(prev) = self.last_path_a_layout.take() {
-                for (px, py, pw, ph) in prev {
-                    if !wins.contains(&(px, py, pw, ph)) {
+                for (pid, px, py, pw, ph) in prev {
+                    if !wins.contains(&(pid, px, py, pw, ph)) {
                         let (cx, cy, cw, ch) = clip(px, py, pw, ph, ow, oh);
                         if cw > 0 && ch > 0 {
                             self.proxy.send(GraphicsRegion {
@@ -1229,7 +1263,7 @@ impl WasmGraphicsHandler {
         if diag {
             self.path_a_diag_count += 1;
         }
-        for &(x, y, w, h) in &wins {
+        for &(_id, x, y, w, h) in &wins {
             let (cx, cy, cw, ch) = clip(x, y, w, h, ow, oh);
             if cw == 0 || ch == 0 {
                 continue;
