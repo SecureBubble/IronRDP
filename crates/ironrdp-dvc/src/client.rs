@@ -204,7 +204,9 @@ impl DrdynvcClient {
     ///
     /// # Note
     ///
-    /// * Doesn't support [TypeId] lookup via [DrdynvcClient::get_dvc].
+    /// * Once the server creates the channel, the created processor is retrievable by its
+    ///   concrete type via [DrdynvcClient::get_dvc] (and by id via
+    ///   [DrdynvcClient::get_dvc_by_channel_id]). Before creation there is nothing to look up.
     /// * If a listener or a pre-registered channel with the same name already exists,
     ///   it will be silently overwritten.
     #[must_use]
@@ -220,7 +222,9 @@ impl DrdynvcClient {
     ///
     /// # Note
     ///
-    /// * Doesn't support [TypeId] lookup via [DrdynvcClient::get_dvc].
+    /// * Once the server creates the channel, the created processor is retrievable by its
+    ///   concrete type via [DrdynvcClient::get_dvc] (and by id via
+    ///   [DrdynvcClient::get_dvc_by_channel_id]). Before creation there is nothing to look up.
     /// * If a listener or a pre-registered channel with the same name already exists,
     ///   it will be silently overwritten.
     pub fn attach_listener<T>(&mut self, listener: T)
@@ -230,13 +234,14 @@ impl DrdynvcClient {
         self.dynamic_channels.register_listener(listener);
     }
 
-    /// Returns a typed accessor for a pre-registered client DVC.
+    /// Returns a typed accessor for an active client DVC by its concrete processor type.
     ///
-    /// Type lookup is available only for channels registered with
-    /// [`DrdynvcClient::with_dynamic_channel`] or [`DrdynvcClient::attach_dynamic_channel`].
-    /// Listener-created channels can be retrieved with [`DrdynvcClient::get_dvc_by_channel_id`].
+    /// Works for channels registered with [`DrdynvcClient::with_dynamic_channel`] /
+    /// [`DrdynvcClient::attach_dynamic_channel`] and, once the server has created them, for
+    /// listener-created channels ([`DrdynvcClient::with_listener`]) as well.
     ///
     /// Returns `None` until the server has created the channel and the processor has started.
+    /// If several active channels share the same concrete type, the most recently created one wins.
     pub fn get_dvc<T>(&self) -> Option<DynamicChannelRef<'_, T>>
     where
         T: DvcClientProcessor,
@@ -540,11 +545,20 @@ impl DynamicChannelSet {
         let entry = self.listeners.get_mut(name)?;
         let processor = entry.listener.create(channel_id)?;
 
-        if let Some(type_id) = entry.type_id {
-            self.type_id_to_channel_id.insert(type_id, channel_id);
-        }
-
         let dvc = DynamicVirtualChannel::from_boxed(processor);
+
+        // Map the created processor's CONCRETE type to this channel id so `get_dvc::<T>()`
+        // (the TypeId lookup) can find it. This must cover BOTH pre-registered channels
+        // (`with_dynamic_channel`, where `entry.type_id` is set) AND listener-created
+        // channels (`with_listener`). The latter previously had no type->id mapping, so
+        // once the graphics DVC moved to a listener (to survive CLOSE->CREATE),
+        // `get_dvc::<GraphicsPipelineClient>()` returned `None` and the eGFX AVC
+        // frame-ack / region-delivery paths silently no-op'd — freezing AVC444v2 sessions
+        // on their first frame. Keying on the concrete processor type (not `entry.type_id`)
+        // covers both registration styles and stays consistent with `remove_by_channel_id`,
+        // which cleans this map up by the same id on CLOSE.
+        self.type_id_to_channel_id.insert(dvc.processor_type_id(), channel_id);
+
         // `dvc.channel_id` stays `None` here — it is set by `DynamicVirtualChannel::start`
         // on success, so `Drop` only invokes `close` for channels that were actually opened.
         let dvc = match self.active_channels.entry(channel_id) {
@@ -633,6 +647,42 @@ mod tests {
         assert!(channels.has_listener_by_type_id(TypeId::of::<TestDvc>()));
         assert!(channels.try_create_channel(&"test".to_owned(), 1).is_some());
         assert!(!channels.has_listener_by_type_id(TypeId::of::<TestDvc>()));
+    }
+
+    struct TestListener;
+
+    impl DvcChannelListener for TestListener {
+        fn channel_name(&self) -> &str {
+            "test-listener"
+        }
+
+        fn create(&mut self, _channel_id: DynamicChannelId) -> Option<Box<dyn DvcClientProcessor>> {
+            Some(Box::new(TestDvc))
+        }
+    }
+
+    // Regression: a channel registered via `with_listener` (e.g. the graphics DVC, made
+    // re-createable to survive CLOSE->CREATE) must still be retrievable by its concrete
+    // processor type via `get_dvc::<T>()` once created. Before the fix, listener-created
+    // channels got no type->id mapping, so `get_dvc::<GraphicsPipelineClient>()` returned
+    // `None` and the eGFX AVC frame-ack path silently no-op'd, freezing AVC444v2 sessions.
+    #[test]
+    fn listener_created_channel_supports_type_id_lookup() {
+        let mut channels = DynamicChannelSet::new();
+        channels.register_listener(TestListener);
+
+        // Nothing to resolve until the server creates the channel.
+        assert!(channels.get_by_type_id(TypeId::of::<TestDvc>()).is_none());
+
+        assert!(channels.try_create_channel(&"test-listener".to_owned(), 7).is_some());
+        assert!(
+            channels.get_by_type_id(TypeId::of::<TestDvc>()).is_some(),
+            "listener-created channel must be resolvable by TypeId after creation"
+        );
+
+        // CLOSE must clean the mapping back up so a later lookup doesn't resolve a dead id.
+        assert!(channels.remove_by_channel_id(7).is_some());
+        assert!(channels.get_by_type_id(TypeId::of::<TestDvc>()).is_none());
     }
 
     fn add_active_channel(client: &mut DrdynvcClient, channel_id: DynamicChannelId) {
