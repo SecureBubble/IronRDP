@@ -56,7 +56,7 @@
 use std::collections::BTreeMap;
 
 use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
-use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
+use ironrdp_dvc::{DvcChannelListener, DvcClientProcessor, DvcMessage, DvcProcessor, DynamicChannelId};
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::ProgressiveDecoder;
 use ironrdp_graphics::rdp6::BitmapStreamDecoder;
@@ -1604,6 +1604,48 @@ impl DvcProcessor for GraphicsPipelineClient {
 }
 
 impl DvcClientProcessor for GraphicsPipelineClient {}
+
+/// Re-createable DVC listener for the RDPGFX graphics channel, so graphics survives a host
+/// close→reopen of `Microsoft::Windows::RDS::Graphics` — which Windows / Azure Virtual Desktop
+/// perform on a backend reconnect and across the Deactivation-Reactivation Sequence.
+///
+/// A one-shot [`GraphicsPipelineClient`] registered via `DrdynvcClient::with_dynamic_channel` is
+/// consumed on the first `DYNVC_CREATE_REQ` and answers every subsequent one with `NO_LISTENER`
+/// (0xC0000001), so the graphics channel never re-opens after the host closes it and the canvas
+/// freezes. This listener instead builds a fresh [`GraphicsPipelineClient`] — and thus fresh
+/// surface/cache state — on each create, via the supplied factory. Point the factory at a
+/// cloneable handler bridge so every re-created channel funnels graphics to the same renderer; the
+/// host re-establishes surfaces through the post-reopen RESETGRAPHICS. Mirrors `RdpsndDvcListener`.
+pub struct GraphicsPipelineDvcListener<F> {
+    make_client: F,
+}
+
+impl<F> GraphicsPipelineDvcListener<F>
+where
+    F: FnMut() -> GraphicsPipelineClient + Send,
+{
+    /// `make_client` is invoked once per channel create to produce the graphics client for that
+    /// incarnation of the channel (fresh surface/cache state, same handler bridge).
+    pub fn new(make_client: F) -> Self {
+        Self { make_client }
+    }
+}
+
+impl<F> DvcChannelListener for GraphicsPipelineDvcListener<F>
+where
+    F: FnMut() -> GraphicsPipelineClient + Send,
+{
+    fn channel_name(&self) -> &str {
+        CHANNEL_NAME
+    }
+
+    fn create(&mut self, _channel_id: DynamicChannelId) -> Option<Box<dyn DvcClientProcessor>> {
+        Some(Box::new((self.make_client)()))
+    }
+
+    // `is_available` defaults to `true`: the listener stays re-createable for the life of the
+    // session, so a close→reopen of the graphics channel always succeeds.
+}
 
 // ============================================================================
 // Frame Cropping

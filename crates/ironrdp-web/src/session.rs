@@ -38,7 +38,7 @@ use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp::svc::SvcProcessorMessages;
 use ironrdp_core::WriteBuf;
-use ironrdp_egfx::client::GraphicsPipelineClient;
+use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineDvcListener};
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
@@ -773,12 +773,28 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         // A registered `surface_present_callback` IS the `?ironwebgl=1` switch: it means JS owns
         // the composite (it draws the AVC video straight into the surface-0 WebGL texture), so the
         // handler must feed it decoded rects + a window layout instead of compositing itself.
-        let graphics_handler = Some(WasmGraphicsHandler::new(
-            WasmGraphicsMessageProxy::new(input_events_tx.clone()),
-            rail_store.clone(),
-            surface_present_callback.is_some(),
-            rail_desktop_origin,
-        ));
+        // Re-createable graphics-client factory. The graphics DVC (Microsoft::Windows::RDS::Graphics)
+        // is registered as a LISTENER (not a one-shot channel) so it survives the host close→reopen
+        // on a backend reconnect / Deactivation-Reactivation — a one-shot would NO_LISTENER-reject
+        // the reopen (0xC0000001) and freeze the canvas (the bug we fixed for AUDIO_PLAYBACK_DVC).
+        // Each create builds a FRESH handler (fresh surface/cache) linked to the same JS bridge via a
+        // cloned proxy + the shared rail store; the host repaints via the post-reopen RESETGRAPHICS.
+        let graphics_client_factory: Option<Box<dyn FnMut() -> GraphicsPipelineClient + Send>> = {
+            let input_tx = input_events_tx.clone();
+            let rail = rail_store.clone();
+            let webgl_present = surface_present_callback.is_some();
+            let origin = rail_desktop_origin;
+            let advertise = advertise_avc;
+            Some(Box::new(move || {
+                let handler = WasmGraphicsHandler::new(
+                    WasmGraphicsMessageProxy::new(input_tx.clone()),
+                    rail.clone(),
+                    webgl_present,
+                    origin,
+                );
+                GraphicsPipelineClient::new(Box::new(handler), None).advertise_avc(advertise)
+            }))
+        };
 
         let (connection_result, ws) = connect(ConnectParams {
             ws,
@@ -795,8 +811,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             sound_backend,
             computer_name: client_name.clone(),
             use_display_control,
-            advertise_avc,
-            graphics_handler,
+            graphics_client_factory,
         })
         .await?;
 
@@ -3756,10 +3771,11 @@ struct ConnectParams {
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
     use_display_control: bool,
-    /// Advertise AVC eGFX caps (H.264). Gated by the web UI "Enhanced graphics"
-    /// toggle via the `advertise_avc` builder extension.
-    advertise_avc: bool,
-    graphics_handler: Option<WasmGraphicsHandler>,
+    /// Re-createable graphics-client factory (`Microsoft::Windows::RDS::Graphics`). `None` = no
+    /// graphics. Each call builds a fresh `GraphicsPipelineClient` with the AVC advertise baked in
+    /// (gated by the web-UI "Enhanced graphics" toggle). Registered as a DVC listener so the channel
+    /// survives a host close→reopen. `Some(_)` iff a graphics handler was configured.
+    graphics_client_factory: Option<Box<dyn FnMut() -> GraphicsPipelineClient + Send>>,
 }
 
 fn default_printer_driver_name() -> String {
@@ -3810,8 +3826,7 @@ async fn connect(
         sound_backend,
         computer_name,
         use_display_control,
-        advertise_avc,
-        graphics_handler,
+        graphics_client_factory,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
@@ -3877,7 +3892,7 @@ async fn connect(
     // DisplayControl, the EGFX graphics pipeline, and AUDIO_PLAYBACK_DVC audio are
     // all dynamic virtual channels, so they ride the same single DRDYNVC static
     // channel.
-    if use_display_control || graphics_handler.is_some() || dvc_sound_backend.is_some() {
+    if use_display_control || graphics_client_factory.is_some() || dvc_sound_backend.is_some() {
         let mut drdynvc = DrdynvcClient::new();
         if let Some(dvc_sound_backend) = dvc_sound_backend {
             // AUDIO_PLAYBACK_DVC (MS-RDPEA over DVC). Same RDPSND PDU flow as the
@@ -3898,20 +3913,18 @@ async fn connect(
         if use_display_control {
             drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
         }
-        if let Some(graphics_handler) = graphics_handler {
-            // AVC MVP (2026-08-10): advertise AVC420/AVC444 caps so the server (AVD/
-            // Windows) sends AVC. The H.264 main sub-stream is decoded out-of-band by
-            // the browser WebCodecs decoder (see `AvcFrame`/`on_avc_frame` →
-            // `avc_decode_callback`), giving full-color 4:2:0 desktop/video.
+        if let Some(make_client) = graphics_client_factory {
+            // Register graphics as a RE-CREATEABLE listener (not a one-shot `with_dynamic_channel`)
+            // so `Microsoft::Windows::RDS::Graphics` survives a host close→reopen (backend reconnect
+            // / Deactivation-Reactivation). A one-shot answers the reopen with NO_LISTENER
+            // (0xC0000001) and freezes the canvas — the bug we fixed for AUDIO_PLAYBACK_DVC (dvc27).
             //
-            // Now controlled per-connection by `advertise_avc` (set from the web UI
-            // "Enhanced graphics" toggle via the `advertise_avc` extension). When
-            // false the server falls back to ClearCodec / RFX-Progressive, which this
-            // client already decodes correctly — so a PROD build can ship AVC off by
-            // simply not enabling the toggle, without a code change.
-            drdynvc = drdynvc.with_dynamic_channel(
-                GraphicsPipelineClient::new(Box::new(graphics_handler), None).advertise_avc(advertise_avc),
-            );
+            // The factory bakes in the AVC advertise (AVC420/AVC444 → server sends H.264, decoded
+            // out-of-band by the browser WebCodecs decoder), gated per-connection by the web-UI
+            // "Enhanced graphics" toggle (`advertise_avc`); when off the server falls back to
+            // ClearCodec / RFX-Progressive, which this client also decodes — so a PROD build can ship
+            // AVC off by simply not enabling the toggle. Each create builds a fresh client.
+            drdynvc = drdynvc.with_listener(GraphicsPipelineDvcListener::new(make_client));
         }
         connector.attach_static_channel(drdynvc);
     }
