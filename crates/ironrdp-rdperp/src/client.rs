@@ -141,9 +141,16 @@ impl RailChannel {
     /// Build the client's response to a server Handshake: reply + client status
     /// + (optionally) launch the app. Fired only once.
     fn on_server_handshake(&mut self) -> Vec<SvcMessage> {
+        // Respond to EVERY server Handshake/HandshakeEx, not just the first. After a
+        // Deactivation-Reactivation Sequence (a reconnect) the server re-drives the RAIL handshake
+        // on the static "rail" channel — a HandshakeEx — and that re-handshake IS the re-attach
+        // signal. Ignoring it (as the old `handshook` guard did) left the RemoteApp session
+        // unattached after a reconnect, and RDS reaped it with ERRINFO_RPC_INITIATED_DISCONNECT_BY_USER
+        // (0x0000000B) ~2-3 min later. Answering whenever the server asks is also proxy-path
+        // independent: it does not require the client to observe the Deactivate-All, which a gateway
+        // may skip forwarding to the front (the HandshakeEx still arrives on the rail SVC either way).
         if self.handshook {
-            debug!("ignoring duplicate RAIL server handshake");
-            return Vec::new();
+            debug!("RAIL server re-handshake — re-attaching after reconnect");
         }
         self.handshook = true;
 
@@ -156,7 +163,10 @@ impl RailChannel {
             })),
         ];
 
-        if let Some(exec) = self.launch.clone() {
+        // One-shot: take() so a reconnect re-attach re-handshakes (Handshake + ClientStatus) but does
+        // NOT relaunch the app — the window already exists and a second Execute would open a
+        // duplicate. Matches the native client, whose reconnect carries no Execute.
+        if let Some(exec) = self.launch.take() {
             info!(exe = %exec.exe_or_file, args = %exec.arguments, "RAIL: launching RemoteApp");
             messages.push(SvcMessage::from(RailPdu::ClientExecute(exec)));
         }
@@ -301,9 +311,44 @@ mod tests {
     }
 
     #[test]
-    fn handshake_reply_fires_only_once() {
+    fn handshake_reply_repeats_for_reattach() {
+        // No app: every server handshake is answered with reply + status. The reconnect re-attach
+        // re-runs the handshake on the static "rail" channel, so a second one must reply again
+        // (it is no longer swallowed as a "duplicate").
         let mut chan = RailChannel::new();
-        assert_eq!(chan.process(&server_handshake_bytes()).unwrap().len(), 2); // no app -> reply + status
-        assert!(chan.process(&server_handshake_bytes()).unwrap().is_empty());
+        assert_eq!(chan.process(&server_handshake_bytes()).unwrap().len(), 2);
+        assert_eq!(chan.process(&server_handshake_bytes()).unwrap().len(), 2);
+    }
+
+    // Regression: after a reconnect the server re-drives the RAIL handshake on the static channel;
+    // iron must answer it (Handshake + ClientStatus) to RE-ATTACH, but must NOT relaunch the app (the
+    // window already exists; a second Execute opens a duplicate). Without the re-attach the AVD
+    // RemoteApp session is reaped ~2-3 min after any reconnect (ERRINFO 0x0000000B).
+    #[test]
+    fn reconnect_rehandshake_reattaches_without_relaunch() {
+        let mut chan = RailChannel::with_app(RemoteApp {
+            exe_or_file: r"C:\Windows\explorer.exe".to_owned(),
+            working_dir: String::new(),
+            arguments: r"C:\Sales".to_owned(),
+        });
+
+        let order_types = |out: Vec<SvcMessage>| -> Vec<RailOrderType> {
+            out.iter()
+                .map(|m| crate::pdu::peek_order_type(&m.encode_unframed_pdu().unwrap()).unwrap())
+                .collect()
+        };
+
+        // Initial handshake: reply + status + exec (launches the app).
+        assert_eq!(
+            order_types(chan.process(&server_handshake_bytes()).unwrap()),
+            vec![RailOrderType::Handshake, RailOrderType::ClientStatus, RailOrderType::Exec]
+        );
+
+        // A later server handshake (the reconnect re-attach): reply + status, NO second Execute.
+        assert_eq!(
+            order_types(chan.process(&server_handshake_bytes()).unwrap()),
+            vec![RailOrderType::Handshake, RailOrderType::ClientStatus],
+            "re-attach must handshake again without a second Execute"
+        );
     }
 }
