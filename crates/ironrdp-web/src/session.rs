@@ -39,7 +39,7 @@ use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput, Grace
 use ironrdp::svc::SvcProcessorMessages;
 use ironrdp_core::WriteBuf;
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineDvcListener};
-use ironrdp_futures::{FramedWrite, single_sequence_step_read};
+use ironrdp_futures::FramedWrite;
 use rgb::AsPixels as _;
 use tap::prelude::*;
 use tracing::{debug, error, info, trace, warn};
@@ -2528,11 +2528,68 @@ impl iron_remote_desktop::Session for Session {
                             requested_resize = None;
                         }
 
+
+                        // Channel-demuxing reactivation driver.
+                        //
+                        // `single_sequence_step_read` feeds the next hint-matching frame straight to
+                        // the activation sequence with NO channel demux. AVD interleaves DVC traffic
+                        // (the graphics-channel close/reopen and its frame acks) and other
+                        // virtual-channel PDUs on the wire during the Deactivate-All -> Demand Active
+                        // window; those are X.224 Send Data Indications too, so the sequence decoded
+                        // them as a Share Control PDU and derailed with
+                        // "ShareControlHeader ... invalid pdu_type". The proxy's workaround was to skip
+                        // the reactivation for ironrdp-web, but then AVD administratively disconnects
+                        // (ERRINFO 0x0000000B) ~2-3.5 min after any backend reconnect. So drive the
+                        // sequence WITH demux: only I/O-channel Share Control PDUs advance it (behavior
+                        // there is unchanged); everything else is serviced through the live ActiveStage
+                        // so DVC (including the graphics-channel reopen and its acks) keeps flowing.
+                        use ironrdp::connector::Sequence as _;
                         let mut connection_activation = activation_factory.create();
+                        let io_channel_id = connection_activation.io_channel_id();
                         let mut buf = WriteBuf::new();
                         'activation_seq: loop {
-                            let written =
-                                single_sequence_step_read(&mut framed, &mut connection_activation, &mut buf).await?;
+                            buf.clear();
+                            let written = if connection_activation.next_pdu_hint().is_some() {
+                                // Read the next frame outright (not by hint) so we can route it by MCS
+                                // channel rather than blindly handing it to the activation sequence.
+                                let (action, frame) = framed
+                                    .read_pdu()
+                                    .await
+                                    .context("read frame during Deactivation-Reactivation Sequence")?;
+
+                                // A reactivation Share Control PDU (Demand Active, then the finalization
+                                // PDUs) arrives as an X.224 MCS Send Data Indication on the I/O channel.
+                                // Anything else (DVC on drdynvc, other SVCs, fast-path) is session
+                                // traffic to service, not sequence input.
+                                let for_sequence = action == ironrdp::pdu::Action::X224
+                                    && ironrdp::pdu::mcs::decode_send_data_indication(&frame)
+                                        .map(|ctx| ctx.channel_id == io_channel_id)
+                                        .unwrap_or(false);
+
+                                if for_sequence {
+                                    connection_activation.step(&frame, framed.last_read_at(), &mut buf)?
+                                } else {
+                                    for out in active_stage.process(&mut image, action, &frame)? {
+                                        match out {
+                                            ActiveStageOutput::ResponseFrame(f) => {
+                                                self.writer_tx
+                                                    .unbounded_send(f)
+                                                    .context("Send frame to writer task")?;
+                                            }
+                                            // A server that ends the session mid-reactivation still
+                                            // terminates cleanly.
+                                            ActiveStageOutput::Terminate(reason) => break 'outer reason,
+                                            // The image is recreated below and the server repaints via
+                                            // RESETGRAPHICS, so visual/other outputs are dropped for the
+                                            // duration of the sequence.
+                                            _ => {}
+                                        }
+                                    }
+                                    connector::Written::Nothing
+                                }
+                            } else {
+                                connection_activation.step_no_input(&mut buf)?
+                            };
 
                             if written.size().is_some() {
                                 self.writer_tx
