@@ -128,8 +128,38 @@ interface MainSurface {
     /** Monotonic per-surface chunk timestamp; also the `geom` map key. */
     timestamp: number;
     /** decode-time metadata keyed by chunk timestamp (matched on decoder output). */
-    geom: Map<number, { frameId: number; rects: RegionRect[]; originX: number; originY: number }>;
+    geom: Map<number, { frameId: number; rects: RegionRect[]; originX: number; originY: number; chunk: GopChunk }>;
+    /**
+     * The current GOP as received -- the keyframe and every delta after it -- kept only while this
+     * surface still decodes in hardware, so that when the hardware decoder dies the surface can be
+     * rebuilt in software and REPLAYED rather than left waiting for a keyframe. See
+     * `fallBackToSoftware` for why waiting is not an option. Bounded by GOP_REPLAY_MAX_BYTES /
+     * GOP_REPLAY_MAX_CHUNKS; past the cap it is dropped (`gopOverflow`) and the old wait applies.
+     */
+    gop: GopChunk[];
+    gopBytes: number;
+    gopOverflow: boolean;
 }
+
+/** One encoded chunk retained for GOP replay, exactly as it was handed to `decodeMain`. */
+interface GopChunk {
+    frameId: number;
+    originX: number;
+    originY: number;
+    regions: Uint32Array;
+    data: Uint8Array;
+    /** Set once the (hardware) decoder produced this frame and its FrameAcknowledge went out. */
+    ackSent: boolean;
+}
+
+/**
+ * GOP replay cap. A hardware decoder that refuses to configure fails on the FIRST chunk, so the
+ * common case replays one keyframe; a runtime failure deep into a long GOP is the rare one, and a
+ * few seconds of desktop video at typical eGFX bitrates fits comfortably here. Beyond it we would
+ * rather forget the GOP than hold an unbounded buffer for the life of a session that never fails.
+ */
+const GOP_REPLAY_MAX_BYTES = 16 * 1024 * 1024;
+const GOP_REPLAY_MAX_CHUNKS = 1024;
 
 export class AvcDecoder {
     private session: SessionLike | null = null;
@@ -359,6 +389,9 @@ export class AvcDecoder {
                 softwareFallback: false,
                 timestamp: 0,
                 geom: new Map(),
+                gop: [],
+                gopBytes: 0,
+                gopOverflow: false,
             };
             this.surfaces.set(surfaceId, sd);
         }
@@ -372,6 +405,7 @@ export class AvcDecoder {
         originY: number,
         regions: Uint32Array,
         data: Uint8Array,
+        replay: GopChunk | null = null,
     ): void {
         if (typeof VideoDecoder === 'undefined') {
             if (!this.warnedUnsupported) {
@@ -382,6 +416,11 @@ export class AvcDecoder {
         }
         const sd = this.getMainSurface(surfaceId);
         const { hasKey, sps } = analyzeAnnexB(data);
+
+        // Retain the GOP while hardware decode is still in play (a replayed chunk is already in it).
+        // Once in software there is no further fallback, so nothing to replay into.
+        const chunk = replay ?? { frameId, originX, originY, regions, data, ackSent: false };
+        if (replay === null && !sd.softwareFallback && HW_DECODE) this.retainForReplay(sd, chunk, hasKey);
 
         if (sd.decoder === null) {
             if (!hasKey || sps === null) return; // wait for this surface's first keyframe
@@ -433,6 +472,11 @@ export class AvcDecoder {
                 if (!sd.softwareFallback && HW_DECODE) {
                     console.warn('[AVC] hardware decode unavailable — falling back to software');
                     sd.softwareFallback = true;
+                    sd.gop = [];
+                    sd.gopBytes = 0;
+                    // Same keyframe, software this time. Dropping it here would leave the surface
+                    // waiting for a keyframe that only a refresh brings (see fallBackToSoftware).
+                    this.decodeMain(surfaceId, frameId, originX, originY, regions, data, chunk);
                 }
                 return;
             }
@@ -447,7 +491,10 @@ export class AvcDecoder {
         // frame, so shifting them here would break the sampling. The origin rides along and is
         // applied only where an OUTPUT-space coordinate is actually needed (the GPU destination
         // rect, and the canvas-update notification).
-        sd.geom.set(ts, { frameId, rects: unflatten(regions), originX, originY });
+        // `chunk` rides along so the output side can record the ack on it: a replayed chunk the
+        // hardware decoder already produced was acked back then, and the host must not see that
+        // FrameAcknowledge twice, so its replay only re-presents.
+        sd.geom.set(ts, { frameId, rects: unflatten(regions), originX, originY, chunk });
         try {
             this.pendingDecodes++;
             sd.decoder.decode(new EncodedVideoChunk({ type: hasKey ? 'key' : 'delta', timestamp: ts, data }));
@@ -459,22 +506,56 @@ export class AvcDecoder {
         }
     }
 
+    /** Append a chunk to the surface's retained GOP; a keyframe starts a new one. */
+    private retainForReplay(sd: MainSurface, chunk: GopChunk, isKey: boolean): void {
+        if (isKey) {
+            sd.gop = [];
+            sd.gopBytes = 0;
+            sd.gopOverflow = false;
+        } else if (sd.gopOverflow || sd.gop.length === 0) {
+            return; // no keyframe to anchor a replay, or already given up on this GOP
+        }
+        if (sd.gopBytes + chunk.data.byteLength > GOP_REPLAY_MAX_BYTES || sd.gop.length >= GOP_REPLAY_MAX_CHUNKS) {
+            sd.gop = [];
+            sd.gopBytes = 0;
+            sd.gopOverflow = true;
+            return;
+        }
+        sd.gop.push(chunk);
+        sd.gopBytes += chunk.data.byteLength;
+    }
+
     /**
      * Drop one surface back to software decode after its hardware decoder failed.
      *
-     * The errored decoder is already closed, so the surface is torn down to the pre-keyframe state
-     * and rebuilt on the next keyframe -- deltas in between are useless without their reference
-     * frames. `geom` is cleared too: those entries are keyed by chunk timestamp for a decoder that
-     * will never produce output, and would otherwise leak for the life of the session.
+     * The errored decoder is already closed, so the surface is torn down and rebuilt in software.
+     * It is then REPLAYED from the retained GOP, because "wait for the next keyframe" is not a
+     * recovery: a decoder that refuses to configure (a VM with no GPU: "Unsupported configuration")
+     * dies on the keyframe itself, that keyframe is gone with it, and the host only sends another on
+     * a refresh -- which a shadow viewer never gets. The result was a permanently black surface on
+     * exactly the machines the fallback exists for. Deltas since the keyframe are replayed too, so
+     * the surface catches up to live rather than showing a stale picture until the next delta.
+     * `geom` is cleared first: those entries belong to a decoder that will never produce output.
      */
     private fallBackToSoftware(surfaceId: number): void {
         const sd = this.surfaces.get(surfaceId);
         if (!sd || sd.softwareFallback) return;
-        console.warn('[AVC] hardware decoder failed on surface', surfaceId, '— retrying in software');
         sd.softwareFallback = true;
         sd.decoder = null;
         sd.sawKeyframe = false;
         sd.geom.clear();
+
+        const gop = sd.gop;
+        sd.gop = [];
+        sd.gopBytes = 0;
+        if (gop.length === 0) {
+            console.warn('[AVC] hardware decoder failed on surface', surfaceId, '— retrying in software on the next keyframe');
+            return;
+        }
+        console.warn('[AVC] hardware decoder failed on surface', surfaceId, `— replaying ${gop.length} chunk(s) in software`);
+        for (const c of gop) {
+            this.decodeMain(surfaceId, c.frameId, c.originX, c.originY, c.regions, c.data, c);
+        }
     }
 
     private onFrameMain(surfaceId: number, frame: VideoFrame): void {
@@ -488,7 +569,12 @@ export class AvcDecoder {
 
         // ACK-ON-DECODE: fire the FrameAcknowledge the instant the frame decodes, BEFORE present, so
         // a present/vsync stall can never delay the ack (MSFT: "frame ack sent without surface").
-        this.session?.invokeExtension(onAvcAck({ frameId: meta.frameId }));
+        // Once per frame: a GOP replay after a hardware-decoder failure re-decodes frames that may
+        // already have been acked (see fallBackToSoftware).
+        if (!meta.chunk.ackSent) {
+            meta.chunk.ackSent = true;
+            this.session?.invokeExtension(onAvcAck({ frameId: meta.frameId }));
+        }
 
         // GPU present: hand the VideoFrame to the unified surface renderer (drop-to-latest; it
         // uploads + closes on the next rAF). No WASM surface write — AVC is a hole in the chrome.
