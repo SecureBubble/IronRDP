@@ -32,6 +32,13 @@ export class ClipboardService {
     // Used to prevent the monitoring loop from clobbering an active file upload's
     // FormatList with a text/image clipboard update.
     private monitoringSuppressed: boolean = false;
+    // Consecutive NotAllowedError reads seen by the monitoring loop while the document
+    // was focused. A single one is normal in Chromium (focus moved between the
+    // hasFocus() check and the read); only a run of them means the permission is gone.
+    private consecutiveNotAllowed = 0;
+    // How many consecutive focused NotAllowedError reads it takes to give up on the
+    // monitoring loop. At the 100ms cadence this is about a second of solid refusals.
+    private static readonly NOT_ALLOWED_GIVE_UP = 10;
 
     constructor(remoteDesktopService: RemoteDesktopService, module: RemoteDesktopModule) {
         this.remoteDesktopService = remoteDesktopService;
@@ -314,6 +321,7 @@ export class ClipboardService {
             }
 
             const value = await navigator.clipboard.read();
+            this.consecutiveNotAllowed = 0;
 
             // Clipboard is empty
             if (value.length == 0) {
@@ -400,8 +408,31 @@ export class ClipboardService {
             }
         } catch (err) {
             if (err instanceof DOMException && err.name === 'NotAllowedError') {
-                // The browser requires user activation for clipboard reads (e.g. Firefox v127+).
-                // The polling loop cannot work in this environment; fall back to manual mode.
+                // NotAllowedError is NOT always "permission denied". Chromium also throws it
+                // ("Document is not focused") when focus leaves between the hasFocus() check
+                // above and the read -- routine when the user clicks into another window to
+                // copy or paste. Treating that one error as permanent killed the clipboard
+                // for the rest of the session in BOTH directions: the poller stopped, so local
+                // copies were never sent, and remote copies were parked in manual mode where
+                // nothing in the host page collects them. Only a reload brought it back.
+                //
+                // So: give up only on a solid run of refusals while focused, or when the
+                // Permissions API says the permission is actually denied. A lone refusal is
+                // logged once and the loop carries on.
+                if (!document.hasFocus()) {
+                    return; // focus moved mid-read; the next tick re-checks hasFocus()
+                }
+                this.consecutiveNotAllowed++;
+                const denied = await this.clipboardReadDenied();
+                if (!denied && this.consecutiveNotAllowed < ClipboardService.NOT_ALLOWED_GIVE_UP) {
+                    if (this.consecutiveNotAllowed === 1) {
+                        console.warn('Clipboard read refused while focused; monitoring continues:', err);
+                    }
+                    return;
+                }
+                // The browser requires user activation for clipboard reads (e.g. Firefox v127+),
+                // or the user denied the permission. The polling loop cannot work; fall back to
+                // manual mode.
                 console.warn('Clipboard monitoring disabled: browser requires user activation for clipboard read.');
                 this.remoteDesktopService.setOnRemoteClipboardChanged(
                     this.onRemoteClipboardChangedManualMode.bind(this),
@@ -409,6 +440,7 @@ export class ClipboardService {
                 stopped = true;
                 return;
             }
+            this.consecutiveNotAllowed = 0;
 
             if (err instanceof Error) {
                 const printError =
@@ -424,6 +456,17 @@ export class ClipboardService {
             if (!stopped && !get(isComponentDestroyed)) {
                 this.scheduleOnMonitorClipboardUpdate();
             }
+        }
+    }
+
+    /** True only when the Permissions API positively reports clipboard-read as denied.
+     *  Unknown (query unsupported or throwing) is NOT treated as denied. */
+    private async clipboardReadDenied(): Promise<boolean> {
+        try {
+            const status = await navigator.permissions.query({ name: 'clipboard-read' as PermissionName });
+            return status.state === 'denied';
+        } catch {
+            return false;
         }
     }
 
