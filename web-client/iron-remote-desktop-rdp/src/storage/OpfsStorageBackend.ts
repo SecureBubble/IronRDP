@@ -91,7 +91,7 @@ class OpfsWriteHandle implements FileWriteHandle {
  *
  * **How it works:**
  * 1. On construction, a per-session subdirectory is created under
- *    `ironrdp-transfers/` in the OPFS root.
+ *    `bubble-transfers/` in the OPFS root.
  * 2. Each download opens a {@link FileSystemWritableFileStream} inside
  *    that directory and flushes chunks to disk as they arrive.
  * 3. On completion, the stream is closed and a lazy {@link File} handle is
@@ -130,7 +130,7 @@ export class OpfsStorageBackend implements FileStorageBackend {
      */
     static async create(opfsRoot: FileSystemDirectoryHandle, sessionId?: string): Promise<OpfsStorageBackend> {
         const id = sessionId ?? `s-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const transfersDir = await opfsRoot.getDirectoryHandle('ironrdp-transfers', { create: true });
+        const transfersDir = await opfsRoot.getDirectoryHandle('bubble-transfers', { create: true });
         const sessionDir = await transfersDir.getDirectoryHandle(id, { create: true });
 
         // Best-effort cleanup of orphaned session directories from previous
@@ -190,10 +190,10 @@ export class OpfsStorageBackend implements FileStorageBackend {
      */
     static async probe(opfsRoot: FileSystemDirectoryHandle): Promise<boolean> {
         try {
-            const handle = await opfsRoot.getFileHandle('.ironrdp-opfs-probe', { create: true });
+            const handle = await opfsRoot.getFileHandle('.bubble-opfs-probe', { create: true });
             const writable = await handle.createWritable();
             await writable.close();
-            await opfsRoot.removeEntry('.ironrdp-opfs-probe');
+            await opfsRoot.removeEntry('.bubble-opfs-probe');
             return true;
         } catch {
             return false;
@@ -225,7 +225,7 @@ export class OpfsStorageBackend implements FileStorageBackend {
         this.sessionDir = undefined;
 
         try {
-            const transfersDir = await this.opfsRoot.getDirectoryHandle('ironrdp-transfers');
+            const transfersDir = await this.opfsRoot.getDirectoryHandle('bubble-transfers');
             await transfersDir.removeEntry(this.sessionId, { recursive: true });
 
             // Clean up the parent directory if it is now empty.
@@ -236,7 +236,7 @@ export class OpfsStorageBackend implements FileStorageBackend {
                 break;
             }
             if (!hasEntries) {
-                await this.opfsRoot.removeEntry('ironrdp-transfers');
+                await this.opfsRoot.removeEntry('bubble-transfers');
             }
         } catch (error) {
             console.debug('OPFS session directory removal failed, falling back to per-file cleanup:', error);

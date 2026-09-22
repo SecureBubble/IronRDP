@@ -60,7 +60,7 @@ function webGlPresentEnabled(): boolean {
     let param: string | null = null;
     try {
         // Tolerant of a JSON-quoted value; see the same note on STATS_ENABLED in SurfaceRenderer.
-        param = new URLSearchParams(globalThis.location?.search ?? '').get('ironwebgl')?.replace(/^"|"$/g, '') ?? null;
+        param = new URLSearchParams(globalThis.location?.search ?? '').get('bubblewebgl')?.replace(/^"|"$/g, '') ?? null;
     } catch {
         /* no location (worker/SSR) — fall through to capability detection */
     }
@@ -74,7 +74,7 @@ function webGlPresentEnabled(): boolean {
 }
 
 /**
- * Hardware H.264 decode on the WebGL path. DEFAULT ON; `?ironhwdec=0` forces software back.
+ * Hardware H.264 decode on the WebGL path. DEFAULT ON; `?bubblehwdec=0` forces software back.
  *
  * Worth roughly half the renderer's CPU (see the configure call for the measurements). Per-surface
  * fallback to software is automatic if the hardware decoder refuses to configure or errors at
@@ -91,7 +91,7 @@ const MAX_QUEUED_CACHE_OPS = 512;
 
 const HW_DECODE = (() => {
     try {
-        const p = new URLSearchParams(globalThis.location?.search ?? '').get('ironhwdec')?.replace(/^"|"$/g, '');
+        const p = new URLSearchParams(globalThis.location?.search ?? '').get('bubblehwdec')?.replace(/^"|"$/g, '');
         return p !== '0' && p !== 'false';
     } catch {
         return true;
@@ -180,7 +180,7 @@ export class AvcDecoder {
         if (this.useWebGl) {
             this.worker = null;
             console.info(
-                '[AVC] WebGL present path: main-thread decode + ack-on-decode (default; ?ironwebgl=0 to opt out)',
+                '[AVC] WebGL present path: main-thread decode + ack-on-decode (default; ?bubblewebgl=0 to opt out)',
             );
         } else {
             this.worker = new AvcWorker();
@@ -456,7 +456,7 @@ export class AvcDecoder {
                 //
                 // Software decode also ran H.264 on a CPU thread pool, which is why nine rounds of
                 // main-thread instrumentation never found this: the cost was never on the thread we
-                // were measuring. `?ironhwdec=0` forces the old behaviour back.
+                // were measuring. `?bubblehwdec=0` forces the old behaviour back.
                 const accel: HardwareAcceleration =
                     HW_DECODE && !sd.softwareFallback ? 'prefer-hardware' : 'prefer-software';
                 console.info(`[AVC] decoder configure codec=${sd.codec} hardwareAcceleration=${accel}`);

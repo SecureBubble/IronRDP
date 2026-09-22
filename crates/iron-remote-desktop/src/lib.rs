@@ -477,6 +477,10 @@ pub mod internal {
         INIT.call_once(|| {
             let fmt_layer = tracing_subscriber::fmt::layer()
                 .with_ansi(false)
+                // No module target on console lines: it is an implementation detail (crate
+                // names) that reads as product branding in a customer's DevTools. The level
+                // and message carry the diagnostic value; `?bubblelog=` still controls depth.
+                .with_target(false)
                 .with_timer(UtcTime::rfc_3339()) // std::time is not available in browsers
                 .with_writer(MakeConsoleWriter);
 

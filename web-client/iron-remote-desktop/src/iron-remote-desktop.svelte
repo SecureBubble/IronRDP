@@ -1,6 +1,6 @@
 <svelte:options
     customElement={{
-        tag: 'iron-remote-desktop',
+        tag: 'bubble-remote-desktop',
         shadow: 'none',
         extend: (elementConstructor) => {
             return class extends elementConstructor {

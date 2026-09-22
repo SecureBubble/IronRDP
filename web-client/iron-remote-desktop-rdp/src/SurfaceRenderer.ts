@@ -31,7 +31,7 @@ interface Rect {
     h: number;
 }
 
-/** `?ironstats=1` re-enables the rolling present-stats line (off by default: console flood). */
+/** `?bubblestats=1` re-enables the rolling present-stats line (off by default: console flood). */
 /**
  * STICKY, and it has to be: connecting navigates to `/webclient` and the query string does not
  * survive it, which silently disarmed an entire A/B capture -- the session ran, AVC frames flowed,
@@ -39,14 +39,14 @@ interface Rect {
  * sighting; this reads the same latch so the vendor and the app arm together.
  */
 /**
- * Per-restore tile-cache tracing (`?irontc=1`). SEPARATE from `?ironstats=1` on purpose: a RAIL
+ * Per-restore tile-cache tracing (`?irontc=1`). SEPARATE from `?bubblestats=1` on purpose: a RAIL
  * session produced 53,093 restores, and one console line each would drown the perf meter that
  * `ironstats` exists for -- the instrument would distort the thing it measures. Aggregate cache
  * counters stay under `ironstats`; only the per-restore `dst <- src` line needs this.
  */
 const TILECACHE_TRACE = (() => {
     try {
-        const p = new URLSearchParams(globalThis.location?.search ?? '').get('irontc')?.replace(/^"|"$/g, '');
+        const p = new URLSearchParams(globalThis.location?.search ?? '').get('bubbletc')?.replace(/^"|"$/g, '');
         return p === '1';
     } catch {
         return false;
@@ -57,9 +57,9 @@ const STATS_ENABLED = (() => {
     try {
         // Tolerant of both `ironstats=1` and `ironstats="1"` -- the app router JSON-serializes
         // string search values, and the quoted form silently fails a strict `=== '1'` test.
-        const param = new URLSearchParams(globalThis.location?.search ?? '').get('ironstats')?.replace(/^"|"$/g, '');
+        const param = new URLSearchParams(globalThis.location?.search ?? '').get('bubblestats')?.replace(/^"|"$/g, '');
         if (param === '0') return false;
-        return param === '1' || sessionStorage.getItem('ironstats') === '1';
+        return param === '1' || sessionStorage.getItem('bubblestats') === '1';
     } catch {
         return false;
     }
@@ -123,7 +123,7 @@ class PresentStats {
         if (elapsed >= 2000) {
             const fps = (this.frames / elapsed) * 1000;
             // Off by default: this fired every 2s for the whole session and was a top console
-            // flooder. `?ironstats=1` brings it back when measuring present cost.
+            // flooder. `?bubblestats=1` brings it back when measuring present cost.
             if (STATS_ENABLED) {
                 console.info(
                     `[SurfaceRenderer] fps=${fps.toFixed(1)} present(avg/max)=${(this.sumMs / this.frames).toFixed(2)}/${this.maxMs.toFixed(2)}ms ` +
@@ -264,7 +264,7 @@ export class SurfaceRenderer {
     private tcMisses = 0;
     private readonly tcMissedSlots = new Set<number>();
     private tcReportAt = 0;
-    /** slot -> "sx,sy WxH" it was captured from. Diagnostics only (?ironstats=1). */
+    /** slot -> "sx,sy WxH" it was captured from. Diagnostics only (?bubblestats=1). */
     private readonly tcOrigin = new Map<number, string>();
 
     // ---- session watermark (RDPGFX_CMDID_WATERMARK), drawn on its own canvas above the present
@@ -553,7 +553,7 @@ export class SurfaceRenderer {
             const dx = points[i]!;
             const dy = points[i + 1]!;
             // `dst <- src` for every restore, so an artifact's screen position maps straight back to
-            // the source rect it was captured from. Behind ?ironstats=1 -- it is one line per
+            // the source rect it was captured from. Behind ?bubblestats=1 -- it is one line per
             // restore and there are thousands.
             if (TILECACHE_TRACE) {
                 console.info(
@@ -763,7 +763,7 @@ export class SurfaceRenderer {
         // Marks this as the canvas that actually HOLDS the composited framebuffer, so an
         // external presenter (the webapp's multi-monitor controller) can find the pixels.
         // `#renderer` stays blank on this path, and sampling it yielded all-black monitors.
-        overlay.setAttribute('data-iron-present', '1');
+        overlay.setAttribute('data-bubble-present', '1');
         overlay.width = Math.max(1, this.base.width);
         overlay.height = Math.max(1, this.base.height);
         if (getComputedStyle(parent).position === 'static') {
@@ -917,7 +917,7 @@ export class SurfaceRenderer {
         c.style.mixBlendMode = 'normal';
         // Tells the multi-monitor blit to copy this opaquely instead of differencing it, so the
         // explanation reaches the secondary displays intact rather than as inverted noise.
-        c.setAttribute('data-iron-watermark-blocked', '1');
+        c.setAttribute('data-bubble-watermark-blocked', '1');
         ctx.clearRect(0, 0, c.width, c.height);
         ctx.fillStyle = '#0b0b0c';
         ctx.fillRect(0, 0, c.width, c.height);
@@ -966,7 +966,7 @@ export class SurfaceRenderer {
         c.style.pointerEvents = 'none';
         c.style.mixBlendMode = 'difference';
         // Lets an external presenter (the multi-monitor controller) find and re-apply this layer.
-        c.setAttribute('data-iron-watermark', '1');
+        c.setAttribute('data-bubble-watermark', '1');
         parent.style.isolation = 'isolate';
         parent.appendChild(c);
         this.wmCanvas = c;
@@ -1012,7 +1012,7 @@ export class SurfaceRenderer {
         // Restore the blend mode: `paintBlocked` turns it off to draw an opaque panel, and a
         // recovered session would otherwise keep rendering its tiles with no blending at all.
         c.style.mixBlendMode = 'difference';
-        c.removeAttribute('data-iron-watermark-blocked');
+        c.removeAttribute('data-bubble-watermark-blocked');
         this.wmBlockedPainted = false;
         ctx.clearRect(0, 0, c.width, c.height);
 
