@@ -23,6 +23,10 @@ function positiveNumber(value) {
   return Number.isSafeInteger(number) && number > 0 ? number : null;
 }
 
+function inputFlag(value) {
+  return ["true", true].includes(value);
+}
+
 async function getOpenAtHead(github, owner, repo, number, requiredSha) {
   const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
   return pr.state === "open" && SHA.test(pr.head?.sha || "") && (!requiredSha || pr.head.sha === requiredSha) ? pr : null;
@@ -54,16 +58,20 @@ async function workflowRunPullRequests(github, owner, repo, workflowRun) {
 async function resolvePr({ github, context, inputs = {} }) {
   const route = routeFor(context);
   const { owner, repo } = context.repo;
-  const force = route === "dispatch" && ["true", true].includes(
-    inputs.force ?? context.payload.inputs?.force);
+  const force = route === "dispatch" && inputFlag(inputs.force ?? context.payload.inputs?.force);
+  const dispatchReview = route === "dispatch" &&
+    inputFlag(inputs.review ?? context.payload.inputs?.review);
   const oversizedReviewRequested = route === "classification" &&
     context.payload.action === "labeled" && context.payload.label?.name === OVERSIZED_REVIEW_LABEL;
   let pr;
+  let observedCiRun = null;
   try {
     if (route === "classification") {
       // State writes also emit `labeled` events, so only the explicit maintainer opt-in may start
-      // automation through that event.
-      if (context.payload.action === "labeled" && context.payload.label?.name !== OVERSIZED_REVIEW_LABEL) {
+      // automation through label events. Removing the opt-in must restart classification so the
+      // shared PR concurrency group cancels any queued or running use of the larger evidence cap.
+      if (["labeled", "unlabeled"].includes(context.payload.action) &&
+          context.payload.label?.name !== OVERSIZED_REVIEW_LABEL) {
         return noResult("unrelated pull request label", route);
       }
       const number = positiveNumber(context.payload.pull_request?.number);
@@ -78,6 +86,11 @@ async function resolvePr({ github, context, inputs = {} }) {
       const matches = await workflowRunPullRequests(github, owner, repo, source);
       if (matches.length !== 1) return noResult("workflow run did not resolve exactly one current PR", route);
       pr = matches[0];
+      // The completed run is authoritative for its own generation while the run listing catches up.
+      observedCiRun = {
+        id: source.id, run_attempt: source.run_attempt, head_sha: source.head_sha,
+        name: source.name, status: source.status, conclusion: source.conclusion,
+      };
     } else if (route === "classification-complete") {
       if (context.payload.action !== "pr-automation-classified") {
         return noResult("unrelated repository dispatch", route);
@@ -100,20 +113,25 @@ async function resolvePr({ github, context, inputs = {} }) {
   const authorIsBot = pr.user?.type === "Bot" || /\[bot\]$/i.test(authorLogin) ||
     authorLogin.toLowerCase() === "devolutionsbot";
   if (authorIsBot && !force) return noResult("bot-authored pull request", route);
+  const labels = (pr.labels || [])
+    .map((label) => typeof label === "string" ? label : label.name)
+    .filter(Boolean);
+  const reviewRequested = oversizedReviewRequested || dispatchReview;
+  const classificationRequested = route === "classification" ||
+    (route === "dispatch" && !dispatchReview);
   return {
     ok: true, route, prNumber: pr.number, headSha: pr.head.sha, baseSha: pr.base.sha,
-    labels: (pr.labels || []).map((label) => typeof label === "string" ? label : label.name).filter(Boolean),
+    labels,
+    evidenceMaxBytes: labels.includes(OVERSIZED_REVIEW_LABEL) ? 4 * 1024 * 1024 : 1024 * 1024,
     author: {
       nodeId: pr.user?.node_id || null, login: pr.user?.login || null, type: pr.user?.type || null,
       association: pr.author_association || null,
     },
     force,
-    reviewRequested: oversizedReviewRequested ||
-      (route === "dispatch" && ["true", true].includes(inputs.review ?? context.payload.inputs?.review)),
-    classificationRequested: route === "classification" ||
-      (route === "dispatch" && !["true", true].includes(inputs.review ?? context.payload.inputs?.review)),
-    reviewRoute: route === "ci" || route === "classification-complete" ||
-      (route === "dispatch" && ["true", true].includes(inputs.review ?? context.payload.inputs?.review)),
+    observedCiRun,
+    reviewRequested,
+    classificationRequested,
+    reviewRoute: route === "ci" || route === "classification-complete" || dispatchReview,
   };
 }
 

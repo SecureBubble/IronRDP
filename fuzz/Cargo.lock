@@ -461,6 +461,7 @@ dependencies = [
  "ironrdp-graphics",
  "ironrdp-pdu",
  "ironrdp-rdpdr",
+ "ironrdp-rdpel",
  "ironrdp-rdpemt",
  "ironrdp-rdpeudp",
  "ironrdp-rdpeusb",
@@ -521,6 +522,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-rdpel"
+version = "0.0.0"
+dependencies = [
+ "ironrdp-core",
+ "ironrdp-dvc",
+ "ironrdp-pdu",
+ "ironrdp-svc",
+ "tracing",
+]
+
+[[package]]
 name = "ironrdp-rdpemt"
 version = "0.1.0"
 dependencies = [
@@ -528,6 +540,7 @@ dependencies = [
  "ironrdp-core",
  "ironrdp-error",
  "subtle",
+ "tracing",
 ]
 
 [[package]]
@@ -538,6 +551,7 @@ dependencies = [
  "bitflags",
  "ironrdp-core",
  "ironrdp-error",
+ "tracing",
 ]
 
 [[package]]

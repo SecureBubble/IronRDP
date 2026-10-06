@@ -57,6 +57,7 @@ enum RdpsndState {
 #[derive(Debug)]
 pub struct Rdpsnd {
     handler: Box<dyn RdpsndClientHandler>,
+    quality_mode: pdu::QualityMode,
     state: RdpsndState,
     server_format: Option<ServerAudioFormatPdu>,
 }
@@ -67,9 +68,16 @@ impl Rdpsnd {
     pub fn new(handler: Box<dyn RdpsndClientHandler>) -> Self {
         Self {
             handler,
+            quality_mode: pdu::QualityMode::High,
             state: RdpsndState::Start,
             server_format: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_quality_mode(mut self, quality_mode: pdu::QualityMode) -> Self {
+        self.quality_mode = quality_mode;
+        self
     }
 
     pub fn get_format(&self, format_no: u16) -> PduResult<&AudioFormat> {
@@ -120,7 +128,7 @@ impl Rdpsnd {
 
     pub fn quality_mode(&mut self) -> PduResult<Vec<ClientAudioOutputPdu>> {
         let pdu = pdu::QualityModePdu {
-            quality_mode: pdu::QualityMode::High,
+            quality_mode: self.quality_mode,
         };
         Ok(vec![ClientAudioOutputPdu::QualityMode(pdu)])
     }

@@ -26,7 +26,7 @@ use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::gcc::{Monitor as GccMonitor, MonitorFlags};
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
-use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
+use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
@@ -179,6 +179,8 @@ struct SessionBuilderInner {
     // server falls back to ClearCodec / RFX-Progressive). Defaults to true to
     // preserve behavior for callers that don't set it.
     advertise_avc: bool,
+    enable_server_pointer: bool,
+    legacy_graphics: bool,
     outbound_message_size_limit: Option<usize>,
 }
 
@@ -238,6 +240,8 @@ impl Default for SessionBuilderInner {
             use_display_control: false,
             enable_credssp: true,
             advertise_avc: true,
+            enable_server_pointer: true,
+            legacy_graphics: false,
             outbound_message_size_limit: None,
         }
     }
@@ -371,6 +375,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             // remote host produces one spanning desktop (bounding box), rendered into
             // the single canvas. An empty/invalid layout falls back to single-monitor.
             |monitors: JsValue| { self.0.borrow_mut().monitors = parse_monitors(&monitors) };
+            |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
+            |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -548,6 +554,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             invalid_sound_callbacks,
             sound_callbacks,
             outbound_message_size_limit,
+            legacy_graphics,
         );
 
         {
@@ -601,11 +608,19 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             invalid_sound_callbacks = inner.invalid_sound_callbacks;
             sound_callbacks = inner.sound_callbacks.clone();
             outbound_message_size_limit = inner.outbound_message_size_limit;
+            legacy_graphics = inner.legacy_graphics;
         }
 
         info!("Connect to RDP host");
 
-        let mut config = build_config(username, password, server_domain, client_name.clone(), desktop_size);
+        let mut config = build_config(
+            username,
+            password,
+            server_domain,
+            client_name.clone(),
+            desktop_size,
+            legacy_graphics,
+        );
 
         let enable_credssp = self.0.borrow().enable_credssp;
         config.enable_credssp = enable_credssp;
@@ -667,6 +682,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                 .to_owned();
             config.request_data = Some(ironrdp::pdu::nego::NegoRequestData::routing_token(value));
         }
+        let enable_server_pointer = self.0.borrow().enable_server_pointer;
+        config.enable_server_pointer = enable_server_pointer;
 
         let (input_events_tx, input_events_rx) = mpsc::unbounded();
 
@@ -3686,7 +3703,27 @@ fn build_config(
     domain: Option<String>,
     client_name: String,
     desktop_size: DesktopSize,
+    legacy_graphics: bool,
 ) -> connector::Config {
+    // Win7-class servers need 32-bpp lossless bitmaps and no advertised codecs.
+    let bitmap = if legacy_graphics {
+        connector::BitmapConfig {
+            color_depth: 32,
+            lossy_compression: false,
+            codecs: BitmapCodecs(Vec::new()),
+        }
+    } else {
+        connector::BitmapConfig {
+            // 32, NOT upstream's 16: with 32 the connector emits highColorDepth=24 +
+            // WANT_32_BPP_SESSION in the GCC client core data. Advertising 16 makes
+            // proxies/servers clamp the session to 16bpp (RGB565), which the eGFX
+            // renderer then misreads as 32bpp XRGB -> scrambled colors.
+            color_depth: 32,
+            lossy_compression: true,
+            codecs: client_codecs_capabilities(&[]).expect("can't panic for &[]"),
+        }
+    };
+
     connector::Config {
         credentials: Credentials::UsernamePassword { username, password },
         domain,
@@ -3715,15 +3752,7 @@ fn build_config(
         rail_support_level: ironrdp::pdu::rdp::capability_sets::RailSupportLevel::SUPPORTED,
         // Client-side audio capture (microphone) is not implemented in the web client.
         enable_audio_capture: false,
-        bitmap: Some(connector::BitmapConfig {
-            // Request a 32bpp session: with 32 the connector emits highColorDepth=24
-            // + WANT_32_BPP_SESSION in the GCC client core data. Advertising 16 here
-            // makes proxies/servers clamp the session to 16bpp (RGB565), which the
-            // eGFX renderer then misreads as 32bpp XRGB → scrambled colors.
-            color_depth: 32,
-            lossy_compression: true,
-            codecs: client_codecs_capabilities(&[]).expect("can't panic for &[]"),
-        }),
+        bitmap: Some(bitmap),
         #[expect(
             clippy::arithmetic_side_effects,
             reason = "fine unless we end up with an insanely big version"
@@ -3738,7 +3767,7 @@ fn build_config(
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
         platform: ironrdp::pdu::rdp::capability_sets::MajorPlatformType::UNSPECIFIED,
         compression_type: None,
-        enable_server_pointer: false,
+        enable_server_pointer: true,
         autologon: false,
         enable_audio_playback: false,
         request_data: None,
@@ -3766,7 +3795,7 @@ fn build_config(
         // eGFX is ON: the client core now decodes the full multi-codec eGFX stream
         // (ClearCodec + RFX Progressive + AVC/uncompressed). The Bubble rdp-proxy
         // REQUIRES the client to announce eGFX, so this is also what the proxy expects.
-        support_graphics_pipeline: true,
+        support_dyn_vc_gfx_protocol: true,
         // RAIL (Remote Programs) is populated after build (from the `remoteApp`
         // extension); None means a normal desktop/alternate-shell session.
         rail: None,

@@ -3,7 +3,9 @@
 
 //! Reusable support for persistent RDP sessions hosted over local RPC.
 
+mod clipboard;
 pub mod daemon;
+pub mod known_certificates;
 pub mod logbuf;
 pub mod now;
 pub mod operations;

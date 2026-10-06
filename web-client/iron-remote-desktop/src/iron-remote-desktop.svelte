@@ -319,6 +319,8 @@
         initListeners();
     }
 
+    // Tells the host the component can connect. Only after the clipboard is set up too: connect() only opens the
+    // clipboard channel when the clipboard callbacks are registered by then.
     function dispatchReady() {
         let result = { irgUserInteraction: publicAPI.getExposedFunctions() };
 
@@ -364,7 +366,13 @@
         // clipboard callback was registered on the SessionBuilder before connect.
         // initClipboard() is what registers it, so `ready` must be dispatched only
         // after it completes — otherwise the client silently connects without CLIPRDR.
-        await clipboardService.initClipboard();
+        // A failure must not swallow readiness, though: without `ready` the host never
+        // connects at all, which is worse than a session without clipboard.
+        try {
+            await clipboardService.initClipboard();
+        } catch (err) {
+            loggingService.error('Clipboard initialization failed: ' + err);
+        }
         dispatchReady();
     });
 

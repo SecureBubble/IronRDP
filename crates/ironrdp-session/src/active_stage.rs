@@ -7,7 +7,7 @@ use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
 use ironrdp_dvc::{DrdynvcClient, DvcClientProcessor, DynamicChannelRef};
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::gcc::{ChannelName, Monitor};
-use ironrdp_pdu::geometry::InclusiveRectangle;
+use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::rdp::autodetect::AutoDetectRequest;
 use ironrdp_pdu::rdp::capability_sets::WindowSupportLevel;
@@ -24,7 +24,7 @@ use ironrdp_pdu::window::{
 use ironrdp_pdu::{Action, mcs};
 use ironrdp_rdpei::RdpeiClient;
 use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::fast_path::UpdateKind;
 use crate::image::DecodedImage;
@@ -1098,4 +1098,54 @@ mod tests {
             .is_ok()
         );
     }
+}
+
+// Adopted from upstream: a pure helper (no dependency on their eGFX compositor, which this
+// fork replaces) that applies RGBA deltas to the image and reports the damage.
+pub fn composite_graphics_updates(
+    image: &mut DecodedImage,
+    updates: impl IntoIterator<Item = (ExclusiveRectangle, Vec<u8>)>,
+) -> SessionResult<(Option<InclusiveRectangle>, Vec<InclusiveRectangle>)> {
+    let mut dirty: Option<InclusiveRectangle> = None;
+    let mut regions = Vec::new();
+    for (region, data) in updates {
+        // egfx maps regions with exclusive right/bottom; the session's InclusiveRectangle
+        // is one-past-inclusive. Compositor updates are always non-empty, so the
+        // saturating decrements never underflow a real region.
+        let region = InclusiveRectangle {
+            left: region.left,
+            top: region.top,
+            right: region.right.saturating_sub(1),
+            bottom: region.bottom.saturating_sub(1),
+        };
+
+        // `apply_rgba32` reports rejection by returning `InclusiveRectangle::empty()`,
+        // which is `(0, 0, 0, 0)` and not distinguishable from a real 1x1 update at the
+        // origin. Checking fit here first, rather than branching on that return value,
+        // means the delta is skipped outright rather than folded into the accumulator
+        // as a phantom region. A successful ResetGraphics resizes `image` to the
+        // compositor output before deltas are drained; this guard remains for deltas
+        // received before the first reset and future accounting mismatches.
+        let fits = region.left <= region.right
+            && region.top <= region.bottom
+            && region.right < image.width()
+            && region.bottom < image.height();
+        if !fits {
+            warn!(
+                ?region,
+                image_width = image.width(),
+                image_height = image.height(),
+                "Dropping a compositor delta outside the image bounds"
+            );
+            continue;
+        }
+
+        let applied = image.apply_rgba32(&data, &region, false)?;
+        regions.push(applied.clone());
+        dirty = Some(match dirty {
+            Some(acc) => acc.union(&applied),
+            None => applied,
+        });
+    }
+    Ok((dirty, regions))
 }

@@ -269,6 +269,12 @@ fn build_config(
         compression_type,
         pointer_software_rendering: true,
         multitransport_flags: None,
+        support_dyn_vc_gfx_protocol: true,
+        rail: Some(connector::RailConfig {
+            exe_or_file: r"C:WindowsSystem32Notepad.exe".to_owned(),
+            working_dir: String::new(),
+            arguments: String::new(),
+        }),
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,
         hardware_id: None,

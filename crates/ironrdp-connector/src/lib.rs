@@ -293,13 +293,27 @@ pub struct Config {
     /// [`MultiTransportChannelData`]: ironrdp_pdu::gcc::MultiTransportChannelData
     pub multitransport_flags: Option<gcc::MultiTransportFlags>,
 
-    /// FORK-ONLY. Advertise `SUPPORT_DYN_VC_GFX_PROTOCOL` in the early capability flags.
+    /// Advertise client support for the Remote Desktop Protocol: Graphics Pipeline Extension.
     ///
-    /// Only set this when the client actually attaches a graphics-pipeline dynamic virtual
-    /// channel handler (`ironrdp-egfx`'s `GraphicsPipelineClient`). Without the handler the
-    /// server may open the graphics DVC and the client would reject it, forcing a bitmap
-    /// fallback. Upstream has no equivalent gate.
-    pub support_graphics_pipeline: bool,
+    /// When `true`, the connector sets `RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL` in `earlyCapabilityFlags`.
+    /// [\[MS-RDPBCGR\] 2.2.1.3.2] defines this Client Core Data flag.
+    /// [\[MS-RDPEGFX\] 1.5.1] requires clients to advertise it before using EGFX.
+    ///
+    /// Enable this only after registering an EGFX-capable [`DvcClientProcessor`].
+    /// [`GraphicsPipelineClient`] provides IronRDP's implementation.
+    /// Register it with [`DrdynvcClient::with_dynamic_channel`].
+    /// Then attach the DRDYNVC client through [`ClientConnector::with_static_channel`].
+    /// Advertising the flag without a processor can make a server route graphics to an unhandled channel.
+    /// The desktop then remains blank.
+    ///
+    /// The default is `false`, so EGFX is not advertised.
+    ///
+    /// [\[MS-RDPBCGR\] 2.2.1.3.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/00f1da4a-ee9c-421a-852f-c19f92343d73
+    /// [\[MS-RDPEGFX\] 1.5.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+    /// [`DvcClientProcessor`]: https://docs.rs/ironrdp-dvc/latest/ironrdp_dvc/trait.DvcClientProcessor.html
+    /// [`DrdynvcClient::with_dynamic_channel`]: https://docs.rs/ironrdp-dvc/latest/ironrdp_dvc/struct.DrdynvcClient.html#method.with_dynamic_channel
+    /// [`GraphicsPipelineClient`]: https://docs.rs/ironrdp-egfx/latest/ironrdp_egfx/client/struct.GraphicsPipelineClient.html
+    pub support_dyn_vc_gfx_protocol: bool,
 
     /// FORK-ONLY. RAIL (Remote Programs) launch config for the `ironrdp-rdperp` crate: when set,
     /// the client attaches the `rail` static channel and sends a Client Execute PDU for this

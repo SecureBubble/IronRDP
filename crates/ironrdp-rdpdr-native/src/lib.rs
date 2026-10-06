@@ -12,9 +12,12 @@
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod nix;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use nix::backend;
+pub use nix::{backend, printer};
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{RedirectedDrive, RedirectedDriveError, WindowsRdpdrBackend, WindowsRdpdrBackendFactory};
+pub use windows::{
+    RdpdrWorkerThreadGuard, RdpdrWorkerThreadGuardResult, RdpdrWorkerThreadHooks, RedirectedDrive,
+    RedirectedDriveError, WindowsRdpdrBackend, WindowsRdpdrBackendFactory,
+};

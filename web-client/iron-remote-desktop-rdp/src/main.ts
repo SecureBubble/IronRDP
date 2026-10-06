@@ -122,6 +122,14 @@ export function enableCredssp(enable: boolean): Extension {
     return new Extension('enable_credssp', enable);
 }
 
+export function enableServerPointer(enable: boolean): Extension {
+    return new Extension('enable_server_pointer', enable);
+}
+
+export function legacyGraphics(enable: boolean): Extension {
+    return new Extension('legacy_graphics', enable);
+}
+
 // --- AVC (H.264) WebCodecs decode (RDP-specific) ---
 
 export { AvcDecoder } from './AvcDecoder';

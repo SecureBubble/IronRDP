@@ -61,7 +61,7 @@ use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::ProgressiveDecoder;
 use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_graphics::zgfx;
-use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle as _};
+use ironrdp_pdu::geometry::{ExclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
 use tracing::{debug, trace, warn};
 
@@ -236,7 +236,10 @@ pub struct AvcFrame<'a> {
     /// length-prefixed NAL units, NOT Annex B). A complete YUV420 picture.
     pub main_stream: &'a [u8],
     /// Metablock region rectangles: the dirty sub-rects updated within this frame.
-    pub regions: &'a [InclusiveRectangle],
+    ///
+    /// Exclusive `right`/`bottom`, like `destination_rectangle`: these are MS-RDPEGFX
+    /// RDPGFX_RECT16 values, so a region's width is `right - left`, not `right - left + 1`.
+    pub regions: &'a [ExclusiveRectangle],
 }
 
 // ============================================================================

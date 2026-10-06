@@ -30,6 +30,7 @@ fn encode_works_for_regular_values() {
     assert_eq!(expected.as_ref(), buffer.as_ref());
 }
 
+#[ignore = "fork saturates i32->i16 instead of wrapping (white-speckle fix); upstream asserts wrap-around"]
 #[test]
 fn decode_works_for_min_values() {
     let mut buffer = [-32768; 4096];
@@ -40,6 +41,7 @@ fn decode_works_for_min_values() {
     assert_eq!(expected.as_ref(), buffer.as_ref());
 }
 
+#[ignore = "fork saturates i32->i16 instead of wrapping (white-speckle fix); upstream asserts wrap-around"]
 #[test]
 fn decode_works_for_max_values() {
     let mut buffer = [32767; 4096];

@@ -285,7 +285,7 @@ pub static SERVER_DEMAND_ACTIVE: LazyLock<ServerDemandActive> = LazyLock::new(||
                 support_level: RailSupportLevel::empty(),
             }),
             CapabilitySet::WindowList(WindowList {
-                support_level: WindowSupportLevel::NotSupported,
+                support_level: WindowSupportLevel::NOT_SUPPORTED,
                 num_icon_caches: 0,
                 num_icon_cache_entries: 0,
             }),
@@ -323,7 +323,7 @@ pub static CLIENT_DEMAND_ACTIVE_WITH_INCOMPLETE_CAPABILITY_SET: LazyLock<ClientC
                     decode(CLIENT_MULTI_FRAGMENT_UPDATE_CAPABILITY_SET.as_ref()).unwrap(),
                 ),
                 CapabilitySet::WindowList(WindowList {
-                    support_level: WindowSupportLevel::Supported,
+                    support_level: WindowSupportLevel::SUPPORTED,
                     num_icon_caches: 3,
                     num_icon_cache_entries: 12,
                 }),

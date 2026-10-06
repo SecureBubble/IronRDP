@@ -1,7 +1,7 @@
 use core::any::TypeId;
 use core::convert::Infallible;
 use core::mem;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -21,7 +21,10 @@ use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_svc::{StaticChannelSet, StaticVirtualChannel, SvcMessage, SvcProcessor};
 
-use crate::{Capture, NegotiatedState, PacketStream, Plaintext, ReplayError, decrypt_tls, recover_negotiated_state};
+use crate::tls::decrypt_tls_streams;
+use crate::{
+    Capture, NegotiatedState, PacketStream, Plaintext, ReplayError, gateway, gateway_rpch, recover_negotiated_state,
+};
 
 const MAX_DESKTOP_DIM: u16 = 8192;
 const MAX_EGFX_OUTPUT_DIM: u16 = 32_766;
@@ -557,12 +560,44 @@ pub fn replay_capture(capture: &Capture) -> Result<ReplayReport, ReplayError> {
 }
 
 pub(crate) fn prepare_replay_capture(capture: &Capture) -> Result<(ReplayRouter, Plaintext), ReplayError> {
-    let plaintext = decrypt_tls(capture)?;
+    let mut decrypted = Vec::new();
+    let mut decrypt_error = None;
+    for flow in core::iter::once(&capture.flow).chain(capture.gateway_alternates.iter()) {
+        match decrypt_tls_streams(&flow.client_stream, &flow.server_stream, capture.tls_key_log.as_str()) {
+            Ok(plaintext) => decrypted.push(plaintext),
+            Err(error) => {
+                if decrypt_error.is_none() {
+                    decrypt_error = Some(error);
+                }
+            }
+        }
+    }
+    let plaintext = if let Some(outer) = decrypted.iter().find(|plaintext| gateway::is_gateway_tunnel(plaintext)) {
+        let tunneled = gateway::extract_tunneled_rdp(outer)?;
+        decrypt_tunneled_rdp(&tunneled, capture)?
+    } else if let Some(tunneled) = gateway_rpch::extract_rpch_from_flows(&decrypted)? {
+        decrypt_tunneled_rdp(&tunneled, capture)?
+    } else {
+        match decrypted.into_iter().next() {
+            Some(plaintext) => plaintext,
+            None => return Err(decrypt_error.unwrap_or(ReplayError::MissingRdpState)),
+        }
+    };
     let router = ReplayRouter::new(CapturedActivation {
         state: recover_negotiated_state(&plaintext)?,
         compression_type: captured_compression_type(&plaintext),
     })?;
     Ok((router, plaintext))
+}
+
+fn decrypt_tunneled_rdp(tunneled: &Plaintext, capture: &Capture) -> Result<Plaintext, ReplayError> {
+    decrypt_tls_streams(&tunneled.client, &tunneled.server, capture.tls_key_log.as_str()).map_err(|error| {
+        if matches!(error, ReplayError::MissingTlsSecret) {
+            ReplayError::MissingTunneledTlsSecret
+        } else {
+            error
+        }
+    })
 }
 
 fn captured_compression_type(plaintext: &Plaintext) -> Option<CompressionType> {
@@ -796,10 +831,7 @@ impl DvcProcessor for OpaqueDynamicChannel {
 impl DvcClientProcessor for OpaqueDynamicChannel {}
 
 struct ReplayGraphicsOutput {
-    width: AtomicU32,
-    height: AtomicU32,
-    reset_generation: AtomicUsize,
-    unsupported_avc420: AtomicBool,
+    unsupported: AtomicBool,
 }
 
 struct ReplayGraphicsHandler {
@@ -809,10 +841,8 @@ struct ReplayGraphicsHandler {
 impl GraphicsPipelineHandler for ReplayGraphicsHandler {
     fn on_capabilities_confirmed(&mut self, _caps: &CapabilitySet) {}
 
-    fn on_reset_graphics(&mut self, width: u32, height: u32) {
-        self.output.width.store(width, Ordering::SeqCst);
-        self.output.height.store(height, Ordering::SeqCst);
-        self.output.reset_generation.fetch_add(1, Ordering::SeqCst);
+    fn on_reset_graphics_rejected(&mut self, _width: u32, _height: u32) {
+        self.output.unsupported.store(true, Ordering::SeqCst);
     }
 
     fn on_surface_created(&mut self, _surface: &Surface) {}
@@ -833,16 +863,12 @@ impl GraphicsPipelineHandler for ReplayGraphicsHandler {
 struct ReplayEgfxChannel {
     client: GraphicsPipelineClient,
     output: Arc<ReplayGraphicsOutput>,
-    observed_reset_generation: usize,
 }
 
 impl ReplayEgfxChannel {
     fn new() -> Self {
         let output = Arc::new(ReplayGraphicsOutput {
-            width: AtomicU32::new(0),
-            height: AtomicU32::new(0),
-            reset_generation: AtomicUsize::new(0),
-            unsupported_avc420: AtomicBool::new(false),
+            unsupported: AtomicBool::new(false),
         });
         let handler = ReplayGraphicsHandler {
             output: Arc::clone(&output),
@@ -855,24 +881,19 @@ impl ReplayEgfxChannel {
                 })),
             ),
             output,
-            observed_reset_generation: 0,
         }
     }
 
     fn drain_output(&mut self) -> (Option<(u32, u32)>, Vec<OutputUpdate>) {
-        let reset_generation = self.output.reset_generation.load(Ordering::SeqCst);
-        let reset = (reset_generation != self.observed_reset_generation).then(|| {
-            self.observed_reset_generation = reset_generation;
-            (
-                self.output.width.load(Ordering::SeqCst),
-                self.output.height.load(Ordering::SeqCst),
-            )
-        });
+        let reset = self
+            .client
+            .take_output_reset()
+            .map(|(width, height)| (u32::from(width), u32::from(height)));
         (reset, self.client.drain_output())
     }
 
     fn take_unsupported_codec(&mut self) -> bool {
-        self.output.unsupported_avc420.swap(false, Ordering::SeqCst)
+        self.output.unsupported.swap(false, Ordering::SeqCst)
     }
 }
 
@@ -882,7 +903,7 @@ struct UnsupportedH264Decoder {
 
 impl H264Decoder for UnsupportedH264Decoder {
     fn decode(&mut self, _data: &[u8]) -> DecoderResult<DecodedFrame> {
-        self.unsupported.unsupported_avc420.store(true, Ordering::SeqCst);
+        self.unsupported.unsupported.store(true, Ordering::SeqCst);
         Err(DecoderError::msg("AVC420 replay is unsupported"))
     }
 }
@@ -1383,6 +1404,32 @@ mod tests {
     #[test]
     fn passive_egfx_channel_does_not_start_negotiation() {
         assert!(ReplayEgfxChannel::new().start(43).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejected_egfx_reset_clears_pending_replay_extent() {
+        let mut channel = ReplayEgfxChannel::new();
+        let accepted = wrap_uncompressed(
+            &encode_vec(&GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                width: 3,
+                height: 1,
+                monitors: Vec::new(),
+            }))
+            .unwrap(),
+        );
+        channel.process(43, &accepted).unwrap();
+
+        let rejected = wrap_uncompressed(
+            &encode_vec(&GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                width: u32::from(MAX_EGFX_OUTPUT_DIM),
+                height: u32::from(MAX_EGFX_OUTPUT_DIM),
+                monitors: Vec::new(),
+            }))
+            .unwrap(),
+        );
+        assert!(channel.process(43, &rejected).is_err());
+
+        assert!(channel.drain_output().0.is_none());
     }
 
     #[test]
