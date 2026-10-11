@@ -61,6 +61,13 @@ export function advertiseAvc(enable: boolean): Extension {
     return new Extension('advertise_avc', enable);
 }
 
+// Acknowledge every eGFX frame only when JS reports it on screen (`onAvcAck`), not at EndFrame.
+// For a session presented on another machine (see `gfxSegmentCallback` / `GfxReplica`), so the host
+// is paced to the machine that draws the picture. Off by default.
+export function remoteFrameAcks(enable: boolean): Extension {
+    return new Extension('remote_frame_acks', enable);
+}
+
 export function kdcProxyUrl(url: string): Extension {
     return new Extension('kdc_proxy_url', url);
 }
@@ -133,6 +140,16 @@ export function legacyGraphics(enable: boolean): Extension {
 // --- AVC (H.264) WebCodecs decode (RDP-specific) ---
 
 export { AvcDecoder } from './AvcDecoder';
+export type { PresentSink } from './AvcDecoder';
+export {
+    surfacePresentCallback,
+    surfaceLayoutCallback,
+    surfaceCopyCallback,
+    surfaceCacheCallback,
+    gfxSegmentCallback,
+} from './extensions';
+/** Renders a graphics stream tapped from a session on another machine (see `gfxSegmentCallback`). */
+export { GfxReplica } from '../../../crates/ironrdp-web/pkg/ironrdp_web';
 
 // --- File transfer (RDP-specific) ---
 

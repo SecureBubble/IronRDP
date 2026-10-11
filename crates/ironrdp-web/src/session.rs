@@ -139,6 +139,11 @@ struct SessionBuilderInner {
     /// WebGL GPU copy callback (extension `surface_copy_callback`). Executes eGFX
     /// SurfaceToSurface copies inside the GPU surface texture.
     surface_copy_callback: Option<js_sys::Function>,
+    /// Graphics stream tap (extension `gfx_segment_callback`): receives every eGFX segment exactly
+    /// as the host sent it (ZGFX- and codec-compressed), in order, for a renderer on another machine
+    /// ([`crate::gfx_replica::GfxReplica`]). An EMPTY array means the graphics channel was
+    /// (re)created and the replica must start over. Passive: local processing is unchanged.
+    gfx_segment_callback: Option<js_sys::Function>,
     /// WebGL GPU tile-cache callback (extension `surface_cache_callback`). Executes eGFX
     /// `SURFACE_TO_CACHE` / `CACHE_TO_SURFACE` on the GPU, for the same reason as
     /// `surface_copy_callback`: cached pixels may be AVC video that never reaches WASM.
@@ -179,6 +184,10 @@ struct SessionBuilderInner {
     // server falls back to ClearCodec / RFX-Progressive). Defaults to true to
     // preserve behavior for callers that don't set it.
     advertise_avc: bool,
+    /// Extension `remote_frame_acks`: every eGFX frame is acknowledged only when JS says it is on
+    /// screen (via `on_avc_ack`), not at EndFrame. For a session presented on another machine,
+    /// whose presenter reports back (see `gfx_segment_callback`). Off by default.
+    remote_frame_acks: bool,
     enable_server_pointer: bool,
     legacy_graphics: bool,
     outbound_message_size_limit: Option<usize>,
@@ -224,6 +233,7 @@ impl Default for SessionBuilderInner {
             surface_layout_callback: None,
             rail_windows_callback: None,
             surface_copy_callback: None,
+            gfx_segment_callback: None,
             surface_cache_callback: None,
             rail_window_callback: None,
             canvas_resized_callback: None,
@@ -240,6 +250,7 @@ impl Default for SessionBuilderInner {
             use_display_control: false,
             enable_credssp: true,
             advertise_avc: true,
+            remote_frame_acks: false,
             enable_server_pointer: true,
             legacy_graphics: false,
             outbound_message_size_limit: None,
@@ -368,6 +379,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |advertise_avc: bool| { self.0.borrow_mut().advertise_avc = advertise_avc };
+            |remote_frame_acks: bool| { self.0.borrow_mut().remote_frame_acks = remote_frame_acks };
             // Multi-monitor layout (Phase 0). Accepts a JSON array of
             // `{ left, top, width, height, primary? }` in virtual-desktop pixel
             // coordinates; the primary should be at (0,0). When set, the client
@@ -504,6 +516,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |surface_copy_callback: JsValue| {
                 self.0.borrow_mut().surface_copy_callback = surface_copy_callback.dyn_into::<js_sys::Function>().ok();
             };
+            // Graphics stream tap for a remote renderer (see the field docs).
+            |gfx_segment_callback: JsValue| {
+                self.0.borrow_mut().gfx_segment_callback = gfx_segment_callback.dyn_into::<js_sys::Function>().ok();
+            };
             |rail_window_callback: JsValue| {
                 self.0.borrow_mut().rail_window_callback = rail_window_callback.dyn_into::<js_sys::Function>().ok();
             };
@@ -543,6 +559,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             surface_layout_callback,
             rail_windows_callback,
             surface_copy_callback,
+            gfx_segment_callback,
             surface_cache_callback,
             rail_window_callback,
             canvas_resized_callback,
@@ -597,6 +614,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             surface_layout_callback = inner.surface_layout_callback.clone();
             rail_windows_callback = inner.rail_windows_callback.clone();
             surface_copy_callback = inner.surface_copy_callback.clone();
+            gfx_segment_callback = inner.gfx_segment_callback.clone();
             surface_cache_callback = inner.surface_cache_callback.clone();
             rail_window_callback = inner.rail_window_callback.clone();
             canvas_resized_callback = inner.canvas_resized_callback.clone();
@@ -774,6 +792,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let use_display_control = self.0.borrow().use_display_control;
         let advertise_avc = self.0.borrow().advertise_avc;
+        let remote_frame_acks = self.0.borrow().remote_frame_acks;
 
         // EGFX (MS-RDPEGFX) graphics pipeline is ENABLED (see `build_config`
         // support_graphics_pipeline = true). Attaching the handler makes the client
@@ -802,6 +821,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             let webgl_present = surface_present_callback.is_some();
             let origin = rail_desktop_origin;
             let advertise = advertise_avc;
+            let tap = gfx_segment_callback.is_some();
             Some(Box::new(move || {
                 let handler = WasmGraphicsHandler::new(
                     WasmGraphicsMessageProxy::new(input_tx.clone()),
@@ -809,7 +829,20 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     webgl_present,
                     origin,
                 );
-                GraphicsPipelineClient::new(Box::new(handler), None).advertise_avc(advertise)
+                let client = GraphicsPipelineClient::new(Box::new(handler), None)
+                    .advertise_avc(advertise)
+                    .remote_acks(remote_frame_acks);
+                if !tap {
+                    return client;
+                }
+                // A fresh client means a fresh channel: the remote replica must drop its surfaces
+                // and caches too. The tap itself cannot reach JS (the client is `Send`), so the
+                // segments go through the run loop like every other graphics event.
+                let _ = input_tx.unbounded_send(RdpInputEvent::GfxSegment(Vec::new()));
+                let tap_tx = input_tx.clone();
+                client.with_segment_tap(move |bytes| {
+                    let _ = tap_tx.unbounded_send(RdpInputEvent::GfxSegment(bytes.to_vec()));
+                })
             }))
         };
 
@@ -857,6 +890,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             surface_layout_callback,
             rail_windows_callback,
             surface_copy_callback,
+            gfx_segment_callback,
             surface_cache_callback,
             rail_window_callback,
             canvas_resized_callback,
@@ -889,6 +923,8 @@ pub(crate) enum RdpInputEvent {
     /// the `!Send` canvas) so the run loop can draw it. Also the return path for
     /// out-of-band AVC decode: JS hands back RGBA as one of these.
     Graphics(GraphicsRegion),
+    /// A raw eGFX segment for the `gfx_segment_callback` tap (empty = channel recreated).
+    GfxSegment(Vec<u8>),
     /// A raw AVC (H.264) main sub-stream that must be decoded out-of-band by the
     /// browser (WebCodecs `VideoDecoder`). The graphics handler is `Send` and has no
     /// JS access, so it forwards the compressed frame here; the run loop hands it to
@@ -1099,6 +1135,8 @@ pub(crate) struct Session {
     rail_windows_callback: Option<js_sys::Function>,
     /// WebGL GPU copy callback; executes eGFX SurfaceToSurface inside the GPU surface texture.
     surface_copy_callback: Option<js_sys::Function>,
+    /// Graphics stream tap for a remote renderer; see the builder field.
+    gfx_segment_callback: Option<js_sys::Function>,
     surface_cache_callback: Option<js_sys::Function>,
     /// RAIL active-window rect notification; `None` if the webapp registered none.
     rail_window_callback: Option<js_sys::Function>,
@@ -1204,16 +1242,7 @@ impl Session {
         let Some(cb) = &self.surface_present_callback else {
             return false;
         };
-        let args = js_sys::Array::from_iter([
-            JsValue::from_f64(f64::from(x)),
-            JsValue::from_f64(f64::from(y)),
-            JsValue::from_f64(f64::from(width)),
-            JsValue::from_f64(f64::from(height)),
-            js_sys::Uint8Array::from(data).into(),
-        ]);
-        if let Err(err) = cb.apply(&JsValue::NULL, &args) {
-            warn!(?err, "surface_present callback threw");
-        }
+        crate::present::surface_region(cb, x, y, width, height, data);
         true
     }
 
@@ -1266,96 +1295,30 @@ impl Session {
     }
 
     fn notify_surface_layout(&self, mode: u8, surface_w: u32, surface_h: u32, rects: &[(u32, i32, i32, u32, u32)]) {
-        let Some(cb) = &self.surface_layout_callback else {
-            return;
-        };
-        // FIVE ints per window now: id, x, y, w, h. The id is what lets the client address a
-        // resize back to the right window (`WindowMove` is keyed by window id).
-        let flat = js_sys::Int32Array::new_with_length(u32::try_from(rects.len() * 5).unwrap_or(0));
-        for (i, &(id, x, y, w, h)) in rects.iter().enumerate() {
-            let base = u32::try_from(i * 5).unwrap_or(0);
-            flat.set_index(base, i32::try_from(id).unwrap_or(0));
-            flat.set_index(base + 1, x);
-            flat.set_index(base + 2, y);
-            flat.set_index(base + 3, i32::try_from(w).unwrap_or(0));
-            flat.set_index(base + 4, i32::try_from(h).unwrap_or(0));
-        }
-        let args = js_sys::Array::from_iter([
-            JsValue::from_f64(f64::from(mode)),
-            JsValue::from_f64(f64::from(surface_w)),
-            JsValue::from_f64(f64::from(surface_h)),
-            flat.into(),
-        ]);
-        if let Err(err) = cb.apply(&JsValue::NULL, &args) {
-            warn!(?err, "surface_layout callback threw");
+        if let Some(cb) = &self.surface_layout_callback {
+            crate::present::surface_layout(cb, mode, surface_w, surface_h, rects);
         }
     }
 
     /// Execute an eGFX SurfaceToSurface copy on the GPU (WebGL path): copy the `w`x`h` block at
     /// (`src_x`,`src_y`) of the surface texture to each destination point. Best-effort.
     fn notify_surface_copy(&self, src_x: u32, src_y: u32, width: u32, height: u32, points: &[(u32, u32)]) {
-        let Some(cb) = &self.surface_copy_callback else {
-            return;
-        };
-        let flat = js_sys::Int32Array::new_with_length(u32::try_from(points.len() * 2).unwrap_or(0));
-        for (i, &(x, y)) in points.iter().enumerate() {
-            let base = u32::try_from(i * 2).unwrap_or(0);
-            flat.set_index(base, i32::try_from(x).unwrap_or(0));
-            flat.set_index(base + 1, i32::try_from(y).unwrap_or(0));
-        }
-        let args = js_sys::Array::from_iter([
-            JsValue::from_f64(f64::from(src_x)),
-            JsValue::from_f64(f64::from(src_y)),
-            JsValue::from_f64(f64::from(width)),
-            JsValue::from_f64(f64::from(height)),
-            flat.into(),
-        ]);
-        if let Err(err) = cb.apply(&JsValue::NULL, &args) {
-            warn!(?err, "surface_copy callback threw");
+        if let Some(cb) = &self.surface_copy_callback {
+            crate::present::surface_copy(cb, src_x, src_y, width, height, points);
         }
     }
 
     /// eGFX `SURFACE_TO_CACHE` on the WebGL path — snapshot a surface rect into a GPU cache slot.
     fn notify_surface_cache_store(&self, cache_slot: u16, src_x: u32, src_y: u32, width: u32, height: u32) {
-        let Some(cb) = &self.surface_cache_callback else {
-            return;
-        };
-        // `points` empty == STORE; a non-empty list == RESTORE. One callback carries both so the
-        // extension surface stays small and the two can never disagree about slot semantics.
-        let args = js_sys::Array::from_iter([
-            JsValue::from_f64(f64::from(cache_slot)),
-            JsValue::from_f64(f64::from(src_x)),
-            JsValue::from_f64(f64::from(src_y)),
-            JsValue::from_f64(f64::from(width)),
-            JsValue::from_f64(f64::from(height)),
-            js_sys::Int32Array::new_with_length(0).into(),
-        ]);
-        if let Err(err) = cb.apply(&JsValue::NULL, &args) {
-            warn!(?err, "surface_cache callback threw (store)");
+        if let Some(cb) = &self.surface_cache_callback {
+            crate::present::surface_cache_store(cb, cache_slot, src_x, src_y, width, height);
         }
     }
 
     /// eGFX `CACHE_TO_SURFACE` on the WebGL path — blit a GPU cache slot to each destination point.
     fn notify_surface_cache_restore(&self, cache_slot: u16, points: &[(u32, u32)]) {
-        let Some(cb) = &self.surface_cache_callback else {
-            return;
-        };
-        let flat = js_sys::Int32Array::new_with_length(u32::try_from(points.len() * 2).unwrap_or(0));
-        for (i, &(x, y)) in points.iter().enumerate() {
-            let base = u32::try_from(i * 2).unwrap_or(0);
-            flat.set_index(base, i32::try_from(x).unwrap_or(0));
-            flat.set_index(base + 1, i32::try_from(y).unwrap_or(0));
-        }
-        let args = js_sys::Array::from_iter([
-            JsValue::from_f64(f64::from(cache_slot)),
-            JsValue::from_f64(0.0),
-            JsValue::from_f64(0.0),
-            JsValue::from_f64(0.0),
-            JsValue::from_f64(0.0),
-            flat.into(),
-        ]);
-        if let Err(err) = cb.apply(&JsValue::NULL, &args) {
-            warn!(?err, "surface_cache callback threw (restore)");
+        if let Some(cb) = &self.surface_cache_callback {
+            crate::present::surface_cache_restore(cb, cache_slot, points);
         }
     }
 
@@ -1709,6 +1672,15 @@ impl iron_remote_desktop::Session for Session {
                             self.notify_canvas_updated(rx, ry, rw, rh);
                             Vec::new()
                         }
+                        RdpInputEvent::GfxSegment(bytes) => {
+                            if let Some(cb) = &self.gfx_segment_callback {
+                                let data = js_sys::Uint8Array::from(bytes.as_slice());
+                                if let Err(err) = cb.call1(&JsValue::NULL, &data) {
+                                    warn!(?err, "gfx_segment callback threw");
+                                }
+                            }
+                            Vec::new()
+                        }
                         RdpInputEvent::SurfaceCopy { src_x, src_y, width, height, points } => {
                             // GPU screen-to-screen copy (window relocation). No WASM pixels move.
                             self.notify_surface_copy(src_x, src_y, width, height, &points);
@@ -1758,20 +1730,7 @@ impl iron_remote_desktop::Session for Session {
                             // buffer, so its watermark is re-blended by the surface flush/composite
                             // (graphics.rs), not here.
                             if let Some(cb) = &self.avc_watermark_callback {
-                                let rgba = js_sys::Uint8Array::from(wm.rgba.as_slice());
-                                let args = js_sys::Array::from_iter([
-                                    rgba.into(),
-                                    JsValue::from_f64(f64::from(wm.width)),
-                                    JsValue::from_f64(f64::from(wm.height)),
-                                    JsValue::from_f64(f64::from(wm.cell_w)),
-                                    JsValue::from_f64(f64::from(wm.cell_h)),
-                                    JsValue::from_f64(f64::from(wm.off_x)),
-                                    JsValue::from_f64(f64::from(wm.off_y)),
-                                    JsValue::from_f64(f64::from(wm.opacity)),
-                                ]);
-                                if let Err(err) = cb.apply(&JsValue::NULL, &args) {
-                                    warn!(?err, "AVC watermark callback threw");
-                                }
+                                crate::present::watermark(cb, &wm);
                             }
                             let _ = wm;
                             Vec::new()
@@ -1823,23 +1782,7 @@ impl iron_remote_desktop::Session for Session {
                             // `regions` is a flat [x,y,w,h, x,y,w,h, ...] Uint32Array so only the
                             // valid sub-rects are blitted (never the green YUV(0,0,0) padding).
                             if let Some(cb) = &self.avc_decode_callback {
-                                let data = js_sys::Uint8Array::from(frame.main_stream.as_slice());
-                                let mut flat: Vec<u32> = Vec::with_capacity(frame.regions.len() * 4);
-                                for (x, y, w, h) in &frame.regions {
-                                    flat.extend_from_slice(&[*x, *y, *w, *h]);
-                                }
-                                let regions = js_sys::Uint32Array::from(flat.as_slice());
-                                let args = js_sys::Array::from_iter([
-                                    JsValue::from_f64(f64::from(frame.surface_id)),
-                                    JsValue::from_f64(f64::from(frame.frame_id)),
-                                    JsValue::from_f64(f64::from(frame.origin_x)),
-                                    JsValue::from_f64(f64::from(frame.origin_y)),
-                                    regions.into(),
-                                    data.into(),
-                                ]);
-                                if let Err(err) = cb.apply(&JsValue::NULL, &args) {
-                                    warn!(?err, "AVC decode callback threw");
-                                }
+                                crate::present::avc_frame(cb, &frame);
                             } else {
                                 trace!(
                                     bytes = frame.main_stream.len(),

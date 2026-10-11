@@ -163,6 +163,8 @@ const GOP_REPLAY_MAX_CHUNKS = 1024;
 
 export class AvcDecoder {
     private session: SessionLike | null = null;
+    /** Set by `presentSink(onDecoded)`: who to tell a frame decoded when the session is elsewhere. */
+    private decodedHook: ((frameId: number) => void) | null = null;
     private readonly useWebGl = webGlPresentEnabled();
     /** Worker path (default). Null in the WebGL path, where decode runs on the main thread. */
     private readonly worker: Worker | null;
@@ -573,7 +575,8 @@ export class AvcDecoder {
         // already have been acked (see fallBackToSoftware).
         if (!meta.chunk.ackSent) {
             meta.chunk.ackSent = true;
-            this.session?.invokeExtension(onAvcAck({ frameId: meta.frameId }));
+            if (this.decodedHook) this.decodedHook(meta.frameId);
+            else this.session?.invokeExtension(onAvcAck({ frameId: meta.frameId }));
         }
 
         // GPU present: hand the VideoFrame to the unified surface renderer (drop-to-latest; it
@@ -634,4 +637,70 @@ export class AvcDecoder {
                 break;
         }
     }
+
+    // ============================================================================================
+    // Present-only mode: draw from render ops that arrived out of band.
+    // ============================================================================================
+
+    /**
+     * The render half of this decoder, driven by someone other than the local run loop.
+     *
+     * The ops below are exactly what `getBuilderExtensions()` receives from the engine, so a
+     * session whose protocol engine runs elsewhere -- another process, a container, another
+     * machine -- can be presented here by forwarding those calls verbatim. No decode happens at
+     * the engine side and none happens twice: the host's own H.264 reaches this GPU untouched.
+     *
+     * Acknowledgements are NOT sent from here: whoever owns the session owns the ack loop, since
+     * only it can talk to the host, and `setSession` is left unset in this mode. Pass `onDecoded`
+     * to learn when each AVC frame has decoded, so the owner can acknowledge it then -- that keeps
+     * the host paced to this machine's decoder, as it is for a local session.
+     */
+    presentSink(onDecoded?: (frameId: number) => void): PresentSink {
+        this.decodedHook = onDecoded ?? null;
+        return {
+            avcFrame: (surfaceId, frameId, originX, originY, regions, data) => {
+                this.origins.set(surfaceId, { x: originX, y: originY });
+                this.decodeMain(surfaceId, frameId, originX, originY, regions, data);
+            },
+            surfacePresent: (x, y, w, h, rgba) => this.renderer?.uploadChromeRegion(x, y, w, h, rgba),
+            surfaceLayout: (mode, surfaceW, surfaceH, rects) => this.renderer?.setLayout(mode, surfaceW, surfaceH, rects),
+            surfaceCopy: (srcX, srcY, w, h, points) => this.renderer?.copyRegion(srcX, srcY, w, h, points),
+            surfaceCache: (slot, srcX, srcY, w, h, points) => this.queueCacheOp(slot, srcX, srcY, w, h, points),
+            watermark: (rgba, width, height, cellW, cellH, offX, offY, opacity) => {
+                this.renderer?.setWatermark(rgba, width, height, cellW, cellH, offX, offY, opacity);
+                this.pendingWatermark = this.renderer
+                    ? null
+                    : ([rgba, width, height, cellW, cellH, offX, offY, opacity] as const);
+            },
+        };
+    }
+}
+
+/**
+ * The render ops of one session, in the order the engine produced them. Mirrors the callbacks
+ * `AvcDecoder.getBuilderExtensions()` registers; see {@link AvcDecoder.presentSink}.
+ */
+export interface PresentSink {
+    avcFrame(
+        surfaceId: number,
+        frameId: number,
+        originX: number,
+        originY: number,
+        regions: Uint32Array,
+        data: Uint8Array,
+    ): void;
+    surfacePresent(x: number, y: number, w: number, h: number, rgba: Uint8Array): void;
+    surfaceLayout(mode: number, surfaceW: number, surfaceH: number, rects: Int32Array): void;
+    surfaceCopy(srcX: number, srcY: number, w: number, h: number, points: Int32Array): void;
+    surfaceCache(slot: number, srcX: number, srcY: number, w: number, h: number, points: Int32Array): void;
+    watermark(
+        rgba: Uint8Array,
+        width: number,
+        height: number,
+        cellW: number,
+        cellH: number,
+        offX: number,
+        offY: number,
+        opacity: number,
+    ): void;
 }

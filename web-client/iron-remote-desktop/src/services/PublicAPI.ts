@@ -10,10 +10,13 @@ import type { Extension } from '../interfaces/Extension';
 import type { ClipboardService } from './clipboard.service';
 import type { FileTransferProvider } from '../interfaces/FileTransferProvider';
 import type { AvcDecoderProvider } from '../interfaces/AvcDecoderProvider';
+import type { ClipboardBridge } from '../interfaces/UserInteraction';
+import type { ClipboardData } from '../interfaces/ClipboardData';
 
 export class PublicAPI {
     private remoteDesktopService: RemoteDesktopService;
     private clipboardService: ClipboardService;
+    private clipboardBridged = false;
 
     constructor(remoteDesktopService: RemoteDesktopService, clipboardService: ClipboardService) {
         this.remoteDesktopService = remoteDesktopService;
@@ -94,6 +97,21 @@ export class PublicAPI {
         return await this.clipboardService.sendClipboardData();
     }
 
+    private bridgeClipboard(bridge: ClipboardBridge): (data: ClipboardData | null) => Promise<void> {
+        // This page's own clipboard is not the user's: stop reading it, and route the session's
+        // clipboard to the caller instead. Must be called before connect(), after `ready`
+        // (initClipboard has registered the page-clipboard callbacks by then, and these replace them).
+        this.clipboardBridged = true;
+        this.clipboardService.suppressMonitoring();
+        this.remoteDesktopService.setEnableClipboard(true);
+        this.remoteDesktopService.setOnRemoteClipboardChanged(bridge.remoteChanged);
+        this.remoteDesktopService.setOnForceClipboardUpdate(bridge.forceUpdate);
+        return (data) =>
+            data && !data.isEmpty()
+                ? this.remoteDesktopService.onClipboardChanged(data)
+                : this.remoteDesktopService.onClipboardChangedEmpty();
+    }
+
     private invokeExtension(ext: Extension) {
         this.remoteDesktopService.invokeExtension(ext);
     }
@@ -108,7 +126,8 @@ export class PublicAPI {
             this.clipboardService.suppressMonitoring();
         };
         provider.onUploadFinished = () => {
-            this.clipboardService.resumeMonitoring();
+            // A bridged clipboard (see bridgeClipboard) keeps this page's monitor off for good.
+            if (!this.clipboardBridged) this.clipboardService.resumeMonitoring();
             origFinish?.();
         };
         return this.remoteDesktopService.enableFileTransfer(provider);
@@ -138,6 +157,7 @@ export class PublicAPI {
             setEnableAutoClipboard: this.setEnableAutoClipboard.bind(this),
             saveRemoteClipboardData: this.saveRemoteClipboardData.bind(this),
             sendClipboardData: this.sendClipboardData.bind(this),
+            bridgeClipboard: this.bridgeClipboard.bind(this),
             invokeExtension: this.invokeExtension.bind(this),
             enableFileTransfer: this.enableFileTransfer.bind(this),
             enableAvcDecoder: this.enableAvcDecoder.bind(this),

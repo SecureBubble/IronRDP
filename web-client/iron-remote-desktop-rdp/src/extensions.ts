@@ -319,6 +319,14 @@ export function surfaceCopyCallback(
     return new Extension('surface_copy_callback', cb as unknown);
 }
 
+/** Graphics stream tap for a renderer on another machine: called with every eGFX segment exactly
+ *  as the host sent it (ZGFX- and codec-compressed), in channel order, to feed a `GfxReplica` there. An EMPTY array
+ *  means the graphics channel was (re)created and the replica must be rebuilt. Passive: the local
+ *  session processes the stream exactly as without it. */
+export function gfxSegmentCallback(cb: (segment: Uint8Array) => void): Extension {
+    return new Extension('gfx_segment_callback', cb as unknown);
+}
+
 /** WebGL GPU tile cache (`?ironwebgl=1`). eGFX `SURFACE_TO_CACHE` / `CACHE_TO_SURFACE`.
  *  `points` empty means STORE the `width`x`height` block at (`srcX`,`srcY`) into `slot`; non-empty
  *  means RESTORE `slot` to each point (flattened `[x, y, ...]`), all in surface coords.

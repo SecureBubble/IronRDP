@@ -445,6 +445,9 @@ enum ClientState {
 // Graphics Pipeline Client
 // ============================================================================
 
+/// See [`GraphicsPipelineClient::with_segment_tap`].
+type SegmentTap = Box<dyn FnMut(&[u8]) + Send>;
+
 /// Client for the Graphics Pipeline Virtual Channel (EGFX)
 ///
 /// This client handles capability negotiation, surface tracking,
@@ -470,6 +473,14 @@ pub struct GraphicsPipelineClient {
 
     decompressor: zgfx::Decompressor,
     decompressed_buffer: Vec<u8>,
+    /// Observer of every graphics segment exactly as received, before anything is done to it.
+    /// Lets a session whose presentation happens elsewhere ship the host's stream onward as the
+    /// host sent it (see [`Self::with_segment_tap`]).
+    segment_tap: Option<SegmentTap>,
+    /// Every frame's acknowledgement waits for [`Self::build_frame_ack`], not only AVC frames'.
+    /// For a session presented on another machine: the host must be paced to the machine that
+    /// shows the picture, and only it knows when a frame is on screen (see [`Self::remote_acks`]).
+    remote_acks: bool,
 
     state: ClientState,
     negotiated_caps: Option<CapabilitySet>,
@@ -555,6 +566,8 @@ impl GraphicsPipelineClient {
             avc_available: false,
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
+            segment_tap: None,
+            remote_acks: false,
             state: ClientState::WaitingForConfirm,
             negotiated_caps: None,
             codec_caps: CodecCapabilities::default(),
@@ -576,6 +589,69 @@ impl GraphicsPipelineClient {
     pub fn advertise_avc(mut self, enable: bool) -> Self {
         self.avc_available = enable;
         self
+    }
+
+    /// Observe every graphics segment exactly as the host sent it: still ZGFX bulk-compressed,
+    /// with the codec payloads inside (ClearCodec, RFX Progressive, Planar, H.264) compressed too.
+    /// The cheapest form of the stream to ship to a renderer on another machine, which feeds the
+    /// segments, IN ORDER and from the channel's first one (ZGFX keeps history across them), to
+    /// [`Self::process_segment`]. Processing here is unaffected.
+    #[must_use]
+    pub fn with_segment_tap(mut self, tap: impl FnMut(&[u8]) + Send + 'static) -> Self {
+        self.segment_tap = Some(Box::new(tap));
+        self
+    }
+
+    /// Hold EVERY frame's `FrameAcknowledge` until [`Self::build_frame_ack`] is called for it, as
+    /// is always done for AVC frames. Use when the frames are rendered elsewhere (see
+    /// [`Self::with_segment_tap`]): acking at EndFrame here would tell the host the picture is up
+    /// while it is still on its way to the machine that draws it, so a slow link would build a
+    /// backlog instead of slowing the host down.
+    #[must_use]
+    pub fn remote_acks(mut self, enable: bool) -> Self {
+        self.remote_acks = enable;
+        self
+    }
+
+    /// Decompress and handle one segment a [`Self::with_segment_tap`] observer received. For a
+    /// replica of this pipeline that renders a stream it does not own: any response (frame
+    /// acknowledgements) is dropped, because only the client holding the channel may send them.
+    /// Returns what [`Self::process_decompressed`] does, plus the segment's decompressed size.
+    pub fn process_segment(&mut self, payload: &[u8]) -> PduResult<(Vec<u32>, usize)> {
+        let mut buffer = core::mem::take(&mut self.decompressed_buffer);
+        buffer.clear();
+        let decompressed = self.decompressor.decompress(payload, &mut buffer).map_err(|e| decode_err!(e));
+        let result = decompressed.and_then(|_| self.process_decompressed(&buffer).map(|done| (done, buffer.len())));
+        buffer.shrink_to(MAX_DECOMPRESSED_BUFFER_CAPACITY);
+        self.decompressed_buffer = buffer;
+        result
+    }
+
+    /// Decode and handle already-decompressed graphics PDUs. Responses are dropped, as for
+    /// [`Self::process_segment`].
+    ///
+    /// Returns the frames this call COMPLETED that carried no AVC: they are fully drawn once this
+    /// returns, so a replica can report them as presented right away. AVC frames are presented
+    /// only when the out-of-band decoder produces them.
+    pub fn process_decompressed(&mut self, data: &[u8]) -> PduResult<Vec<u32>> {
+        let mut completed = Vec::new();
+        let mut cursor = ReadCursor::new(data);
+        while !cursor.is_empty() {
+            let pdu = match decode_cursor::<GfxPdu>(&mut cursor) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error = %e, "EGFX PDU decode failed; processing prior PDUs in segment");
+                    break;
+                }
+            };
+            let finished = match &pdu {
+                GfxPdu::EndFrame(end) if !self.current_frame_has_avc => Some(end.frame_id),
+                _ => None,
+            };
+            let _ = self.handle_pdu(pdu)?;
+            completed.extend(finished);
+        }
+        Ok(completed)
     }
 
     // ========================================================================
@@ -672,18 +748,7 @@ impl GraphicsPipelineClient {
     /// Used by the `reconstruct` example to replay a flat capture and diff against a golden.
     #[doc(hidden)]
     pub fn process_pdu_bytes_for_test(&mut self, data: &[u8]) -> PduResult<()> {
-        let mut cursor = ReadCursor::new(data);
-        while !cursor.is_empty() {
-            let pdu = match decode_cursor::<GfxPdu>(&mut cursor) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(error = %e, "process_pdu_bytes_for_test: decode stopped");
-                    break;
-                }
-            };
-            let _ = self.handle_pdu(pdu)?;
-        }
-        Ok(())
+        self.process_decompressed(data).map(|_| ())
     }
 
     fn handle_pdu(&mut self, pdu: GfxPdu) -> PduResult<Vec<DvcMessage>> {
@@ -1365,7 +1430,8 @@ impl GraphicsPipelineClient {
         // front. That keeps `frameId` / `totalFramesDecoded` monotonic on the wire even
         // when two surfaces feed two out-of-order VideoDecoders (multi-monitor), the
         // condition that otherwise trips the server's "graphics subsystem error state".
-        let ready = !self.current_frame_has_avc;
+        // A remotely presented session holds every frame for its presenter (see `remote_acks`).
+        let ready = !self.current_frame_has_avc && !self.remote_acks;
         self.pending_acks.insert(
             frame_id,
             PendingAck {
@@ -1567,6 +1633,10 @@ impl DvcProcessor for GraphicsPipelineClient {
     }
 
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        if let Some(tap) = &mut self.segment_tap {
+            tap(payload);
+        }
+
         // ZGFX decompress
         self.decompressed_buffer.clear();
         self.decompressed_buffer.shrink_to(MAX_DECOMPRESSED_BUFFER_CAPACITY);

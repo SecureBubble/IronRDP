@@ -6,6 +6,7 @@ import type { Extension } from './Extension';
 import type { Callback } from '../lib/Observable';
 import type { FileTransferProvider } from './FileTransferProvider';
 import type { AvcDecoderProvider } from './AvcDecoderProvider';
+import type { ClipboardData } from './ClipboardData';
 
 export interface UserInteraction {
     setVisibility(state: boolean): void;
@@ -57,4 +58,19 @@ export interface UserInteraction {
     enableFileTransfer(provider: FileTransferProvider): FileTransferProvider;
 
     enableAvcDecoder(provider: AvcDecoderProvider): AvcDecoderProvider;
+
+    /**
+     * Route the session's clipboard to the caller instead of this page's clipboard -- for a page
+     * that runs the session on behalf of a user elsewhere (the user's clipboard is not this page's).
+     * Call after `ready` and before connect(). Returns a function that pushes the user's clipboard
+     * content into the session (`null` or empty data clears it).
+     */
+    bridgeClipboard(bridge: ClipboardBridge): (data: ClipboardData | null) => Promise<void>;
+}
+
+export interface ClipboardBridge {
+    /** The remote clipboard changed; `data` is its full content. */
+    remoteChanged(data: ClipboardData): void;
+    /** The host asked for the current local clipboard (start of session): push it, or push empty. */
+    forceUpdate(): void;
 }
