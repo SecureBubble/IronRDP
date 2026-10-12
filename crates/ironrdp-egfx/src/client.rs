@@ -481,6 +481,12 @@ pub struct GraphicsPipelineClient {
     /// For a session presented on another machine: the host must be paced to the machine that
     /// shows the picture, and only it knows when a frame is on screen (see [`Self::remote_acks`]).
     remote_acks: bool,
+    /// Turn RDP-only codec payloads (ClearCodec, Planar, RFX Progressive, uncompressed, alpha)
+    /// into pixels. On by default. Off for a session whose picture is decoded elsewhere from the
+    /// tapped stream ([`Self::with_segment_tap`]): every PDU is still parsed and every frame still
+    /// tracked and acknowledged, but nobody would look at the pixels. AVC is unaffected -- it is
+    /// never decoded here in the browser build anyway.
+    decode_pixels: bool,
 
     state: ClientState,
     negotiated_caps: Option<CapabilitySet>,
@@ -568,6 +574,7 @@ impl GraphicsPipelineClient {
             decompressed_buffer: Vec::new(),
             segment_tap: None,
             remote_acks: false,
+            decode_pixels: true,
             state: ClientState::WaitingForConfirm,
             negotiated_caps: None,
             codec_caps: CodecCapabilities::default(),
@@ -610,6 +617,13 @@ impl GraphicsPipelineClient {
     #[must_use]
     pub fn remote_acks(mut self, enable: bool) -> Self {
         self.remote_acks = enable;
+        self
+    }
+
+    /// Decode RDP-only codec payloads into pixels (default `true`). See the field of the same name.
+    #[must_use]
+    pub fn decode_pixels(mut self, enable: bool) -> Self {
+        self.decode_pixels = enable;
         self
     }
 
@@ -787,7 +801,9 @@ impl GraphicsPipelineClient {
             GfxPdu::WireToSurface2(pdu) => {
                 trace!("WireToSurface2 (progressive codec)");
                 self.handler.on_wire_to_surface2(&pdu);
-                self.handle_wire_to_surface2(pdu)?;
+                if self.decode_pixels {
+                    self.handle_wire_to_surface2(pdu)?;
+                }
                 Ok(vec![])
             }
             GfxPdu::EndFrame(end) => self.handle_end_frame(end.frame_id),
@@ -1070,6 +1086,10 @@ impl GraphicsPipelineClient {
             }
             Codec1Type::Avc444 | Codec1Type::Avc444v2 => {
                 self.decode_avc444(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data, pdu.codec_id);
+            }
+            // The picture is decoded elsewhere: parsed, not turned into pixels.
+            _ if !self.decode_pixels => {
+                trace!(codec_id = ?pdu.codec_id, "WireToSurface1 not decoded (decode_pixels off)");
             }
             Codec1Type::ClearCodec => {
                 self.decode_clearcodec(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;

@@ -68,6 +68,14 @@ export function remoteFrameAcks(enable: boolean): Extension {
     return new Extension('remote_frame_acks', enable);
 }
 
+// Decode RDP-only graphics codecs (ClearCodec, Planar, RFX Progressive) into pixels. On by default.
+// Off for a session whose picture is decoded on another machine from the tapped stream
+// (`gfxSegmentCallback` / `GfxReplica`): the stream is still parsed and every frame acknowledged,
+// but no pixels are made that nobody would see.
+export function gfxDecode(enable: boolean): Extension {
+    return new Extension('gfx_decode', enable);
+}
+
 export function kdcProxyUrl(url: string): Extension {
     return new Extension('kdc_proxy_url', url);
 }

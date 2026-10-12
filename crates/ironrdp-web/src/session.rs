@@ -188,6 +188,10 @@ struct SessionBuilderInner {
     /// screen (via `on_avc_ack`), not at EndFrame. For a session presented on another machine,
     /// whose presenter reports back (see `gfx_segment_callback`). Off by default.
     remote_frame_acks: bool,
+    /// Extension `gfx_decode`: turn RDP-only codec payloads into pixels. On by default; off for
+    /// a session whose picture is decoded on another machine from the tapped stream, where the
+    /// pixels would go to nobody (see `gfx_segment_callback`).
+    gfx_decode: bool,
     enable_server_pointer: bool,
     legacy_graphics: bool,
     outbound_message_size_limit: Option<usize>,
@@ -251,6 +255,7 @@ impl Default for SessionBuilderInner {
             enable_credssp: true,
             advertise_avc: true,
             remote_frame_acks: false,
+            gfx_decode: true,
             enable_server_pointer: true,
             legacy_graphics: false,
             outbound_message_size_limit: None,
@@ -380,6 +385,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |advertise_avc: bool| { self.0.borrow_mut().advertise_avc = advertise_avc };
             |remote_frame_acks: bool| { self.0.borrow_mut().remote_frame_acks = remote_frame_acks };
+            |gfx_decode: bool| { self.0.borrow_mut().gfx_decode = gfx_decode };
             // Multi-monitor layout (Phase 0). Accepts a JSON array of
             // `{ left, top, width, height, primary? }` in virtual-desktop pixel
             // coordinates; the primary should be at (0,0). When set, the client
@@ -793,6 +799,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         let use_display_control = self.0.borrow().use_display_control;
         let advertise_avc = self.0.borrow().advertise_avc;
         let remote_frame_acks = self.0.borrow().remote_frame_acks;
+        let gfx_decode = self.0.borrow().gfx_decode;
 
         // EGFX (MS-RDPEGFX) graphics pipeline is ENABLED (see `build_config`
         // support_graphics_pipeline = true). Attaching the handler makes the client
@@ -831,7 +838,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                 );
                 let client = GraphicsPipelineClient::new(Box::new(handler), None)
                     .advertise_avc(advertise)
-                    .remote_acks(remote_frame_acks);
+                    .remote_acks(remote_frame_acks)
+                    .decode_pixels(gfx_decode);
                 if !tap {
                     return client;
                 }
