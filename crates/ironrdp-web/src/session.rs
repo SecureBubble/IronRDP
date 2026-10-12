@@ -28,7 +28,7 @@ use ironrdp::pdu::gcc::{Monitor as GccMonitor, MonitorFlags};
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
-use ironrdp::rdpdr::Rdpdr;
+use ironrdp::rdpdr::{NoopRdpdrBackend, Rdpdr};
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
 use ironrdp::rdperp::client::{RailChannel, RemoteApp};
 use ironrdp::rdperp::orders::{WindowOrder, WindowState};
@@ -3924,6 +3924,12 @@ async fn connect(
                 printer_driver_name,
             ),
         );
+    } else if dvc_sound_backend.is_some() {
+        // The reverse dependency also holds: Windows redirects sound (on either transport) only
+        // when the device-redirection channel is joined too -- FreeRDP loads RDPDR whenever sound
+        // is on for the same reason. Without a printer, join it with no devices. Seen 2026-10-11:
+        // an AVD host opened 13 DVCs but never AUDIO_PLAYBACK_DVC, and played sound locally.
+        connector.attach_static_channel(Rdpdr::new(Box::new(NoopRdpdrBackend), computer_name));
     }
 
     // DisplayControl, the EGFX graphics pipeline, and AUDIO_PLAYBACK_DVC audio are
