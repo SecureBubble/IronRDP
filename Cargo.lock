@@ -3588,6 +3588,8 @@ dependencies = [
  "ironrdp-pdu",
  "ironrdp-propertyset",
  "ironrdp-rdcleanpath",
+ "ironrdp-rdpeai",
+ "ironrdp-rdpecam",
  "ironrdp-rdpfile",
  "ironrdp-svc",
  "ironrdp-vmconnect",

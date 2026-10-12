@@ -15,6 +15,7 @@ extern crate getrandom2 as _;
 extern crate getrandom4 as _;
 extern crate time as _;
 
+mod camera;
 mod canvas;
 mod clipboard;
 mod error;
@@ -22,6 +23,7 @@ mod gfx_replica;
 mod graphics;
 mod image;
 mod input;
+mod mic;
 mod network_client;
 mod present;
 mod printer;

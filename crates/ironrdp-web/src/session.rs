@@ -28,8 +28,8 @@ use ironrdp::pdu::gcc::{Monitor as GccMonitor, MonitorFlags};
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
-use ironrdp::rdpdr::{NoopRdpdrBackend, Rdpdr};
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
+use ironrdp::rdpdr::{NoopRdpdrBackend, Rdpdr};
 use ironrdp::rdperp::client::{RailChannel, RemoteApp};
 use ironrdp::rdperp::orders::{WindowOrder, WindowState};
 use ironrdp::rdperp::pdu::RAIL_WMSZ_MOVE;
@@ -47,6 +47,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlCanvasElement;
 
+use crate::camera::{CameraFeed, CameraListener, CameraMessage, JsCameraCallbacks, parse_camera_callbacks};
 use crate::canvas::Canvas;
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
@@ -54,6 +55,7 @@ use crate::error::IronError;
 use crate::graphics::{LocalDrag, RailWindowStore, WasmGraphicsHandler, WasmGraphicsMessageProxy, Watermark};
 use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
+use crate::mic::{JsMicCallbacks, MicInput, MicListener, MicMessage, parse_mic_callbacks};
 use crate::network_client::WasmNetworkClient;
 use crate::printer::{JsPrinterStreamCallbacks, WasmPrinter, WasmPrinterBackend, wasm_printer_pair};
 use crate::sound::{JsSoundCallbacks, WasmSound, WasmSoundBackend, wasm_sound_pair};
@@ -176,6 +178,12 @@ struct SessionBuilderInner {
     invalid_sound_callbacks: bool,
     sound_callbacks: Option<JsSoundCallbacks>,
 
+    // Setting microphone callbacks offers the host the user's microphone (AUDIO_INPUT).
+    mic_callbacks: Option<JsMicCallbacks>,
+
+    // Setting camera callbacks offers the host one camera (video-capture redirection).
+    camera_callbacks: Option<JsCameraCallbacks>,
+
     use_display_control: bool,
     enable_credssp: bool,
     // Advertise AVC420/AVC444 eGFX caps so the server sends H.264 (decoded by the
@@ -250,6 +258,10 @@ impl Default for SessionBuilderInner {
 
             invalid_sound_callbacks: false,
             sound_callbacks: None,
+
+            mic_callbacks: None,
+
+            camera_callbacks: None,
 
             use_display_control: false,
             enable_credssp: true,
@@ -478,6 +490,22 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                         inner.sound_callbacks = None;
                         warn!(%error, "Invalid sound_callbacks; audio playback requires an onWave function");
                     }
+                }
+            };
+            // Registering microphone callbacks offers the host the user's microphone: `onOpen`
+            // when an application on the host starts recording, `onClose` when it stops.
+            |mic_callbacks: JsValue| {
+                match parse_mic_callbacks(mic_callbacks) {
+                    Ok(callbacks) => self.0.borrow_mut().mic_callbacks = Some(callbacks),
+                    Err(error) => warn!(error, "Invalid mic_callbacks; microphone not offered"),
+                }
+            };
+            // Registering camera callbacks offers the host one camera: `onStart(width, height, fps)`
+            // when an application on the host starts using it, `onStop` when it stops.
+            |camera_callbacks: JsValue| {
+                match parse_camera_callbacks(camera_callbacks) {
+                    Ok(callbacks) => self.0.borrow_mut().camera_callbacks = Some(callbacks),
+                    Err(error) => warn!(error, "Invalid camera_callbacks; camera not offered"),
                 }
             };
             // WebCodecs H.264 decode callback. Registering it lets the run loop hand
@@ -752,6 +780,38 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             None => (None, None),
         };
 
+        // The microphone: a shared capture the page feeds (`mic_data`) and a listener that gives
+        // every AUDIO_INPUT open a fresh processor writing into it.
+        let mic_callbacks = self.0.borrow().mic_callbacks.clone();
+        let mic_input = mic_callbacks.as_ref().map(|_| MicInput::default());
+        // The INFO_AUDIOCAPTURE logon flag: without it Windows never offers AUDIO_INPUT and
+        // applications on the host see no input device.
+        config.enable_audio_capture = mic_input.is_some();
+        let mic_listener = mic_input
+            .clone()
+            .map(|input| MicListener::new(input, input_events_tx.clone()));
+
+        // The camera: one device, advertised on the enumeration channel; its device channel is a
+        // re-createable listener fed from the shared picture queue (`camera_frame`).
+        let camera_callbacks = self.0.borrow().camera_callbacks.clone();
+        let camera_feed = camera_callbacks
+            .as_ref()
+            .map(|_| CameraFeed::new(input_events_tx.clone()));
+        let camera = match (&camera_callbacks, &camera_feed) {
+            (Some(callbacks), Some(feed)) => {
+                let redirection = ironrdp_rdpecam::CameraRedirectionSession::new();
+                let descriptor =
+                    ironrdp_rdpecam::DeviceDescriptor::new(callbacks.name.clone(), "RDCamera_Device_0".to_owned())
+                        .context("camera descriptor")?;
+                let device = redirection.select_device(descriptor).context("camera device")?;
+                let enumeration = redirection
+                    .enumeration_client(vec![device.clone()])
+                    .context("camera enumeration")?;
+                Some((enumeration, CameraListener::new(device, feed.clone())))
+            }
+            _ => None,
+        };
+
         // Build the virtual-printer pair when JS printer callbacks were
         // registered via extension(). Backend is Send (holds the mpsc proxy
         // only) and goes into the SVC processor below; the front-end
@@ -867,6 +927,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_name,
             printer_driver_name,
             sound_backend,
+            mic_listener,
+            camera,
             computer_name: client_name.clone(),
             use_display_control,
             graphics_client_factory,
@@ -909,6 +971,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             clipboard: RefCell::new(Some(clipboard)),
             printer: RefCell::new(Some(printer)),
             sound: RefCell::new(Some(sound)),
+            mic: RefCell::new(Some(mic_callbacks)),
+            mic_input,
+            camera: RefCell::new(Some(camera_callbacks)),
+            camera_feed,
         })
     }
 }
@@ -925,6 +991,10 @@ pub(crate) enum RdpInputEvent {
     /// Sound backend → event loop: a chunk of PCM audio is ready for delivery to
     /// JS (Web Audio). See [`crate::sound::SoundBackendMessage`].
     Sound(crate::sound::SoundBackendMessage),
+    Mic(MicMessage),
+    Camera(CameraMessage),
+    /// A camera picture was queued: answer a parked Sample Request.
+    CameraFrame,
     FastPath(FastPathInputEvents),
     /// An EGFX-decoded output region, ready to blit to the canvas. Sent by
     /// [`crate::graphics::WasmGraphicsHandler`] (which is `Send` and cannot touch
@@ -1159,6 +1229,14 @@ pub(crate) struct Session {
     clipboard: RefCell<Option<Option<WasmClipboard>>>,
     printer: RefCell<Option<Option<WasmPrinter>>>,
     sound: RefCell<Option<Option<WasmSound>>>,
+    /// The page's microphone callbacks; taken by the run loop.
+    mic: RefCell<Option<Option<JsMicCallbacks>>>,
+    /// The open microphone capture the `mic_data` extension feeds; `None` = microphone not offered.
+    mic_input: Option<MicInput>,
+    /// The page's camera callbacks; taken by the run loop.
+    camera: RefCell<Option<Option<JsCameraCallbacks>>>,
+    /// Encoded pictures the `camera_frame` extension feeds; `None` = camera not offered.
+    camera_feed: Option<CameraFeed>,
 }
 
 impl Session {
@@ -1392,6 +1470,8 @@ impl iron_remote_desktop::Session for Session {
         let mut clipboard = self.clipboard.borrow_mut().take().expect("run called only once");
         let mut wasm_printer = self.printer.borrow_mut().take().expect("run called only once");
         let wasm_sound = self.sound.borrow_mut().take().expect("run called only once");
+        let mic_callbacks = self.mic.borrow_mut().take().expect("run called only once");
+        let camera_callbacks = self.camera.borrow_mut().take().expect("run called only once");
 
         let mut framed = ironrdp_futures::LocalFuturesFramed::new(rdp_reader);
 
@@ -1835,6 +1915,43 @@ impl iron_remote_desktop::Session for Session {
                             }
                             Vec::new()
                         }
+                        RdpInputEvent::Mic(message) => match message {
+                            MicMessage::Open { sample_rate, channels, bits_per_sample } => {
+                                info!(sample_rate, channels, "Host opened the microphone");
+                                if let Some(ref callbacks) = mic_callbacks {
+                                    callbacks.open(sample_rate, channels, bits_per_sample);
+                                }
+                                Vec::new()
+                            }
+                            MicMessage::Close => {
+                                info!("Host closed the microphone");
+                                if let Some(ref callbacks) = mic_callbacks {
+                                    callbacks.close();
+                                }
+                                Vec::new()
+                            }
+                            MicMessage::Uplink(messages) => match active_stage.encode_dvc_messages(messages.into_inner().unwrap_or_default()) {
+                                Ok(frame) => vec![ActiveStageOutput::ResponseFrame(frame)],
+                                Err(error) => {
+                                    warn!(%error, "Failed to send microphone data");
+                                    Vec::new()
+                                }
+                            },
+                        },
+                        RdpInputEvent::Camera(message) => {
+                            info!(?message, "Camera");
+                            if let Some(ref callbacks) = camera_callbacks {
+                                callbacks.handle(message);
+                            }
+                            Vec::new()
+                        }
+                        RdpInputEvent::CameraFrame => match deliver_camera_frame(&mut active_stage, self.camera_feed.as_ref()) {
+                            Ok(frames) => frames.into_iter().map(ActiveStageOutput::ResponseFrame).collect(),
+                            Err(e) => {
+                                warn!(error = format!("{e:#}"), "Failed to send a camera picture");
+                                Vec::new()
+                            }
+                        },
                         RdpInputEvent::TerminateSession => {
                             active_stage.graceful_shutdown()
                                 .context("graceful shutdown")?
@@ -2496,7 +2613,6 @@ impl iron_remote_desktop::Session for Session {
                             requested_resize = None;
                         }
 
-
                         // Channel-demuxing reactivation driver.
                         //
                         // `single_sequence_step_read` feeds the next hint-matching frame straight to
@@ -2779,6 +2895,33 @@ impl iron_remote_desktop::Session for Session {
         // to keep the iron-remote-desktop trait surface protocol-agnostic.
         iron_remote_desktop::extension_match! {
             match ext;
+            // One encoded camera picture from the page: `{ data: Uint8Array, key: boolean }`, an
+            // H.264 access unit (Annex B) at the size of the last `onStart`.
+            |camera_frame: JsValue| {
+                if let Some(feed) = &self.camera_feed {
+                    let obj = into_object(camera_frame)?;
+                    let data = js_sys::Reflect::get(&obj, &JsValue::from_str("data"))
+                        .ok()
+                        .and_then(|v| v.dyn_into::<js_sys::Uint8Array>().ok());
+                    let key = js_sys::Reflect::get(&obj, &JsValue::from_str("key"))
+                        .ok()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if let Some(data) = data {
+                        if feed.push(data.to_vec(), key) {
+                            let _ = self.input_events_tx.unbounded_send(RdpInputEvent::CameraFrame);
+                        }
+                    }
+                }
+                return Ok(JsValue::NULL);
+            };
+            // Captured microphone PCM from the page, in the format of the last `onOpen`.
+            |mic_data: JsValue| {
+                if let (Some(input), Ok(pcm)) = (&self.mic_input, mic_data.dyn_into::<js_sys::Uint8Array>()) {
+                    input.push(&pcm.to_vec());
+                }
+                return Ok(JsValue::NULL);
+            };
             |rail_sys_command: JsValue| {
                 let obj = into_object(rail_sys_command)?;
                 let window_id = get_u32(&obj, "window_id")?;
@@ -3002,6 +3145,29 @@ fn deliver_avc_region(
 /// processor (the only exposed mutable path), pops the deferred ack for `frame_id`,
 /// and frames it drdynvc → SVC → x224. Returns `None` when the graphics channel isn't
 /// active or `frame_id` has no pending ack.
+/// Answer the camera's parked Sample Requests with the pictures just queued, each on the channel
+/// its request came in on.
+fn deliver_camera_frame(active_stage: &mut ActiveStage, feed: Option<&CameraFeed>) -> anyhow::Result<Vec<Vec<u8>>> {
+    let Some(feed) = feed else {
+        return Ok(Vec::new());
+    };
+    let mut frames = Vec::new();
+    for (channel_id, response) in feed.take_ready() {
+        let svc = ironrdp::dvc::encode_dvc_messages(
+            channel_id,
+            vec![Box::new(response)],
+            ironrdp::svc::ChannelFlags::empty(),
+        )
+        .map_err(|e| anyhow::anyhow!("encode camera sample (drdynvc): {e}"))?;
+        frames.push(
+            active_stage
+                .encode_dvc_messages(svc)
+                .map_err(|e| anyhow::anyhow!("frame camera sample (svc): {e}"))?,
+        );
+    }
+    Ok(frames)
+}
+
 fn encode_avc_frame_ack(active_stage: &mut ActiveStage, frame_id: u32) -> anyhow::Result<Option<Vec<u8>>> {
     let Some(gfx_channel_id) = active_stage
         .get_dvc::<GraphicsPipelineClient>()
@@ -3804,6 +3970,10 @@ struct ConnectParams {
     printer_name: String,
     printer_driver_name: String,
     sound_backend: Option<WasmSoundBackend>,
+    /// AUDIO_INPUT listener; `Some` when the page offered a microphone.
+    mic_listener: Option<MicListener>,
+    /// Camera enumeration channel + device listener; `Some` when the page offered a camera.
+    camera: Option<(ironrdp_rdpecam::EnumerationClient, CameraListener)>,
     /// Matches the `client_name` in the connector config; used as the
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
@@ -3861,6 +4031,8 @@ async fn connect(
         printer_name,
         printer_driver_name,
         sound_backend,
+        mic_listener,
+        camera,
         computer_name,
         use_display_control,
         graphics_client_factory,
@@ -3924,7 +4096,7 @@ async fn connect(
                 printer_driver_name,
             ),
         );
-    } else if dvc_sound_backend.is_some() {
+    } else if dvc_sound_backend.is_some() || mic_listener.is_some() || camera.is_some() {
         // The reverse dependency also holds: Windows redirects sound (on either transport) only
         // when the device-redirection channel is joined too -- FreeRDP loads RDPDR whenever sound
         // is on for the same reason. Without a printer, join it with no devices. Seen 2026-10-11:
@@ -3935,8 +4107,22 @@ async fn connect(
     // DisplayControl, the EGFX graphics pipeline, and AUDIO_PLAYBACK_DVC audio are
     // all dynamic virtual channels, so they ride the same single DRDYNVC static
     // channel.
-    if use_display_control || graphics_client_factory.is_some() || dvc_sound_backend.is_some() {
+    if use_display_control
+        || graphics_client_factory.is_some()
+        || dvc_sound_backend.is_some()
+        || mic_listener.is_some()
+        || camera.is_some()
+    {
         let mut drdynvc = DrdynvcClient::new();
+        if let Some(mic_listener) = mic_listener {
+            // AUDIO_INPUT (MS-RDPEAI): re-createable, the host opens it per recording.
+            drdynvc = drdynvc.with_listener(mic_listener);
+        }
+        if let Some((enumeration, device)) = camera {
+            // MS-RDPECAM: the enumeration channel advertises the camera; the device channel is
+            // opened by the host when an application uses it.
+            drdynvc = drdynvc.with_dynamic_channel(enumeration).with_listener(device);
+        }
         if let Some(dvc_sound_backend) = dvc_sound_backend {
             // AUDIO_PLAYBACK_DVC (MS-RDPEA over DVC). Same RDPSND PDU flow as the
             // static "rdpsnd" channel registered above, different transport; AVD

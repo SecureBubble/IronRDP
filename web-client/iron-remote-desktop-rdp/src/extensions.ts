@@ -108,7 +108,47 @@ export function soundCallbacks(callbacks: SoundCallbacks): Extension {
     return new Extension('sound_callbacks', callbacks as unknown);
 }
 
+// Registering `micCallbacks` offers the host the user's microphone (AUDIO_INPUT). The host
+// decides when to record: `onOpen(sampleRate, channels, bitsPerSample)` fires when an
+// application on the host starts using the microphone -- start capturing in that format (16-bit
+// PCM; `MicCapture` does it) and push the samples with `micData`. `onClose` fires when it stops.
+
+export interface MicCallbacks {
+    onOpen: (sampleRate: number, channels: number, bitsPerSample: number) => void;
+    onClose?: () => void;
+}
+
+export function micCallbacks(callbacks: MicCallbacks): Extension {
+    return new Extension('mic_callbacks', callbacks as unknown);
+}
+
+// Registering `cameraCallbacks` offers the host one camera, named `name` there (video-capture
+// redirection). `onStart(width, height, fps)` fires when an application on the host starts using
+// it: capture, encode as H.264 (Annex B) at that size and push each picture with `cameraFrame`
+// (`CameraCapture` does it). `onStop` fires when it stops; `onKeyframe` asks for a key frame next.
+
+export interface CameraCallbacks {
+    name?: string;
+    onStart: (width: number, height: number, fps: number) => void;
+    onStop?: () => void;
+    onKeyframe?: () => void;
+}
+
+export function cameraCallbacks(callbacks: CameraCallbacks): Extension {
+    return new Extension('camera_callbacks', callbacks as unknown);
+}
+
 // Runtime operation extensions (invoked via Session.invokeExtension())
+
+/** One encoded camera picture: an H.264 access unit (Annex B) at the size of the last `onStart`. */
+export function cameraFrame(data: Uint8Array, key: boolean): Extension {
+    return new Extension('camera_frame', { data, key } as unknown);
+}
+
+/** Captured microphone PCM (little-endian 16-bit, interleaved) in the format of the last `onOpen`. */
+export function micData(pcm: Uint8Array): Extension {
+    return new Extension('mic_data', pcm as unknown);
+}
 
 export function requestFileContents(params: {
     stream_id: number;

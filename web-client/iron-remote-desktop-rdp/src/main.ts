@@ -200,6 +200,10 @@ export {
     printerDeviceId,
     printerDriverName,
     soundCallbacks,
+    micCallbacks,
+    micData,
+    cameraCallbacks,
+    cameraFrame,
     avcDecodeCallback,
     onAvcDecoded,
     onAvcAck,
@@ -216,4 +220,6 @@ export {
     railWindowsCallback,
     railWindowCallback,
 } from './extensions';
-export type { PrintJobStreamCallbacks, RailIcon, RailWindow, SoundCallbacks } from './extensions';
+export type { CameraCallbacks, MicCallbacks, PrintJobStreamCallbacks, RailIcon, RailWindow, SoundCallbacks } from './extensions';
+export { MicCapture } from './mic';
+export { CameraCapture } from './camera';
