@@ -560,8 +560,29 @@ export class AvcDecoder {
         }
     }
 
+    /**
+     * Chunks older than `ts` that the decoder dropped without a picture. RDP's H.264 has no
+     * reordering, so output arrives in submission order: anything still pending before `ts` will
+     * never come out. Acknowledge it now -- the host counts unacknowledged frames and throttles,
+     * then stalls -- and release its share of the pending-decode count that holds back cache ops.
+     * (FreeRDP fixed the same class of bug for AVC444, 3.32.1.)
+     */
+    private settleDropped(sd: MainSurface, ts: number): void {
+        for (const [older, m] of sd.geom) {
+            if (older >= ts) break; // insertion order = timestamp order
+            sd.geom.delete(older);
+            if (!m.chunk.ackSent) {
+                m.chunk.ackSent = true;
+                if (this.decodedHook) this.decodedHook(m.frameId);
+                else this.session?.invokeExtension(onAvcAck({ frameId: m.frameId }));
+            }
+            this.pendingDecodes = Math.max(0, this.pendingDecodes - 1);
+        }
+    }
+
     private onFrameMain(surfaceId: number, frame: VideoFrame): void {
         const sd = this.surfaces.get(surfaceId);
+        if (sd) this.settleDropped(sd, frame.timestamp);
         const meta = sd?.geom.get(frame.timestamp);
         sd?.geom.delete(frame.timestamp);
         if (!sd || !meta) {

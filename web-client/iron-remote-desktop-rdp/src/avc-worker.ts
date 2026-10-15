@@ -48,6 +48,15 @@ function getSurface(surfaceId: number): SurfaceState {
 
 async function onFrame(surfaceId: number, frame: VideoFrame): Promise<void> {
     const sd = surfaces.get(surfaceId);
+    // Chunks before this one that the decoder dropped without a picture will never come out (no
+    // reordering in RDP's H.264): acknowledge them now, or the host throttles and then stalls.
+    if (sd) {
+        for (const [older, m] of sd.geom) {
+            if (older >= frame.timestamp) break; // insertion order = timestamp order
+            sd.geom.delete(older);
+            (self as unknown as Worker).postMessage({ type: 'ack', surfaceId, frameId: m.frameId });
+        }
+    }
     const meta = sd?.geom.get(frame.timestamp);
     sd?.geom.delete(frame.timestamp);
     if (!sd || !meta) {
