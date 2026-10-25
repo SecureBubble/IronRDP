@@ -137,6 +137,23 @@ export function enableCredssp(enable: boolean): Extension {
     return new Extension('enable_credssp', enable);
 }
 
+/**
+ * The proxy address is an RD Gateway (MS-TSGU over WebSocket) instead of an RDCleanPath proxy: the
+ * auth token is sent as the gateway access token, and RDP's own TLS runs inside the tunnel, end to
+ * end with the RDP server. The destination must be the name on the RDP server's certificate.
+ */
+export function rdGateway(enable: boolean): Extension {
+    return new Extension('rd_gateway', enable);
+}
+
+/**
+ * Called with each message the RD Gateway sends while connecting or during the session: e.g. a
+ * prompt to approve the sign-in on the user's phone, or why the sign-in was refused.
+ */
+export function gatewayMessageCallback(callback: (text: string) => void): Extension {
+    return new Extension('gateway_message_callback', callback);
+}
+
 export function enableServerPointer(enable: boolean): Extension {
     return new Extension('enable_server_pointer', enable);
 }
@@ -186,6 +203,7 @@ export { detectStorageBackend } from './storage';
 // register callbacks or invoke file transfer operations directly.
 export {
     filesAvailableCallback,
+    filesOfferedCallback,
     fileContentsRequestCallback,
     fileContentsResponseCallback,
     lockCallback,

@@ -19,6 +19,7 @@ mod camera;
 mod canvas;
 mod clipboard;
 mod error;
+mod gateway;
 mod gfx_replica;
 mod graphics;
 mod image;

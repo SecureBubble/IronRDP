@@ -10,6 +10,12 @@ import type { FileInfo } from './FileTransfer';
 
 // Builder-time callback extensions (registered via SessionBuilder.extension())
 
+/** The remote copied files. Their list (filesAvailableCallback) follows once the remote serves it,
+ *  which can take seconds when a gateway inspects the files first: time to tell the user. */
+export function filesOfferedCallback(cb: () => void): Extension {
+    return new Extension('files_offered_callback', cb as unknown);
+}
+
 export function filesAvailableCallback(cb: (files: FileInfo[], clipDataId?: number) => void): Extension {
     return new Extension('files_available_callback', cb as unknown);
 }

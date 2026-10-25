@@ -240,6 +240,8 @@ pub(crate) struct JsClipboardCallbacks {
     pub(crate) on_force_clipboard_update: Option<js_sys::Function>,
     // File transfer callbacks
     pub(crate) on_files_available: Option<js_sys::Function>,
+    /// The remote copied files (its Format List names FileGroupDescriptorW), before the list itself.
+    pub(crate) on_files_offered: Option<js_sys::Function>,
     pub(crate) on_file_contents_request: Option<js_sys::Function>,
     pub(crate) on_file_contents_response: Option<js_sys::Function>,
     pub(crate) on_lock: Option<js_sys::Function>,
@@ -421,6 +423,11 @@ impl WasmClipboard {
                     // to avoid conflicts with the FormatDataRequest/Response chain.
                     if name.value() == ClipboardFormatName::FILE_LIST.value() {
                         self.pending_file_list_paste = Some(format.id());
+                        if let Some(callback) = self.js_callbacks.on_files_offered.as_ref() {
+                            if let Err(err) = callback.call0(&JsValue::NULL) {
+                                warn!(?err, "files_offered callback threw");
+                            }
+                        }
                         continue;
                     }
 
@@ -1247,6 +1254,7 @@ mod tests {
             on_remote_clipboard_changed: js_sys::Function::new_no_args(""),
             on_force_clipboard_update: Some(js_sys::Function::new_no_args("")),
             on_files_available: Some(js_sys::Function::new_no_args("")),
+            on_files_offered: None,
             on_file_contents_request: Some(js_sys::Function::new_no_args("")),
             on_file_contents_response: Some(js_sys::Function::new_no_args("")),
             on_lock: Some(js_sys::Function::new_no_args("")),

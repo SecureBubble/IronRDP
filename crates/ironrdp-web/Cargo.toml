@@ -95,6 +95,12 @@ tap = "1"
 semver = "1"
 url = "2.5"
 base64 = "0.22"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+futures-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "1"
+# UnixTime::now() in the browser, for certificate checks
+rustls-pki-types = { version = "1.15", features = ["web"] }
 
 [lints]
 workspace = true

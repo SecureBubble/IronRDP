@@ -52,6 +52,7 @@ use crate::canvas::Canvas;
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::error::IronError;
+use crate::gateway::RdpStream;
 use crate::graphics::{LocalDrag, RailWindowStore, WasmGraphicsHandler, WasmGraphicsMessageProxy, Watermark};
 use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
@@ -101,6 +102,9 @@ struct SessionBuilderInner {
     force_clipboard_update_callback: Option<js_sys::Function>,
     // File transfer callbacks
     files_available_callback: Option<js_sys::Function>,
+    /// Extension `files_offered_callback`: the remote copied files; their list follows once the
+    /// remote serves it, which a gateway that inspects files first may take seconds to do.
+    files_offered_callback: Option<js_sys::Function>,
     file_contents_request_callback: Option<js_sys::Function>,
     file_contents_response_callback: Option<js_sys::Function>,
     lock_callback: Option<js_sys::Function>,
@@ -186,6 +190,13 @@ struct SessionBuilderInner {
 
     use_display_control: bool,
     enable_credssp: bool,
+    /// Extension `rd_gateway`: `proxy_address` is an RD Gateway (MS-TSGU over WebSocket) that admits
+    /// by the auth token as an access token, and this client runs RDP's own TLS inside its tunnel
+    /// (e.g. the diode front). Off: the proxy speaks RDCleanPath.
+    rd_gateway: bool,
+    /// Extension `gateway_message_callback`: called with the text of each message the RD Gateway
+    /// sends (e.g. "approve the sign-in on your phone", or why it refused), for the page to show.
+    gateway_message_callback: Option<js_sys::Function>,
     // Advertise AVC420/AVC444 eGFX caps so the server sends H.264 (decoded by the
     // browser WebCodecs path). Controlled per-connection via the `advertise_avc`
     // extension so the web UI's "Enhanced graphics" toggle can turn it off (off =>
@@ -232,6 +243,7 @@ impl Default for SessionBuilderInner {
             remote_clipboard_changed_callback: None,
             force_clipboard_update_callback: None,
             files_available_callback: None,
+            files_offered_callback: None,
             file_contents_request_callback: None,
             file_contents_response_callback: None,
             lock_callback: None,
@@ -265,6 +277,8 @@ impl Default for SessionBuilderInner {
 
             use_display_control: false,
             enable_credssp: true,
+            rd_gateway: false,
+            gateway_message_callback: None,
             advertise_avc: true,
             remote_frame_acks: false,
             gfx_decode: true,
@@ -395,6 +409,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |remote_app: JsValue| { self.0.borrow_mut().remote_app = parse_remote_app(&remote_app) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
+            |rd_gateway: bool| { self.0.borrow_mut().rd_gateway = rd_gateway };
+            |gateway_message_callback: JsValue| {
+                self.0.borrow_mut().gateway_message_callback = gateway_message_callback.dyn_into::<js_sys::Function>().ok();
+            };
             |advertise_avc: bool| { self.0.borrow_mut().advertise_avc = advertise_avc };
             |remote_frame_acks: bool| { self.0.borrow_mut().remote_frame_acks = remote_frame_acks };
             |gfx_decode: bool| { self.0.borrow_mut().gfx_decode = gfx_decode };
@@ -421,6 +439,9 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             // rather than dedicated trait methods to keep iron-remote-desktop protocol-agnostic.
             |files_available_callback: JsValue| {
                 self.0.borrow_mut().files_available_callback = files_available_callback.dyn_into::<js_sys::Function>().ok();
+            };
+            |files_offered_callback: JsValue| {
+                self.0.borrow_mut().files_offered_callback = files_offered_callback.dyn_into::<js_sys::Function>().ok();
             };
             |file_contents_request_callback: JsValue| {
                 self.0.borrow_mut().file_contents_request_callback = file_contents_request_callback.dyn_into::<js_sys::Function>().ok();
@@ -580,6 +601,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             remote_clipboard_changed_callback,
             force_clipboard_update_callback,
             files_available_callback,
+            files_offered_callback,
             file_contents_request_callback,
             file_contents_response_callback,
             lock_callback,
@@ -635,6 +657,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             remote_clipboard_changed_callback = inner.remote_clipboard_changed_callback.clone();
             force_clipboard_update_callback = inner.force_clipboard_update_callback.clone();
             files_available_callback = inner.files_available_callback.clone();
+            files_offered_callback = inner.files_offered_callback.clone();
             file_contents_request_callback = inner.file_contents_request_callback.clone();
             file_contents_response_callback = inner.file_contents_response_callback.clone();
             lock_callback = inner.lock_callback.clone();
@@ -746,6 +769,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     on_remote_clipboard_changed: callback,
                     on_force_clipboard_update: force_clipboard_update_callback,
                     on_files_available: files_available_callback,
+                    on_files_offered: files_offered_callback,
                     on_file_contents_request: file_contents_request_callback,
                     on_file_contents_response: file_contents_response_callback,
                     on_lock: lock_callback,
@@ -857,6 +881,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         }
 
         let use_display_control = self.0.borrow().use_display_control;
+        let rd_gateway = self.0.borrow().rd_gateway;
+        let gateway_message_callback = self.0.borrow().gateway_message_callback.clone();
         let advertise_avc = self.0.borrow().advertise_avc;
         let remote_frame_acks = self.0.borrow().remote_frame_acks;
         let gfx_decode = self.0.borrow().gfx_decode;
@@ -916,6 +942,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let (connection_result, ws) = connect(ConnectParams {
             ws,
+            rd_gateway,
+            gateway_message_callback,
             config,
             proxy_auth_token: auth_token,
             destination,
@@ -940,13 +968,15 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         let (rdp_reader, rdp_writer) = futures_util::AsyncReadExt::split(ws);
 
         let (writer_tx, writer_rx) = mpsc::unbounded();
+        let (writer_close, close_rx) = futures_channel::oneshot::channel::<()>();
 
-        spawn_local(writer_task(writer_rx, rdp_writer, outbound_message_size_limit));
+        spawn_local(writer_task(writer_rx, close_rx, rdp_writer, outbound_message_size_limit));
 
         Ok(Session {
             desktop_size: connection_result.desktop_size,
             input_database: RefCell::new(ironrdp::input::Database::new()),
             writer_tx,
+            writer_close: RefCell::new(Some(writer_close)),
             input_events_tx,
             rail_store,
 
@@ -1190,6 +1220,8 @@ pub(crate) struct Session {
     desktop_size: connector::DesktopSize,
     input_database: RefCell<ironrdp::input::Database>,
     writer_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Fired when the session ends: the writer task closes the connection.
+    writer_close: RefCell<Option<futures_channel::oneshot::Sender<()>>>,
     input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
     /// Shared HiDef-RAIL window positions, fed to the graphics handler's compositor from
     /// the run loop's Window List order decoding. Inert for non-RAIL / output-mapped sessions.
@@ -1225,7 +1257,7 @@ pub(crate) struct Session {
     // Consumed when `run` is called
     input_events_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpInputEvent>>>,
     connection_result: RefCell<Option<connector::ConnectionResult>>,
-    rdp_reader: RefCell<Option<ReadHalf<WebSocket>>>,
+    rdp_reader: RefCell<Option<ReadHalf<RdpStream>>>,
     clipboard: RefCell<Option<Option<WasmClipboard>>>,
     printer: RefCell<Option<Option<WasmPrinter>>>,
     sound: RefCell<Option<Option<WasmSound>>>,
@@ -1449,6 +1481,7 @@ impl iron_remote_desktop::Session for Session {
     type Error = IronError;
 
     async fn run(&self) -> Result<Self::SessionTerminationInfo, Self::Error> {
+        let result: Result<SessionTerminationInfo, IronError> = async {
         let rdp_reader = self
             .rdp_reader
             .borrow_mut()
@@ -2744,6 +2777,16 @@ impl iron_remote_desktop::Session for Session {
         Ok(SessionTerminationInfo {
             reason: disconnect_reason,
         })
+        }
+        .await;
+
+        // However the session ended, end its connection too: a gateway keeps the RDP server's
+        // session (and the host's logon) up until the client closes the tunnel.
+        if let Some(close) = self.writer_close.borrow_mut().take() {
+            let _ = close.send(());
+        }
+
+        result
     }
 
     fn desktop_size(&self) -> DesktopSize {
@@ -3921,17 +3964,31 @@ fn build_config(
 
 async fn writer_task(
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    rdp_writer: WriteHalf<WebSocket>,
+    close_rx: futures_channel::oneshot::Receiver<()>,
+    rdp_writer: WriteHalf<RdpStream>,
     outbound_limit: Option<usize>,
 ) {
     debug!("writer task started");
 
     async fn inner(
         mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
-        mut rdp_writer: WriteHalf<WebSocket>,
+        close_rx: futures_channel::oneshot::Receiver<()>,
+        mut rdp_writer: WriteHalf<RdpStream>,
         outbound_limit: Option<usize>,
     ) -> anyhow::Result<()> {
-        while let Some(frame) = rx.next().await {
+        let mut close_rx = close_rx.fuse();
+        loop {
+            let frame = select! {
+                frame = rx.next() => match frame {
+                    Some(frame) => frame,
+                    None => break,
+                },
+                _ = close_rx => {
+                    // The session is over: close the connection.
+                    rdp_writer.close().await.context("couldn't close the connection")?;
+                    break;
+                }
+            };
             match outbound_limit {
                 Some(max_size) if frame.len() > max_size => {
                     // Send in chunks.
@@ -3951,7 +4008,7 @@ async fn writer_task(
         Ok(())
     }
 
-    match inner(rx, rdp_writer, outbound_limit).await {
+    match inner(rx, close_rx, rdp_writer, outbound_limit).await {
         Ok(()) => debug!("writer task ended gracefully"),
         Err(e) => error!("writer task ended unexpectedly: {e:#}"),
     }
@@ -3959,6 +4016,8 @@ async fn writer_task(
 
 struct ConnectParams {
     ws: WebSocket,
+    rd_gateway: bool,
+    gateway_message_callback: Option<js_sys::Function>,
     config: connector::Config,
     proxy_auth_token: String,
     destination: String,
@@ -4020,6 +4079,8 @@ fn macos_major_version_from_user_agent(user_agent: &str) -> Option<u32> {
 async fn connect(
     ConnectParams {
         ws,
+        rd_gateway,
+        gateway_message_callback,
         config,
         proxy_auth_token,
         destination,
@@ -4037,8 +4098,17 @@ async fn connect(
         use_display_control,
         graphics_client_factory,
     }: ConnectParams,
-) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
-    let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
+) -> Result<(connector::ConnectionResult, RdpStream), IronError> {
+    let stream: RdpStream = if rd_gateway {
+        Box::new(
+            crate::gateway::Tunnel::open(ws, &proxy_auth_token, &destination, &computer_name, gateway_message_callback)
+                .await
+                .map_err(|e| IronError::from(e).with_kind(IronErrorKind::ProxyConnect))?,
+        )
+    } else {
+        Box::new(ws)
+    };
+    let mut framed = ironrdp_futures::LocalFuturesFramed::new(stream);
 
     // In web browser environments, we do not have an easy access to the local address of the socket.
     let dummy_client_addr = core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 33899));
@@ -4158,8 +4228,22 @@ async fn connect(
         connector.attach_static_channel(drdynvc);
     }
 
-    let (upgraded, server_public_key) =
-        connect_rdcleanpath(&mut framed, &mut connector, destination.clone(), proxy_auth_token, pcb).await?;
+    let (upgraded, server_public_key) = if rd_gateway {
+        // X.224 negotiation in the clear, then RDP's TLS inside the tunnel, as mstsc does.
+        let should_upgrade = ironrdp_futures::connect_begin(&mut framed, &mut connector).await?;
+        let (stream, leftover) = framed.into_inner();
+        if !leftover.is_empty() {
+            return Err(anyhow::Error::msg("unexpected bytes before the TLS handshake").into());
+        }
+        let (stream, server_public_key) = crate::gateway::upgrade_tls(stream, &destination).await?;
+        framed = ironrdp_futures::LocalFuturesFramed::new(stream);
+        (
+            ironrdp_futures::mark_as_upgraded(should_upgrade, &mut connector),
+            server_public_key,
+        )
+    } else {
+        connect_rdcleanpath(&mut framed, &mut connector, destination.clone(), proxy_auth_token, pcb).await?
+    };
 
     let connection_result = ironrdp_futures::connect_finalize(
         upgraded,
