@@ -419,6 +419,9 @@ pub struct Cliprdr<R: Role> {
     backend: Box<dyn CliprdrBackend>,
     capabilities: Capabilities,
     state: CliprdrState,
+    /// The server sent Monitor Ready. A client says nothing on the channel before it ([MS-RDPECLIP]
+    /// 1.3.2.1): a server may open the channel late, e.g. after an MFA prompt, and drop earlier PDUs.
+    monitor_ready: bool,
 
     /// Format IDs of the sent FormatDataRequests not yet answered, oldest
     /// first. A FormatDataResponse names no format, but [MS-RDPECLIP] requires
@@ -605,6 +608,7 @@ impl<R: Role> Cliprdr<R> {
         Self {
             backend,
             state: CliprdrState::Initialization,
+            monitor_ready: false,
             capabilities: Capabilities::new(ClipboardProtocolVersion::V2, flags),
             pending_format_data_requests: VecDeque::new(),
             local_file_list: None,
@@ -686,6 +690,7 @@ impl<R: Role> Cliprdr<R> {
         // regardless of whether the backend responds synchronously or
         // asynchronously, because `process()` for the Capabilities PDU
         // completes before `process()` for Monitor Ready begins.
+        self.monitor_ready = true;
         self.backend.on_request_format_list();
         Ok(Vec::new())
     }
@@ -921,6 +926,11 @@ impl<R: Role> Cliprdr<R> {
                     pdus.push(ClipboardPdu::FormatList(
                         self.build_format_list(available_formats).map_err(|e| encode_err!(e))?,
                     ));
+                }
+                CliprdrState::Initialization if !R::is_server() && !self.monitor_ready => {
+                    // A local copy before the server is ready: Monitor Ready asks for the format
+                    // list again, so there is nothing to send yet.
+                    debug!("Local copy before Monitor Ready; the format list goes after it");
                 }
                 CliprdrState::Initialization => {
                     // During initialization state, first copy action is synthetic and should be sent along with
