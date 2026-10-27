@@ -233,6 +233,8 @@ pub(crate) struct Compositor {
     small_bitmap_cache: bool,
     /// Window deltas from completed frames, awaiting drain.
     ready_windows: Vec<WindowUpdate>,
+    /// The handler composites: no surface is created, so every operation on one does nothing.
+    disabled: bool,
 }
 
 impl Compositor {
@@ -356,8 +358,13 @@ impl Compositor {
     /// Surfaces beyond [`MAX_SURFACE_DIM`] on either edge are skipped rather than
     /// allocated; subsequent commands targeting them become no-ops (the metadata
     /// tracked by the client is unaffected).
+    /// Keeps no surfaces (and so no caches or output) from now on.
+    pub(crate) fn disable(&mut self) {
+        self.disabled = true;
+    }
+
     pub(crate) fn create_surface(&mut self, id: u16, width: u16, height: u16) {
-        if width == 0 || height == 0 || width > MAX_SURFACE_DIM || height > MAX_SURFACE_DIM {
+        if self.disabled || width == 0 || height == 0 || width > MAX_SURFACE_DIM || height > MAX_SURFACE_DIM {
             return;
         }
         let len = usize::from(width) * usize::from(height) * BYTES_PER_PIXEL;

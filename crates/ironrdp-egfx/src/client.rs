@@ -439,6 +439,11 @@ pub trait GraphicsPipelineHandler: Send {
     /// Called with each H.264 picture when the client was built
     /// [`with_external_avc`](GraphicsPipelineClient::with_external_avc).
     fn on_avc_frame(&mut self, _frame: &AvcFrame<'_>) {}
+
+    /// Called with each ALPHA codec bitmap, undecoded, when the client was built
+    /// [`with_handler_compositing`](GraphicsPipelineClient::with_handler_compositing): applying
+    /// it needs the surface pixels, which only the handler then has.
+    fn on_alpha_update(&mut self, _surface_id: u16, _destination: &ExclusiveRectangle, _alpha_stream: &[u8]) {}
 }
 
 // ============================================================================
@@ -508,6 +513,8 @@ pub struct GraphicsPipelineClient {
 
     /// H.264 goes to the handler's `on_avc_frame` instead of a decoder in this client.
     external_avc: bool,
+    /// The handler composites: the client keeps no surface copies and hands ALPHA over undecoded.
+    handler_composites: bool,
     /// Every frame waits for `ack_frame`, not only frames with H.264 in them.
     defer_all_acks: bool,
     /// The current frame handed H.264 out, so its acknowledgement waits for `ack_frame`.
@@ -555,6 +562,7 @@ impl GraphicsPipelineClient {
             cache_import_attempted: false,
             offered_cache_keys: None,
             external_avc: false,
+            handler_composites: false,
             defer_all_acks: false,
             current_frame_deferred: false,
             pending_acks: BTreeMap::new(),
@@ -570,6 +578,16 @@ impl GraphicsPipelineClient {
     #[must_use]
     pub fn with_external_avc(mut self) -> Self {
         self.external_avc = true;
+        self
+    }
+
+    /// The handler composites every surface operation itself (e.g. on a GPU), so the client keeps
+    /// no copy of surfaces, caches or output ([`drain_output`](Self::drain_output) stays empty)
+    /// and hands ALPHA bitmaps to [`GraphicsPipelineHandler::on_alpha_update`] undecoded.
+    #[must_use]
+    pub fn with_handler_compositing(mut self) -> Self {
+        self.handler_composites = true;
+        self.compositor.disable();
         self
     }
 
@@ -1858,6 +1876,10 @@ impl GraphicsPipelineClient {
     /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
     /// [3.3.5.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/3fdfcd8d-ec4f-4b7a-8e0d-0385a840ec81
     fn decode_alpha(&mut self, surface_id: u16, dest_rect: &ExclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
+        if self.handler_composites {
+            self.handler.on_alpha_update(surface_id, dest_rect, bitmap_data);
+            return Ok(());
+        }
         let composited = self
             .compositor
             .apply_alpha(surface_id, dest_rect, bitmap_data)
@@ -4091,5 +4113,88 @@ mod tests {
             [1],
             "the new stream's ids start over"
         );
+    }
+
+    #[derive(Default)]
+    struct ComposeLog {
+        fills: usize,
+        bitmaps: usize,
+        alpha: Vec<Vec<u8>>,
+    }
+    struct ComposeRecorder(Arc<Mutex<ComposeLog>>);
+    impl GraphicsPipelineHandler for ComposeRecorder {
+        fn on_solid_fill(&mut self, _pdu: &SolidFillPdu) {
+            self.0.lock().unwrap().fills += 1;
+        }
+        fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {
+            self.0.lock().unwrap().bitmaps += 1;
+        }
+        fn on_alpha_update(&mut self, _surface_id: u16, _destination: &ExclusiveRectangle, alpha_stream: &[u8]) {
+            self.0.lock().unwrap().alpha.push(alpha_stream.to_vec());
+        }
+    }
+
+    #[test]
+    fn handler_compositing_keeps_no_surface_copy_and_passes_alpha_through() {
+        let log = Arc::new(Mutex::new(ComposeLog::default()));
+        let mut client =
+            GraphicsPipelineClient::new(Box::new(ComposeRecorder(Arc::clone(&log))), None).with_handler_compositing();
+        let rect = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 2,
+            bottom: 1,
+        };
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: 2,
+            height: 1,
+            pixel_format: PixelFormat::ARgb,
+        }));
+        let _ = client.handle_pdu(GfxPdu::MapSurfaceToOutput(crate::pdu::MapSurfaceToOutputPdu {
+            surface_id: 1,
+            output_origin_x: 0,
+            output_origin_y: 0,
+        }));
+        start_frame(&mut client, 1);
+        client
+            .handle_pdu(GfxPdu::SolidFill(SolidFillPdu {
+                surface_id: 1,
+                fill_pixel: crate::pdu::Color {
+                    b: 1,
+                    g: 2,
+                    r: 3,
+                    xa: 0xFF,
+                },
+                rectangles: vec![rect.clone()],
+            }))
+            .unwrap();
+        // Uncompressed XRGB still decodes to a bitmap for the handler.
+        client
+            .handle_pdu(GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
+                surface_id: 1,
+                codec_id: Codec1Type::Uncompressed,
+                pixel_format: PixelFormat::XRgb,
+                destination_rectangle: rect.clone(),
+                bitmap_data: vec![0; 8],
+            }))
+            .unwrap();
+        let alpha = vec![b'A', b'L', 0, 0, 0x80, 0x80];
+        client
+            .handle_pdu(GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
+                surface_id: 1,
+                codec_id: Codec1Type::Alpha,
+                pixel_format: PixelFormat::ARgb,
+                destination_rectangle: rect,
+                bitmap_data: alpha.clone(),
+            }))
+            .unwrap();
+        end_frame(&mut client, 1);
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.fills, 1);
+        assert_eq!(log.bitmaps, 1);
+        assert_eq!(log.alpha, [alpha]);
+        assert!(client.drain_output().is_empty());
     }
 }
