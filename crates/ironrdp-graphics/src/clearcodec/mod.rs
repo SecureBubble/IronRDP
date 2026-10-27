@@ -190,12 +190,15 @@ impl ClearCodecDecoder {
                 let band_height = band.y_end - band.y_start + 1;
                 for (col_offset, vbar) in band.vbars.iter().enumerate() {
                     let x = usize::from(band.x_start) + col_offset;
+
+                    // Every V-bar is resolved, clipped or not: the cache cursors advance with
+                    // each one, as on the server, and later VBAR_CACHE_HITs index by them.
+                    let full_vbar =
+                        self.resolve_vbar(vbar, band_height, band.blue_bkg, band.green_bkg, band.red_bkg)?;
+
                     if x >= w {
                         continue;
                     }
-
-                    let full_vbar =
-                        self.resolve_vbar(vbar, band_height, band.blue_bkg, band.green_bkg, band.red_bkg)?;
 
                     // Blit the full V-bar column into the output
                     let pixel_rows = full_vbar.pixels.len() / 3;
@@ -235,28 +238,28 @@ impl ClearCodecDecoder {
     ) -> DecodeResult<FullVBar> {
         match vbar {
             VBar::CacheHit { index } => {
-                let cached = self
-                    .vbar_cache
-                    .get_vbar(*index)
-                    .ok_or_else(|| invalid_field_err!("vbarIndex", "V-bar cache miss on hit"))?;
-                Ok(cached.clone())
+                // Windows hits slots that are empty for this client (e.g. after a cache
+                // reset). FreeRDP fills a background column and keeps decoding; failing the
+                // WireToSurface1 left the tile gray or black on screen.
+                match self.vbar_cache.get_vbar(*index) {
+                    Some(cached) => Ok(cached.clone()),
+                    None => Ok(dummy_full_vbar(band_height, bg_blue, bg_green, bg_red)),
+                }
             }
             VBar::ShortCacheHit { index, y_on } => {
-                let cached_short = self
-                    .vbar_cache
-                    .get_short_vbar(*index)
-                    .ok_or_else(|| invalid_field_err!("shortVbarIndex", "short V-bar cache miss on hit"))?;
-                if usize::from(*y_on) + usize::from(cached_short.pixel_count) > usize::from(band_height) {
-                    return Err(invalid_field_err!(
-                        "shortVBarYOn",
-                        "y_on + pixel_count exceeds band height"
-                    ));
-                }
-                // Create a modified short vbar with the y_on from this reference
-                let modified = ShortVBar {
-                    y_on: *y_on,
-                    pixel_count: cached_short.pixel_count,
-                    pixels: cached_short.pixels.clone(),
+                // An empty short slot is an all-background column, as in FreeRDP; the
+                // band-height overflow is clamped in `reconstruct_full_vbar`.
+                let modified = match self.vbar_cache.get_short_vbar(*index) {
+                    Some(cached_short) => ShortVBar {
+                        y_on: *y_on,
+                        pixel_count: cached_short.pixel_count,
+                        pixels: cached_short.pixels.clone(),
+                    },
+                    None => ShortVBar {
+                        y_on: *y_on,
+                        pixel_count: 0,
+                        pixels: Vec::new(),
+                    },
                 };
                 let full = VBarCache::reconstruct_full_vbar(&modified, band_height, bg_blue, bg_green, bg_red);
                 // Store reconstructed full V-bar in cache
@@ -399,6 +402,18 @@ impl Default for ClearCodecDecoder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A background-filled full V-bar of `band_height` rows (BGR), for a VBAR_CACHE_HIT to an
+/// empty slot (FreeRDP clear.c "filling dummy data").
+fn dummy_full_vbar(band_height: u16, bg_blue: u8, bg_green: u8, bg_red: u8) -> FullVBar {
+    let mut pixels = Vec::with_capacity(usize::from(band_height) * 3);
+    for _ in 0..band_height {
+        pixels.push(bg_blue);
+        pixels.push(bg_green);
+        pixels.push(bg_red);
+    }
+    FullVBar { pixels }
 }
 
 /// ClearCodec encoder for server-side bitmap compression.
@@ -587,6 +602,19 @@ mod tests {
     use ironrdp_pdu::codecs::clearcodec::{FLAG_CACHE_RESET, FLAG_GLYPH_HIT};
 
     use super::*;
+
+    #[test]
+    fn vbar_cache_hit_to_an_empty_slot_is_a_background_column() {
+        let mut decoder = ClearCodecDecoder::new();
+
+        let full = decoder.resolve_vbar(&VBar::CacheHit { index: 5 }, 3, 1, 2, 3).unwrap();
+        assert_eq!(full.pixels, [1, 2, 3, 1, 2, 3, 1, 2, 3]);
+
+        let short = decoder
+            .resolve_vbar(&VBar::ShortCacheHit { index: 7, y_on: 1 }, 3, 1, 2, 3)
+            .unwrap();
+        assert_eq!(short.pixels, [1, 2, 3, 1, 2, 3, 1, 2, 3]);
+    }
 
     fn make_residual_only_stream(width: u16, height: u16, blue: u8, green: u8, red: u8) -> Vec<u8> {
         let pixel_count = u32::from(width) * u32::from(height);
