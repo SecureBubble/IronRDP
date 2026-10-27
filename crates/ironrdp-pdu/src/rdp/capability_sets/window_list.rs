@@ -1,6 +1,4 @@
-use ironrdp_core::{
-    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size, invalid_field_err,
-};
+use ironrdp_core::{Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size};
 
 /// [2.2.1.1.2] Window List Capability Set.
 ///
@@ -44,8 +42,18 @@ impl<'de> Decode<'de> for WindowList {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         ensure_fixed_part_size!(in: src);
 
-        let support_level = WindowSupportLevel::from_u32(src.read_u32())
-            .ok_or_else(|| invalid_field_err!("wndSupportLevel", "invalid window support level"))?;
+        // A server's level outside {0, 1, 2} must not abort the connection at Capabilities
+        // Exchange (a real Windows host sends 3, i.e. SUPPORTED | SUPPORTED_EX): take the
+        // highest level whose bit is set.
+        let raw_support_level = src.read_u32();
+        let support_level =
+            WindowSupportLevel::from_u32(raw_support_level).unwrap_or(if raw_support_level & 0x2 != 0 {
+                WindowSupportLevel::SupportedEx
+            } else if raw_support_level & 0x1 != 0 {
+                WindowSupportLevel::Supported
+            } else {
+                WindowSupportLevel::NotSupported
+            });
         let num_icon_caches = src.read_u8();
         let num_icon_cache_entries = src.read_u16();
 
@@ -106,8 +114,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_window_support_level() {
-        assert!(decode::<WindowList>(&[3, 0, 0, 0, 0, 0, 0]).is_err());
+    fn unknown_window_support_level_decodes_to_highest_set_level() {
+        let decoded: WindowList = decode(&[3, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(decoded.support_level, WindowSupportLevel::SupportedEx);
+        let decoded: WindowList = decode(&[0x10, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(decoded.support_level, WindowSupportLevel::NotSupported);
     }
 
     #[test]
