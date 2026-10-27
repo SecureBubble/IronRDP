@@ -125,6 +125,12 @@ pub enum DisconnectDescription {
     /// Includes the error information sent by the RDP server when there
     /// is a connection or disconnection failure.
     ErrorInfo(ErrorInfo),
+
+    /// The server (or proxy) sent a Server Redirection PDU. The web client does
+    /// not follow redirects; it surfaces the redirect so the shell can present a
+    /// message (e.g. the SecureBubble proxy's failed-sign-in `QTERR` sentinel) or,
+    /// in future, reconnect to the target.
+    ServerRedirection(ServerRedirectionPdu),
 }
 
 pub struct Processor {
@@ -375,6 +381,14 @@ impl Processor {
             }
             IoChannelPdu::DeactivateAll(_) => Ok(vec![ProcessorOutput::DeactivateAll]),
             IoChannelPdu::ServerRedirection(redirection) => {
+                // The SecureBubble proxy reports a failed sign-in as a redirection whose
+                // load-balance info carries a `QTERR` message: end the session with it.
+                if redirection.qterr_message().is_some() {
+                    debug!("Server Redirection PDU carries a proxy message; ending the session");
+                    return Ok(vec![ProcessorOutput::Disconnect(DisconnectDescription::ServerRedirection(
+                        redirection,
+                    ))]);
+                }
                 if redirection.is_informational() {
                     debug!(?redirection, "Ignoring informational Server Redirection PDU");
                     return Ok(Vec::new());
