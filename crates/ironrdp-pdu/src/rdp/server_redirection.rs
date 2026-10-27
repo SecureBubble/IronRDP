@@ -187,6 +187,26 @@ impl ServerRedirectionPdu {
     pub fn is_informational(&self) -> bool {
         self.flags.contains(ServerRedirectionFlags::NO_REDIRECT)
     }
+
+    /// The message a SecureBubble proxy puts in the load-balance info to end a session it refused
+    /// (a failed sign-in): `QTERR`, a code, a title and a body, separated by tabs; as `(title, body)`.
+    ///
+    /// FreeRDP wraps `LB_LOAD_BALANCE_INFO` on the wire as `Cookie: msts=<value>` plus CRLF, so the
+    /// prefix and suffix are stripped first.
+    pub fn qterr_message(&self) -> Option<(String, String)> {
+        let lbi = self.load_balance_info.as_ref()?;
+        let text = core::str::from_utf8(lbi).ok()?;
+        let text = text.strip_prefix("Cookie: msts=").unwrap_or(text);
+        let text = text.trim_end_matches(['\r', '\n']);
+        let mut parts = text.split('\t');
+        if parts.next()? != "QTERR" {
+            return None;
+        }
+        let _code = parts.next()?;
+        let title = parts.next()?.to_owned();
+        let body = parts.next().unwrap_or("").to_owned();
+        Some((title, body))
+    }
 }
 
 impl Encode for ServerRedirectionPdu {
