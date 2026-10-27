@@ -36,6 +36,13 @@ const RDPGFX_CMDID_MAPSURFACETOWINDOW: u16 = 0x0015;
 const RDPGFX_CMDID_QOEFRAMEACKNOWLEDGE: u16 = 0x0016;
 const RDPGFX_CMDID_MAPSURFACETOSCALEDOUTPUT: u16 = 0x0017;
 const RDPGFX_CMDID_MAPSURFACETOSCALEDWINDOW: u16 = 0x0018;
+// Non-standard commands: private SecureBubble/proxy extension past the MS-RDPEGFX
+// range (0x0001..=0x0018). The proxy injects these into the server->client eGFX
+// stream to overlay a per-session QR watermark and to flag surfaces as
+// capture-protected. Only enabled when the client advertises the private caps
+// version (see `ironrdp-connector` GFX capabilities).
+const RDPGFX_CMDID_PROTECT_SURFACE: u16 = 0x0019;
+const RDPGFX_CMDID_WATERMARK: u16 = 0x001a;
 
 const MAX_RESET_GRAPHICS_WIDTH_HEIGHT: u32 = 32_766;
 const MONITOR_COUNT_MAX: u32 = 16;
@@ -71,6 +78,10 @@ pub enum GfxPdu {
     QoeFrameAcknowledge(QoeFrameAcknowledgePdu),
     MapSurfaceToScaledOutput(MapSurfaceToScaledOutputPdu),
     MapSurfaceToScaledWindow(MapSurfaceToScaledWindowPdu),
+    /// Non-standard SecureBubble proxy extension (cmd id `0x0019`).
+    ProtectSurface(ProtectSurfacePdu),
+    /// Non-standard SecureBubble proxy extension (cmd id `0x001A`).
+    Watermark(WatermarkPdu),
 }
 
 /// 2.2.1.5 RDPGFX_HEADER
@@ -110,6 +121,8 @@ impl Encode for GfxPdu {
             GfxPdu::QoeFrameAcknowledge(pdu) => (RDPGFX_CMDID_QOEFRAMEACKNOWLEDGE, pdu.size()),
             GfxPdu::MapSurfaceToScaledOutput(pdu) => (RDPGFX_CMDID_MAPSURFACETOSCALEDOUTPUT, pdu.size()),
             GfxPdu::MapSurfaceToScaledWindow(pdu) => (RDPGFX_CMDID_MAPSURFACETOSCALEDWINDOW, pdu.size()),
+            GfxPdu::ProtectSurface(pdu) => (RDPGFX_CMDID_PROTECT_SURFACE, pdu.size()),
+            GfxPdu::Watermark(pdu) => (RDPGFX_CMDID_WATERMARK, pdu.size()),
         };
 
         // This will never overflow as per invariants.
@@ -146,6 +159,8 @@ impl Encode for GfxPdu {
             GfxPdu::QoeFrameAcknowledge(pdu) => pdu.encode(dst),
             GfxPdu::MapSurfaceToScaledOutput(pdu) => pdu.encode(dst),
             GfxPdu::MapSurfaceToScaledWindow(pdu) => pdu.encode(dst),
+            GfxPdu::ProtectSurface(pdu) => pdu.encode(dst),
+            GfxPdu::Watermark(pdu) => pdu.encode(dst),
         }?;
 
         Ok(())
@@ -183,6 +198,8 @@ impl Encode for GfxPdu {
                 GfxPdu::QoeFrameAcknowledge(pdu) => pdu.size(),
                 GfxPdu::MapSurfaceToScaledOutput(pdu) => pdu.size(),
                 GfxPdu::MapSurfaceToScaledWindow(pdu) => pdu.size(),
+                GfxPdu::ProtectSurface(pdu) => pdu.size(),
+                GfxPdu::Watermark(pdu) => pdu.size(),
             };
 
         size
@@ -300,6 +317,14 @@ impl<'de> Decode<'de> for GfxPdu {
             RDPGFX_CMDID_MAPSURFACETOSCALEDWINDOW => {
                 let pdu = MapSurfaceToScaledWindowPdu::decode(src)?;
                 Ok(GfxPdu::MapSurfaceToScaledWindow(pdu))
+            }
+            RDPGFX_CMDID_PROTECT_SURFACE => {
+                let pdu = ProtectSurfacePdu::decode(src)?;
+                Ok(GfxPdu::ProtectSurface(pdu))
+            }
+            RDPGFX_CMDID_WATERMARK => {
+                let pdu = WatermarkPdu::decode(src)?;
+                Ok(GfxPdu::Watermark(pdu))
             }
             _ => Err(invalid_field_err!("Type", "Unknown GFX PDU type", in: src)),
         }
@@ -1648,6 +1673,18 @@ impl RawCapabilitySet {
                     flags: CapabilitiesV107Flags::from_bits_retain(cur.read_u32()),
                 }
             }
+            CapabilityVersion::V10_8 => {
+                ensure_size!(in: cur, size: 4);
+                CapabilitySet::V10_8 {
+                    flags: CapabilitiesV107Flags::from_bits_retain(cur.read_u32()),
+                }
+            }
+            CapabilityVersion::V10_9 => {
+                ensure_size!(in: cur, size: 4);
+                CapabilitySet::V10_9 {
+                    flags: CapabilitiesV107Flags::from_bits_retain(cur.read_u32()),
+                }
+            }
             _ => return Ok(None),
         };
 
@@ -1716,6 +1753,10 @@ pub enum CapabilitySet {
     V10_6 { flags: CapabilitiesV104Flags },
     V10_6Err { flags: CapabilitiesV104Flags },
     V10_7 { flags: CapabilitiesV107Flags },
+    /// V10.8 / V10.9 reuse the V10.7 flag layout (SMALL_CACHE / AVC_DISABLED / …).
+    /// Advertised to satisfy gateways that gate AVC forwarding behind >= 108.
+    V10_8 { flags: CapabilitiesV107Flags },
+    V10_9 { flags: CapabilitiesV107Flags },
 }
 
 impl CapabilitySet {
@@ -1733,6 +1774,8 @@ impl CapabilitySet {
             CapabilitySet::V10_6 { .. } => CapabilityVersion::V10_6,
             CapabilitySet::V10_6Err { .. } => CapabilityVersion::V10_6_ERR,
             CapabilitySet::V10_7 { .. } => CapabilityVersion::V10_7,
+            CapabilitySet::V10_8 { .. } => CapabilityVersion::V10_8,
+            CapabilitySet::V10_9 { .. } => CapabilityVersion::V10_9,
         }
     }
 
@@ -1749,7 +1792,9 @@ impl CapabilitySet {
             | CapabilitySet::V10_5 { .. }
             | CapabilitySet::V10_6 { .. }
             | CapabilitySet::V10_6Err { .. }
-            | CapabilitySet::V10_7 { .. } => 4,
+            | CapabilitySet::V10_7 { .. }
+            | CapabilitySet::V10_8 { .. }
+            | CapabilitySet::V10_9 { .. } => 4,
         }
     }
 
@@ -1768,6 +1813,8 @@ impl CapabilitySet {
             CapabilitySet::V10_6 { flags } => dst.write_u32(flags.bits()),
             CapabilitySet::V10_6Err { flags } => dst.write_u32(flags.bits()),
             CapabilitySet::V10_7 { flags } => dst.write_u32(flags.bits()),
+            CapabilitySet::V10_8 { flags } => dst.write_u32(flags.bits()),
+            CapabilitySet::V10_9 { flags } => dst.write_u32(flags.bits()),
         }
         Ok(())
     }
@@ -1803,6 +1850,8 @@ impl CapabilityVersion {
     pub const V10_6: Self = Self(0xa_0600); // [MS-RDPEGFX-errata]
     pub const V10_6_ERR: Self = Self(0xa_0601); // defined similar to FreeRDP to maintain best compatibility
     pub const V10_7: Self = Self(0xa_0701);
+    pub const V10_8: Self = Self(0xa_0801);
+    pub const V10_9: Self = Self(0xa_0901);
 
     /// Returns `true` if this version matches one of the constants defined on
     /// `CapabilityVersion`, i.e. one this build knows how to decode into a
@@ -1822,6 +1871,8 @@ impl CapabilityVersion {
                 | Self::V10_6
                 | Self::V10_6_ERR
                 | Self::V10_7
+                | Self::V10_8
+                | Self::V10_9
         )
     }
 }
@@ -2243,5 +2294,372 @@ impl From<Codec2Type> for u16 {
     #[expect(clippy::as_conversions, reason = "repr(u16) enum discriminant")]
     fn from(value: Codec2Type) -> Self {
         value as u16
+    }
+}
+
+/// `RDPGFX_CMDID_PROTECT_SURFACE` (0x0019) — non-standard SecureBubble proxy extension.
+///
+/// Tells the client that the given surface must be treated as capture-protected
+/// (the native client maps this to `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`).
+/// The proxy emits it right after each `MapSurfaceTo{Output,ScaledOutput,Window,ScaledWindow}`
+/// when screen-capture protection is enabled for the session.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectSurfacePdu {
+    pub surface_id: u16,
+    /// Non-zero to enable protection (the proxy always sends `1`).
+    pub enable: u16,
+}
+
+impl ProtectSurfacePdu {
+    const NAME: &'static str = "ProtectSurfacePdu";
+
+    const FIXED_PART_SIZE: usize = 2 /* SurfaceId */ + 2 /* Enable */;
+}
+
+impl Encode for ProtectSurfacePdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+
+        dst.write_u16(self.surface_id);
+        dst.write_u16(self.enable);
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        Self::FIXED_PART_SIZE
+    }
+}
+
+impl<'a> Decode<'a> for ProtectSurfacePdu {
+    fn decode(src: &mut ReadCursor<'a>) -> DecodeResult<Self> {
+        ensure_fixed_part_size!(in: src);
+
+        let surface_id = src.read_u16();
+        let enable = src.read_u16();
+
+        Ok(Self { surface_id, enable })
+    }
+}
+
+/// `RDPGFX_CMDID_WATERMARK` (0x001A) — non-standard SecureBubble proxy extension.
+///
+/// Carries an ARGB8888 watermark bitmap (a QR code encoding the session id) that
+/// the client must keep drawn over the mapped output at the requested `opacity`.
+/// The proxy injects it after each `MapSurfaceTo{Output,ScaledOutput}` when
+/// watermarking is enabled for the session.
+///
+/// Wire layout (little-endian, after the 8-byte `RDPGFX_HEADER`), reconstructed
+/// from the proxy writer (`rdp-proxy/src/egfx.cpp::watermarkSurface`): a 39-byte
+/// fixed header then `img_size` image bytes. Several header words are constants
+/// whose exact semantics are unconfirmed against a live capture; they are
+/// preserved verbatim (`reserved_a`/`reserved_b`) rather than dropped, so a
+/// future renderer can use them once pinned. The image blob length is taken from
+/// the `img_size` field (bounded to `u16`), matching what the proxy actually
+/// frames — not derived from `width*height*4`, which avoids overflow on 32-bit
+/// (wasm) targets for hostile inputs.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, PartialEq, Eq)]
+pub struct WatermarkPdu {
+    pub surface_id: u16,
+    pub width: u16,
+    pub height: u16,
+    /// Pixel format byte; the proxy always sends `GFX_PIXEL_FORMAT_ARGB_8888` (0x21).
+    pub pixel_format: u8,
+    /// Blend opacity for the overlay (0..=0xFFFF as framed by the proxy).
+    pub opacity: u16,
+    /// Proxy emits constant `0x017E`; semantics unconfirmed (likely a tiling
+    /// cell/step). Preserved verbatim.
+    pub reserved_a: u16,
+    /// Proxy emits constant `0x00CD`; see [`Self::reserved_a`].
+    pub reserved_b: u16,
+    pub h_padding: u16,
+    pub v_padding: u16,
+    /// ARGB8888 pixels, top-down. Length is the framed `img_size`; it should equal
+    /// `width * height * 4` for well-formed input.
+    pub image: Vec<u8>,
+}
+
+impl fmt::Debug for WatermarkPdu {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WatermarkPdu")
+            .field("surface_id", &self.surface_id)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("pixel_format", &self.pixel_format)
+            .field("opacity", &self.opacity)
+            .field("reserved_a", &self.reserved_a)
+            .field("reserved_b", &self.reserved_b)
+            .field("h_padding", &self.h_padding)
+            .field("v_padding", &self.v_padding)
+            .field("image_len", &self.image.len())
+            .finish()
+    }
+}
+
+impl WatermarkPdu {
+    const NAME: &'static str = "WatermarkPdu";
+
+    const FIXED_PART_SIZE: usize = 2 /* SurfaceId */
+        + 2 /* Width */
+        + 2 /* Height */
+        + 6 /* reserved */
+        + 1 /* PixelFormat */
+        + 2 /* reserved */
+        + 2 /* Opacity */
+        + 2 /* reserved */
+        + 2 /* reserved_a */
+        + 2 /* reserved_b */
+        + 2 /* HPadding */
+        + 2 /* VPadding */
+        + 8 /* reserved */
+        + 2 /* ImgSize */
+        + 2 /* reserved */;
+}
+
+impl Encode for WatermarkPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+
+        let img_size: u16 = cast_length!("ImgSize", self.image.len())?;
+
+        dst.write_u16(self.surface_id);
+        dst.write_u16(self.width);
+        dst.write_u16(self.height);
+        write_padding!(dst, 6);
+        dst.write_u8(self.pixel_format);
+        write_padding!(dst, 2);
+        dst.write_u16(self.opacity);
+        write_padding!(dst, 2);
+        dst.write_u16(self.reserved_a);
+        dst.write_u16(self.reserved_b);
+        dst.write_u16(self.h_padding);
+        dst.write_u16(self.v_padding);
+        write_padding!(dst, 8);
+        dst.write_u16(img_size);
+        write_padding!(dst, 2);
+        dst.write_slice(&self.image);
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        Self::FIXED_PART_SIZE + self.image.len()
+    }
+}
+
+impl<'a> Decode<'a> for WatermarkPdu {
+    /// DELIBERATELY LENIENT: this decode does not fail on a malformed body.
+    ///
+    /// A watermark is a security control, so the session must fail CLOSED when one cannot be
+    /// applied. If this returned `Err`, the shared eGFX decode loop would log and drop the PDU, and
+    /// nothing downstream would ever learn a watermark had been mandated -- the session would
+    /// present clean, UNWATERMARKED pixels because a parse failed. That is the same evasion as
+    /// failing to render one, just reached a layer earlier.
+    ///
+    /// Rather than teach the shared loop about this proprietary extension, malformation is carried
+    /// FORWARD as data: a short body yields a short `image`, and a header too small to parse yields
+    /// `width == 0`. Both are caught by the single downstream check in the graphics handler, which
+    /// already blocks the session. One enforcement point, and the leniency stays inside the PDU
+    /// that needs it.
+    ///
+    /// The proxy's `imgSize` is a UINT16, so a tile over 65535 bytes wraps and arrives as a
+    /// self-consistent header with a short body. That case cannot be distinguished at the wire,
+    /// which is why the downstream length check is the authority.
+    fn decode(src: &mut ReadCursor<'a>) -> DecodeResult<Self> {
+        if src.len() < Self::FIXED_PART_SIZE {
+            // Too short to read the header at all. Report a zero-sized watermark rather than an
+            // error, so the requirement still reaches the handler and blocks the session.
+            src.advance(src.len());
+            return Ok(Self {
+                surface_id: 0,
+                width: 0,
+                height: 0,
+                pixel_format: 0,
+                opacity: 0,
+                reserved_a: 0,
+                reserved_b: 0,
+                h_padding: 0,
+                v_padding: 0,
+                image: Vec::new(),
+            });
+        }
+
+        let surface_id = src.read_u16();
+        let width = src.read_u16();
+        let height = src.read_u16();
+        read_padding!(src, 6);
+        let pixel_format = src.read_u8();
+        read_padding!(src, 2);
+        let opacity = src.read_u16();
+        read_padding!(src, 2);
+        let reserved_a = src.read_u16();
+        let reserved_b = src.read_u16();
+        let h_padding = src.read_u16();
+        let v_padding = src.read_u16();
+        read_padding!(src, 8);
+        let img_size = usize::from(src.read_u16());
+        read_padding!(src, 2);
+
+        // Take what is actually there. A short read is malformation to report downstream, not a
+        // parse error to drop -- see the note on this impl.
+        let available = img_size.min(src.len());
+        let image = src.read_slice(available).to_vec();
+
+        Ok(Self {
+            surface_id,
+            width,
+            height,
+            pixel_format,
+            opacity,
+            reserved_a,
+            reserved_b,
+            h_padding,
+            v_padding,
+            image,
+        })
+    }
+}
+
+#[cfg(test)]
+mod watermark_tests {
+    use ironrdp_core::{decode, encode_vec};
+
+    use super::*;
+
+    /// Build a `RDPGFX_CMDID_WATERMARK` PDU byte-for-byte the way the proxy
+    /// (`rdp-proxy/src/egfx.cpp::watermarkSurface`) frames it, so a decode failure
+    /// here means our field offsets drifted from the wire.
+    fn proxy_watermark_bytes(width: u16, height: u16, image: &[u8]) -> Vec<u8> {
+        let img_size = u16::try_from(image.len()).unwrap();
+        let pdu_len = 8u32 + 0x27 + u32::from(img_size);
+        let mut b = Vec::new();
+        // RDPGFX_HEADER
+        b.extend_from_slice(&0x001Au16.to_le_bytes()); // cmdId
+        b.extend_from_slice(&0u16.to_le_bytes()); // flags
+        b.extend_from_slice(&pdu_len.to_le_bytes()); // pduLength
+        // body (matches the proxy writer order exactly)
+        b.extend_from_slice(&7u16.to_le_bytes()); // surfaceId
+        b.extend_from_slice(&width.to_le_bytes());
+        b.extend_from_slice(&height.to_le_bytes());
+        b.extend_from_slice(&[0u8; 6]);
+        b.push(0x21); // GFX_PIXEL_FORMAT_ARGB_8888
+        b.extend_from_slice(&[0u8; 2]);
+        b.extend_from_slice(&0x0080u16.to_le_bytes()); // opacity
+        b.extend_from_slice(&[0u8; 2]);
+        b.extend_from_slice(&0x017Eu16.to_le_bytes());
+        b.extend_from_slice(&0x00CDu16.to_le_bytes());
+        b.extend_from_slice(&0x0089u16.to_le_bytes()); // hpadding
+        b.extend_from_slice(&0x0030u16.to_le_bytes()); // vpadding
+        b.extend_from_slice(&[0u8; 8]);
+        b.extend_from_slice(&img_size.to_le_bytes());
+        b.extend_from_slice(&[0u8; 2]);
+        b.extend_from_slice(image);
+        b
+    }
+
+    /// The proxy's `PROXY_WM_MALFORM=truncate`: an honest header (width/height/imgSize all declare
+    /// the true size) with only half the pixel body.
+    ///
+    /// It must DECODE, carrying the malformation forward as a short image, rather than erroring.
+    /// An error would be logged and dropped by the shared eGFX loop, and the session would present
+    /// clean UNWATERMARKED pixels because a parse failed -- the exact evasion the watermark exists
+    /// to prevent. The downstream `image.len() < w*h*4` check is what blocks it.
+    #[test]
+    fn watermark_with_a_truncated_body_decodes_short_rather_than_erroring() {
+        let full: Vec<u8> = (0..64u8).collect(); // 4x4 ARGB8888
+        let mut bytes = proxy_watermark_bytes(4, 4, &full);
+        // Keep the declared imgSize at 64, drop half the pixels off the end.
+        bytes.truncate(bytes.len() - 32);
+        let decoded = decode::<GfxPdu>(&bytes).expect("must decode so the malformation is REPORTED");
+        let GfxPdu::Watermark(pdu) = decoded else { panic!("wrong variant: {decoded:?}") };
+        assert_eq!((pdu.width, pdu.height), (4, 4), "the header is honest; only the body is short");
+        assert!(
+            pdu.image.len() < usize::from(pdu.width) * usize::from(pdu.height) * 4,
+            "a short body must surface as a short image for the downstream check to catch"
+        );
+    }
+
+    /// A watermark PDU too short to even contain its fixed header still decodes, as a zero-sized
+    /// watermark. Same reason: the requirement has to reach the handler to block the session.
+    #[test]
+    fn watermark_with_a_runt_header_decodes_as_zero_sized() {
+        let bytes = proxy_watermark_bytes(2, 2, &(0..16u8).collect::<Vec<u8>>());
+        // Keep the 8-byte RDPGFX header, cut the body to a few bytes.
+        let mut runt = bytes[..8 + 6].to_vec();
+        // pduLength must match what is actually on the wire or the outer framing rejects it first.
+        let len = u32::try_from(runt.len()).unwrap();
+        runt[4..8].copy_from_slice(&len.to_le_bytes());
+        let decoded = decode::<GfxPdu>(&runt).expect("must decode so the requirement is REPORTED");
+        let GfxPdu::Watermark(pdu) = decoded else { panic!("wrong variant: {decoded:?}") };
+        assert_eq!((pdu.width, pdu.height), (0, 0), "a runt header reports a zero-sized watermark");
+    }
+
+    /// The proxy's `PROXY_WM_MALFORM=overflow`: the authentic UINT16 landmine. width/height say
+    /// 155 (expected 155*155*4 = 96_100) while imgSize has WRAPPED to 96_100 & 0xFFFF = 30_564.
+    ///
+    /// This one DECODES cleanly -- the header is self-consistent -- so the wire layer cannot catch
+    /// it. It is caught downstream by comparing the image length against width*height*4, which is
+    /// why that check exists and why it must stay.
+    #[test]
+    fn watermark_with_a_wrapped_img_size_decodes_but_is_short() {
+        const W: u16 = 155;
+        let wrapped = (usize::from(W) * usize::from(W) * 4) & 0xFFFF;
+        assert_eq!(wrapped, 30_564, "the wrap this test is pinning");
+        let image = vec![0xABu8; wrapped];
+        let bytes = proxy_watermark_bytes(W, W, &image);
+        let decoded = decode::<GfxPdu>(&bytes).expect("a self-consistent header decodes");
+        let GfxPdu::Watermark(pdu) = decoded else { panic!("wrong variant: {decoded:?}") };
+        let expected = usize::from(pdu.width) * usize::from(pdu.height) * 4;
+        assert!(
+            pdu.image.len() < expected,
+            "the downstream length check is the ONLY thing standing between a wrapped imgSize and              an unwatermarked session"
+        );
+    }
+
+    #[test]
+    fn watermark_decodes_proxy_layout() {
+        let image: Vec<u8> = (0..16u8).collect(); // 2x2 ARGB8888
+        let bytes = proxy_watermark_bytes(2, 2, &image);
+        let pdu = decode::<GfxPdu>(&bytes).expect("decode watermark");
+        let GfxPdu::Watermark(w) = pdu else { panic!("wrong variant: {pdu:?}") };
+        assert_eq!(w.surface_id, 7);
+        assert_eq!((w.width, w.height), (2, 2));
+        assert_eq!(w.pixel_format, 0x21);
+        assert_eq!(w.opacity, 0x0080);
+        assert_eq!((w.reserved_a, w.reserved_b), (0x017E, 0x00CD));
+        assert_eq!((w.h_padding, w.v_padding), (0x0089, 0x0030));
+        assert_eq!(w.image, image);
+    }
+
+    #[test]
+    fn watermark_round_trips_bytes() {
+        let image: Vec<u8> = (0..64u8).collect(); // 4x4 ARGB8888
+        let bytes = proxy_watermark_bytes(4, 4, &image);
+        let pdu = decode::<GfxPdu>(&bytes).expect("decode");
+        let reencoded = encode_vec(&pdu).expect("encode");
+        assert_eq!(reencoded, bytes, "watermark PDU is not byte-stable");
+    }
+
+    #[test]
+    fn protect_surface_round_trips() {
+        let pdu = GfxPdu::ProtectSurface(ProtectSurfacePdu {
+            surface_id: 3,
+            enable: 1,
+        });
+        let bytes = encode_vec(&pdu).expect("encode");
+        // 8-byte header + 4-byte body
+        assert_eq!(bytes.len(), 12);
+        let decoded = decode::<GfxPdu>(&bytes).expect("decode");
+        assert_eq!(decoded, pdu);
     }
 }
