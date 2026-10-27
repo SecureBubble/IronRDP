@@ -585,6 +585,37 @@ fn dequantize_component_ccq(coefficients: &mut [i16], quant: &ComponentCodecQuan
     }
 }
 
+/// Base dequantization for reconstruction, as FreeRDP and mstsc decode real Windows streams:
+/// each band shifted left by `quant - 1`, the spec's `2^(quant - 6)` with a `2^5` precision factor
+/// kept through the inverse DWT and removed by [`ycbcr_x32_to_rgb`]. Dequantizing to `quant - 6`
+/// first rounds those 5 bits away and leaves every pixel about one level off.
+fn dequantize_component_ccq_x32(coefficients: &mut [i16], quant: &ComponentCodecQuant, use_reduce_extrapolate: bool) {
+    let bands = get_band_layout(use_reduce_extrapolate);
+
+    for (band_idx, band) in bands.iter().enumerate() {
+        let shift = quant.for_band(band_idx).saturating_sub(1);
+        if shift > 0 {
+            for coeff in &mut coefficients[band.offset..band.offset + band.count()] {
+                *coeff = clamp_i16(i32::from(*coeff) << i32::from(shift));
+            }
+        }
+    }
+}
+
+/// [`ycbcr_to_rgb`] for samples carrying the 32x scale of [`dequantize_component_ccq_x32`]:
+/// `>> 21` is the fixed-point `>> 16` and the `/ 32` together.
+fn ycbcr_x32_to_rgb(y: i16, cb: i16, cr: i16) -> [u8; 3] {
+    let y = i64::from(y) << 16;
+    let cb = i64::from(cb);
+    let cr = i64::from(cr);
+
+    let r = 128 + ((y + cr * 91881) >> 21);
+    let g = 128 + ((y - cb * 22554 - cr * 46802) >> 21);
+    let b = 128 + ((y + cb * 116130) >> 21);
+
+    [clamp_u8(r), clamp_u8(g), clamp_u8(b)]
+}
+
 // ---------------------------------------------------------------------------
 // Sign capture
 // ---------------------------------------------------------------------------
@@ -673,6 +704,8 @@ fn clamp_u8(value: i64) -> u8 {
 /// the fixed-point products overflow i32. Widening keeps the arithmetic
 /// exact for every input a tile can hold, and `clamp_u8` still bounds the
 /// result.
+// Reconstruction uses `ycbcr_x32_to_rgb`; the tests pin this unscaled form.
+#[cfg(test)]
 fn ycbcr_to_rgb(y: i16, cb: i16, cr: i16) -> [u8; 3] {
     let y = i64::from(y) + 128;
     let cb = i64::from(cb);
@@ -1016,9 +1049,9 @@ impl TileState {
         let mut temp = [0i16; COEFFICIENTS_PER_COMPONENT];
 
         // The progressive state remains in DecDwtQ form until all refinements are applied.
-        dequantize_component_ccq(&mut y_buf, &self.base_quant[0], self.use_reduce_extrapolate);
-        dequantize_component_ccq(&mut cb_buf, &self.base_quant[1], self.use_reduce_extrapolate);
-        dequantize_component_ccq(&mut cr_buf, &self.base_quant[2], self.use_reduce_extrapolate);
+        dequantize_component_ccq_x32(&mut y_buf, &self.base_quant[0], self.use_reduce_extrapolate);
+        dequantize_component_ccq_x32(&mut cb_buf, &self.base_quant[1], self.use_reduce_extrapolate);
+        dequantize_component_ccq_x32(&mut cr_buf, &self.base_quant[2], self.use_reduce_extrapolate);
 
         // Inverse DWT.
         if self.use_reduce_extrapolate {
@@ -1034,7 +1067,7 @@ impl TileState {
 
         // YCbCr to RGBA conversion.
         for i in 0..64 * 64 {
-            let [r, g, b] = ycbcr_to_rgb(y_buf[i], cb_buf[i], cr_buf[i]);
+            let [r, g, b] = ycbcr_x32_to_rgb(y_buf[i], cb_buf[i], cr_buf[i]);
             let off = i * 4;
             pixels[off] = r;
             pixels[off + 1] = g;
@@ -1453,11 +1486,13 @@ impl ProgressiveDecoder {
                         &mut region_clipping_work,
                         clipping_region.rectangles.len().saturating_add(1),
                     )?;
+                    // `Region` works on exclusive bounds (FreeRDP region16): an inclusive
+                    // conversion would empty a 1-pixel-high or -wide rectangle and drop it.
                     clipping_region.union_rectangle(InclusiveRectangle {
                         left,
                         top,
-                        right: right - 1,
-                        bottom: bottom - 1,
+                        right,
+                        bottom,
                     });
                 }
             }
@@ -1480,16 +1515,17 @@ impl ProgressiveDecoder {
                     .intersect_rectangle(&InclusiveRectangle {
                         left,
                         top,
-                        right: right - 1,
-                        bottom: bottom - 1,
+                        right,
+                        bottom,
                     })
                     .rectangles
                     .into_iter()
+                    .filter(|rectangle| rectangle.left < rectangle.right && rectangle.top < rectangle.bottom)
                     .map(|rectangle| ExclusiveRectangle {
                         left: rectangle.left,
                         top: rectangle.top,
-                        right: rectangle.right + 1,
-                        bottom: rectangle.bottom + 1,
+                        right: rectangle.right,
+                        bottom: rectangle.bottom,
                     })
                     .collect::<Vec<_>>();
                 if update_rectangles.is_empty() {
@@ -2331,6 +2367,60 @@ mod tests {
             Ok(_) => panic!("tile intersections must share the clipping work budget"),
         };
         assert!(error.to_string().contains("clipping work limit exceeded"));
+    }
+
+    #[test]
+    fn one_pixel_region_rectangles_are_painted() {
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ComponentCodecQuant, ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu,
+            ProgressiveFrameEndPdu, ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, TileSimple,
+            encode_progressive_stream,
+        };
+
+        // Windows sends REGION rectangles one pixel high (here row 20); every row of the tile
+        // must still be covered by its update rectangles.
+        let data = [0i16; 3].map(encode_full_quality_component);
+        let stream = encode_progressive_stream(&[
+            ProgressiveBlock::Sync(ProgressiveSyncPdu),
+            ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 0,
+                tile_size: 0x0040,
+                flags: 0,
+            }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }),
+            ProgressiveBlock::Region(ProgressiveRegion {
+                tile_size: 0x40,
+                rects: vec![rect(0, 0, 64, 20), rect(0, 20, 64, 1), rect(0, 21, 64, 43)],
+                quant_vals: vec![ComponentCodecQuant::LOSSLESS],
+                quant_prog_vals: vec![],
+                flags: 0,
+                tiles: vec![ProgressiveTile::Simple(TileSimple {
+                    quant_idx_y: 0,
+                    quant_idx_cb: 0,
+                    quant_idx_cr: 0,
+                    x_idx: 0,
+                    y_idx: 0,
+                    flags: 0,
+                    y_data: &data[0],
+                    cb_data: &data[1],
+                    cr_data: &data[2],
+                    tail_data: &[],
+                })],
+            }),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ])
+        .unwrap();
+
+        let tiles = ProgressiveDecoder::new().decode_bitmap(1, 0, 64, 64, &stream).unwrap();
+        let painted: u32 = tiles[0]
+            .update_rectangles
+            .iter()
+            .map(|r| u32::from(r.right - r.left) * u32::from(r.bottom - r.top))
+            .sum();
+        assert_eq!(painted, 64 * 64);
     }
 
     #[test]
