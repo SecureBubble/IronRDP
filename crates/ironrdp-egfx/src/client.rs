@@ -242,6 +242,25 @@ pub struct BitmapUpdate {
 // Handler Trait
 // ============================================================================
 
+/// An H.264 picture handed to an external decoder ([`GraphicsPipelineClient::with_external_avc`]).
+///
+/// For AVC444 / AVC444v2 only the main (YUV420) view is handed out.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct AvcFrame<'a> {
+    pub surface_id: u16,
+    /// The RDPGFX frame the picture belongs to; pass it to [`GraphicsPipelineClient::ack_frame`]
+    /// once the picture is decoded.
+    pub frame_id: u32,
+    pub codec_id: Codec1Type,
+    pub destination_rectangle: ExclusiveRectangle,
+    /// The H.264 bitstream of the (main) YUV420 view.
+    pub main_stream: &'a [u8],
+    /// The metablock's region rectangles (exclusive `right`/`bottom`): the parts of the
+    /// destination this picture updates.
+    pub regions: &'a [ExclusiveRectangle],
+}
+
 /// Handler trait for client-side EGFX events
 ///
 /// Implement this trait to receive decoded bitmap data and surface
@@ -416,6 +435,10 @@ pub trait GraphicsPipelineHandler: Send {
     ///
     /// This is a catch-all for any GfxPdu variant not matched above.
     fn on_unhandled_pdu(&mut self, _pdu: &GfxPdu) {}
+
+    /// Called with each H.264 picture when the client was built
+    /// [`with_external_avc`](GraphicsPipelineClient::with_external_avc).
+    fn on_avc_frame(&mut self, _frame: &AvcFrame<'_>) {}
 }
 
 // ============================================================================
@@ -482,7 +505,23 @@ pub struct GraphicsPipelineClient {
     cache_import_attempted: bool,
     /// Keys of the last `CacheImportOffer`, in offer order, until its reply arrives.
     offered_cache_keys: Option<Vec<u64>>,
+
+    /// H.264 goes to the handler's `on_avc_frame` instead of a decoder in this client.
+    external_avc: bool,
+    /// Every frame waits for `ack_frame`, not only frames with H.264 in them.
+    defer_all_acks: bool,
+    /// The current frame handed H.264 out, so its acknowledgement waits for `ack_frame`.
+    current_frame_deferred: bool,
+    /// Frames ended but not yet acknowledged, by frame id: `(total_frames_decoded, ready)`.
+    pending_acks: BTreeMap<u32, (u32, bool)>,
+    /// Highest frame id and `totalFramesDecoded` acknowledged so far.
+    max_acked_frame_id: u32,
+    max_acked_total: u32,
 }
+
+/// Frames held for `ack_frame` beyond this are dropped, oldest first, so a decoder that stops
+/// reporting cannot grow the backlog without bound.
+const MAX_DEFERRED_ACKS: usize = 64;
 
 impl GraphicsPipelineClient {
     /// Create a new `GraphicsPipelineClient`
@@ -515,7 +554,108 @@ impl GraphicsPipelineClient {
             persistent_cache: None,
             cache_import_attempted: false,
             offered_cache_keys: None,
+            external_avc: false,
+            defer_all_acks: false,
+            current_frame_deferred: false,
+            pending_acks: BTreeMap::new(),
+            max_acked_frame_id: 0,
+            max_acked_total: 0,
         }
+    }
+
+    /// Hands H.264 (AVC420, and the main view of AVC444) to
+    /// [`GraphicsPipelineHandler::on_avc_frame`] instead of decoding it here, for a decoder that
+    /// finishes later (a browser's). A frame with H.264 in it is acknowledged when
+    /// [`ack_frame`](Self::ack_frame) reports it decoded, which paces the server to that decoder.
+    #[must_use]
+    pub fn with_external_avc(mut self) -> Self {
+        self.external_avc = true;
+        self
+    }
+
+    /// Makes every frame wait for [`ack_frame`](Self::ack_frame), e.g. when the picture is shown
+    /// on another machine that reports back.
+    #[must_use]
+    pub fn defer_all_acks(mut self, enable: bool) -> Self {
+        self.defer_all_acks = enable;
+        self
+    }
+
+    /// Reports `frame_id` decoded (or shown) and returns the acknowledgements this releases.
+    ///
+    /// Frames are acknowledged in frame-id order. A frame below one already acknowledged (another
+    /// surface's decoder finishing late) is dropped silently: the server's count already covers it.
+    pub fn ack_frame(&mut self, frame_id: u32) -> Vec<DvcMessage> {
+        match self.pending_acks.get_mut(&frame_id) {
+            Some(entry) => entry.1 = true,
+            None => return Vec::new(),
+        }
+        self.flush_ready_acks()
+    }
+
+    fn flush_ready_acks(&mut self) -> Vec<DvcMessage> {
+        let ready: Vec<(u32, u32)> = self
+            .pending_acks
+            .iter()
+            .filter(|(_, (_, ready))| *ready)
+            .map(|(&id, &(total, _))| (id, total))
+            .collect();
+        let mut out = Vec::new();
+        for (frame_id, total) in ready {
+            self.pending_acks.remove(&frame_id);
+            if frame_id > self.max_acked_frame_id {
+                self.max_acked_frame_id = frame_id;
+                self.max_acked_total = total.max(self.max_acked_total);
+                out.push(self.frame_ack(frame_id, self.max_acked_total));
+            }
+        }
+        while self.pending_acks.len() > MAX_DEFERRED_ACKS {
+            let Some((&oldest, _)) = self.pending_acks.iter().next() else {
+                break;
+            };
+            warn!(
+                oldest,
+                "Dropping a frame acknowledgement that was never reported decoded"
+            );
+            self.pending_acks.remove(&oldest);
+        }
+        out
+    }
+
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "pending_acks is bounded by MAX_DEFERRED_ACKS"
+    )]
+    fn frame_ack(&self, frame_id: u32, total_frames_decoded: u32) -> DvcMessage {
+        trace!(frame_id, pending = self.pending_acks.len(), "Sending FrameAcknowledge");
+        // The frames still waiting for their decoder are the client's backlog.
+        Box::new(GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+            queue_depth: QueueDepth::from_u32(self.pending_acks.len() as u32),
+            frame_id,
+            total_frames_decoded,
+        }))
+    }
+
+    fn hand_out_avc(&mut self, pdu: &crate::pdu::WireToSurface1Pdu) -> PduResult<()> {
+        let mut cursor = ReadCursor::new(&pdu.bitmap_data);
+        let stream = if pdu.codec_id == Codec1Type::Avc420 {
+            Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?
+        } else {
+            Avc444BitmapStream::decode(&mut cursor)
+                .map_err(|e| decode_err!(e))?
+                .stream1
+        };
+        self.current_frame_deferred = true;
+        self.handler.on_avc_frame(&AvcFrame {
+            surface_id: pdu.surface_id,
+            frame_id: self.current_frame_id.unwrap_or(0),
+            codec_id: pdu.codec_id,
+            destination_rectangle: pdu.destination_rectangle.clone(),
+            main_stream: stream.data,
+            regions: &stream.rectangles,
+        });
+        Ok(())
     }
 
     /// Keep the bitmap cache across sessions in `store` ([MS-RDPEGFX] [3.3.1.5]).
@@ -925,6 +1065,11 @@ impl GraphicsPipelineClient {
         // per spec, capabilities are negotiated via CapabilitiesConfirm before
         // ResetGraphics, and a ResetGraphics does not re-negotiate capabilities.
         self.current_frame_id = None;
+        // Held acknowledgements belong to the old stream, and its frame ids may restart; the
+        // `totalFramesDecoded` high-water keeps counting so it never goes backwards.
+        self.current_frame_deferred = false;
+        self.pending_acks.clear();
+        self.max_acked_frame_id = 0;
 
         // Reset decoder state for new stream
         if let Some(ref mut decoder) = self.h264_decoder {
@@ -1088,6 +1233,17 @@ impl GraphicsPipelineClient {
             );
         }
 
+        if self.external_avc
+            && matches!(
+                pdu.codec_id,
+                Codec1Type::Avc420 | Codec1Type::Avc444 | Codec1Type::Avc444v2
+            )
+        {
+            if let Err(error) = self.hand_out_avc(&pdu) {
+                self.drop_update(pdu.codec_id, pdu.surface_id, pdu.bitmap_data.len(), &error);
+            }
+            return Ok(());
+        }
         let result = match pdu.codec_id {
             Codec1Type::Avc420 => self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data),
             Codec1Type::ClearCodec => {
@@ -1938,11 +2094,21 @@ impl GraphicsPipelineClient {
         // Per [3.3.5.12]: client MUST send FrameAcknowledge after EndFrame.
         // QueueDepth counts queued bytes, not decoded/queued frames. This client
         // does not measure queued bytes, so report Unavailable (not Suspend).
+        let deferred = core::mem::take(&mut self.current_frame_deferred) || self.defer_all_acks;
+        if deferred || !self.pending_acks.is_empty() {
+            // Held until its decoder reports it; acknowledgements only move forward in frame id.
+            self.pending_acks
+                .insert(frame_id, (self.total_frames_decoded, !deferred));
+            return Ok(self.flush_ready_acks());
+        }
+
         let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
             queue_depth: QueueDepth::Unavailable,
             frame_id,
             total_frames_decoded: self.total_frames_decoded,
         });
+        self.max_acked_frame_id = frame_id;
+        self.max_acked_total = self.total_frames_decoded;
 
         trace!(frame_id, "Sending FrameAcknowledge");
         Ok(vec![Box::new(ack) as DvcMessage])
@@ -1966,11 +2132,12 @@ impl DvcProcessor for GraphicsPipelineClient {
 
         // Keep only the sets this client can honor: AVC420 needs a decoder, and AVC444
         // needs one returning the YUV planes the two views are combined from.
-        let avc420 = self.h264_decoder.is_some();
-        let avc444 = self
-            .h264_decoder
-            .as_ref()
-            .is_some_and(|decoder| decoder.supports_yuv420());
+        let avc420 = self.external_avc || self.h264_decoder.is_some();
+        let avc444 = self.external_avc
+            || self
+                .h264_decoder
+                .as_ref()
+                .is_some_and(|decoder| decoder.supports_yuv420());
         let mut caps: Vec<CapabilitySet> = self
             .handler
             .capabilities()
@@ -3699,5 +3866,139 @@ mod tests {
         assert_eq!(ack.frame_id, 7);
         assert_eq!(ack.total_frames_decoded, 4);
         assert_eq!(ack.queue_depth, QueueDepth::Unavailable);
+    }
+
+    struct AvcRecorder(Arc<Mutex<Vec<(u16, u32)>>>);
+    impl GraphicsPipelineHandler for AvcRecorder {
+        fn on_avc_frame(&mut self, frame: &AvcFrame<'_>) {
+            self.0.lock().unwrap().push((frame.surface_id, frame.frame_id));
+        }
+    }
+
+    fn external_avc_client() -> (GraphicsPipelineClient, Arc<Mutex<Vec<(u16, u32)>>>) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let mut client =
+            GraphicsPipelineClient::new(Box::new(AvcRecorder(Arc::clone(&frames))), None).with_external_avc();
+        for surface_id in [1, 2] {
+            let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id,
+                width: 64,
+                height: 64,
+                pixel_format: PixelFormat::XRgb,
+            }));
+        }
+        (client, frames)
+    }
+
+    fn avc420(client: &mut GraphicsPipelineClient, surface_id: u16) {
+        let bitmap_data = crate::pdu::encode_avc420_bitmap_stream(
+            &[crate::pdu::Avc420Region::full_frame(64, 64, 22)],
+            &[0, 0, 0, 1, 0x65, 0x88],
+        );
+        client
+            .handle_pdu(GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
+                surface_id,
+                codec_id: Codec1Type::Avc420,
+                pixel_format: PixelFormat::XRgb,
+                destination_rectangle: ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 64,
+                    bottom: 64,
+                },
+                bitmap_data,
+            }))
+            .unwrap();
+    }
+
+    fn acked_frames(messages: &[DvcMessage]) -> Vec<u32> {
+        messages
+            .iter()
+            .map(|message| {
+                let bytes = ironrdp_core::encode_vec(message.as_ref()).unwrap();
+                let GfxPdu::FrameAcknowledge(ack) = ironrdp_core::decode::<GfxPdu>(&bytes).unwrap() else {
+                    panic!("expected frame ack")
+                };
+                ack.frame_id
+            })
+            .collect()
+    }
+
+    #[test]
+    fn external_avc_frame_is_acknowledged_once_decoded() {
+        let (mut client, frames) = external_avc_client();
+        start_frame(&mut client, 1);
+        avc420(&mut client, 1);
+        let at_end = client.handle_end_frame(1).unwrap();
+        assert!(at_end.is_empty(), "the ack waits for the decoder");
+        assert_eq!(*frames.lock().unwrap(), [(1, 1)]);
+        assert_eq!(acked_frames(&client.ack_frame(1)), [1]);
+        assert!(client.ack_frame(1).is_empty(), "a frame is acknowledged once");
+    }
+
+    #[test]
+    fn a_ready_frame_does_not_wait_for_an_earlier_pending_one() {
+        let (mut client, _) = external_avc_client();
+        start_frame(&mut client, 1);
+        avc420(&mut client, 1);
+        assert!(client.handle_end_frame(1).unwrap().is_empty());
+        start_frame(&mut client, 2);
+        assert_eq!(acked_frames(&client.handle_end_frame(2).unwrap()), [2]);
+        assert!(
+            client.ack_frame(1).is_empty(),
+            "frame 2's acknowledgement already covers frame 1"
+        );
+    }
+
+    #[test]
+    fn a_late_frame_below_the_acknowledged_one_is_dropped() {
+        let (mut client, _) = external_avc_client();
+        for frame_id in [1, 2] {
+            start_frame(&mut client, frame_id);
+            avc420(&mut client, u16::try_from(frame_id).unwrap());
+            assert!(client.handle_end_frame(frame_id).unwrap().is_empty());
+        }
+        assert_eq!(acked_frames(&client.ack_frame(2)), [2]);
+        assert!(
+            client.ack_frame(1).is_empty(),
+            "already covered by frame 2's acknowledgement"
+        );
+    }
+
+    #[test]
+    fn external_avc_keeps_the_avc_capability_sets() {
+        let (mut client, _) = external_avc_client();
+        let messages = client.start(0).unwrap();
+        let bytes = ironrdp_core::encode_vec(messages[0].as_ref()).unwrap();
+        let GfxPdu::CapabilitiesAdvertise(advertise) = ironrdp_core::decode::<GfxPdu>(&bytes).unwrap() else {
+            panic!("expected a capabilities advertisement")
+        };
+        assert!(
+            advertise
+                .0
+                .iter()
+                .filter_map(|raw| raw.parsed().unwrap())
+                .any(|cap| CodecCapabilities::from_capability_set(&cap).avc444)
+        );
+    }
+
+    #[test]
+    fn graphics_reset_drops_held_acknowledgements() {
+        let (mut client, _) = external_avc_client();
+        start_frame(&mut client, 5);
+        avc420(&mut client, 1);
+        assert!(client.handle_end_frame(5).unwrap().is_empty());
+        let _ = client.handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+            width: 64,
+            height: 64,
+            monitors: Vec::new(),
+        }));
+        assert!(client.ack_frame(5).is_empty());
+        start_frame(&mut client, 1);
+        assert_eq!(
+            acked_frames(&client.handle_end_frame(1).unwrap()),
+            [1],
+            "the new stream's ids start over"
+        );
     }
 }
