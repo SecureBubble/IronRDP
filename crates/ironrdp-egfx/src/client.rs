@@ -318,6 +318,13 @@ pub trait GraphicsPipelineHandler: Send {
     /// Called when the server confirms negotiated capabilities
     fn on_capabilities_confirmed(&mut self, _caps: &CapabilitySet) {}
 
+    /// Capability sets to advertise exactly as given, instead of [`capabilities`](Self::capabilities):
+    /// for versions without a typed form here (e.g. V11.x) or a client whose advertisement must
+    /// match another client's byte for byte. They are not filtered by what this client can decode.
+    fn raw_capabilities(&self) -> Option<Vec<RawCapabilitySet>> {
+        None
+    }
+
     /// Called when the server resets the graphics output buffer
     fn on_reset_graphics(&mut self, _width: u32, _height: u32) {}
 
@@ -2150,6 +2157,13 @@ impl DvcProcessor for GraphicsPipelineClient {
         {
             warn!("The H.264 decoder is unavailable; advertising no AVC capability set");
             self.h264_decoder = None;
+        }
+
+        if let Some(raw) = self.handler.raw_capabilities() {
+            debug!(count = raw.len(), "Advertising the handler's EGFX capability sets");
+            let pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu(raw));
+            #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
+            return Ok(vec![Box::new(pdu) as DvcMessage]);
         }
 
         // Keep only the sets this client can honor: AVC420 needs a decoder, and AVC444
@@ -4105,5 +4119,32 @@ mod tests {
         assert_eq!(log.bitmaps, 1);
         assert_eq!(log.alpha, [alpha]);
         assert!(client.drain_output().is_empty());
+    }
+
+    struct RawCapsHandler;
+    impl GraphicsPipelineHandler for RawCapsHandler {
+        fn raw_capabilities(&self) -> Option<Vec<RawCapabilitySet>> {
+            Some(vec![RawCapabilitySet::new(
+                crate::pdu::CapabilityVersion(0x000b_0101),
+                0u32.to_le_bytes().to_vec(),
+            )])
+        }
+    }
+
+    #[test]
+    fn raw_capabilities_are_advertised_as_given() {
+        let mut client = GraphicsPipelineClient::new(Box::new(RawCapsHandler), None);
+        let messages = client.start(0).unwrap();
+        let bytes = ironrdp_core::encode_vec(messages[0].as_ref()).unwrap();
+        let GfxPdu::CapabilitiesAdvertise(advertise) = ironrdp_core::decode::<GfxPdu>(&bytes).unwrap() else {
+            panic!("expected a capabilities advertisement")
+        };
+        assert_eq!(
+            advertise.0,
+            [RawCapabilitySet::new(
+                crate::pdu::CapabilityVersion(0x000b_0101),
+                0u32.to_le_bytes().to_vec()
+            )]
+        );
     }
 }
