@@ -522,6 +522,10 @@ pub struct GraphicsPipelineClient {
     external_avc: bool,
     /// The handler composites: the client keeps no surface copies and hands ALPHA over undecoded.
     handler_composites: bool,
+    /// Sees every segment as received (see `with_segment_tap`).
+    segment_tap: Option<Box<dyn FnMut(&[u8]) + Send>>,
+    /// Decode bitmaps into pixels; off when another machine renders the tapped stream.
+    decode_pixels: bool,
     /// Every frame waits for `ack_frame`, not only frames with H.264 in them.
     defer_all_acks: bool,
     /// The current frame handed H.264 out, so its acknowledgement waits for `ack_frame`.
@@ -570,6 +574,8 @@ impl GraphicsPipelineClient {
             offered_cache_keys: None,
             external_avc: false,
             handler_composites: false,
+            segment_tap: None,
+            decode_pixels: true,
             defer_all_acks: false,
             current_frame_deferred: false,
             pending_acks: BTreeMap::new(),
@@ -595,6 +601,24 @@ impl GraphicsPipelineClient {
     pub fn with_handler_compositing(mut self) -> Self {
         self.handler_composites = true;
         self.compositor.disable();
+        self
+    }
+
+    /// Calls `tap` with every segment of the channel as received (still ZGFX-compressed), e.g. to
+    /// render the stream on another machine, which feeds them in order from the first one (ZGFX
+    /// keeps history across segments) to its own client. Processing here is unchanged.
+    #[must_use]
+    pub fn with_segment_tap(mut self, tap: impl FnMut(&[u8]) + Send + 'static) -> Self {
+        self.segment_tap = Some(Box::new(tap));
+        self
+    }
+
+    /// Whether bitmaps are decoded into pixels (default `true`). Off when the tapped stream is
+    /// rendered elsewhere: every PDU is still parsed and every frame acknowledged, but no pixels
+    /// are made that nobody would see. H.264 handed out by `with_external_avc` still is.
+    #[must_use]
+    pub fn decode_pixels(mut self, enable: bool) -> Self {
+        self.decode_pixels = enable;
         self
     }
 
@@ -1269,6 +1293,10 @@ impl GraphicsPipelineClient {
             }
             return Ok(());
         }
+        if !self.decode_pixels {
+            trace!(codec_id = ?pdu.codec_id, "WireToSurface1 not decoded");
+            return Ok(());
+        }
         let result = match pdu.codec_id {
             Codec1Type::Avc420 => self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data),
             Codec1Type::ClearCodec => {
@@ -1304,6 +1332,10 @@ impl GraphicsPipelineClient {
     /// Decode RemoteFX Progressive bitmap data, applying each decoded tile to the
     /// persistent surface before delivering the same RGBA update to the handler.
     fn handle_wire_to_surface2(&mut self, pdu: WireToSurface2Pdu) -> PduResult<()> {
+        if !self.decode_pixels {
+            trace!(surface_id = pdu.surface_id, "WireToSurface2 not decoded");
+            return Ok(());
+        }
         let surface = self
             .surfaces
             .get(&pdu.surface_id)
@@ -2209,6 +2241,9 @@ impl DvcProcessor for GraphicsPipelineClient {
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
         if self.state == ClientState::Closed {
             return Err(pdu_other_err!("graphics channel is closed; recreate the channel"));
+        }
+        if let Some(tap) = &mut self.segment_tap {
+            tap(payload);
         }
         self.process_messages(payload).inspect_err(|_| {
             if self.state == ClientState::Resetting {
@@ -4146,5 +4181,73 @@ mod tests {
                 0u32.to_le_bytes().to_vec()
             )]
         );
+    }
+
+    #[test]
+    fn tapped_parse_only_client_acknowledges_without_making_pixels() {
+        use crate::pdu::{CapabilitiesConfirmPdu, CreateSurfacePdu};
+
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let tapped = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let tap = Arc::clone(&tapped);
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(CapturingHandler {
+                updates: Arc::clone(&updates),
+                unhandled: Arc::new(Mutex::new(0)),
+            }),
+            None,
+        )
+        .with_segment_tap(move |segment| tap.lock().unwrap().push(segment.to_vec()))
+        .decode_pixels(false);
+
+        let rect = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 2,
+            bottom: 1,
+        };
+        let pdus = [
+            GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::empty(),
+            })),
+            GfxPdu::CreateSurface(CreateSurfacePdu {
+                surface_id: 1,
+                width: 2,
+                height: 1,
+                pixel_format: PixelFormat::XRgb,
+            }),
+            GfxPdu::StartFrame(crate::pdu::StartFramePdu {
+                timestamp: crate::pdu::Timestamp {
+                    milliseconds: 0,
+                    seconds: 0,
+                    minutes: 0,
+                    hours: 0,
+                },
+                frame_id: 9,
+            }),
+            GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
+                surface_id: 1,
+                codec_id: Codec1Type::Uncompressed,
+                pixel_format: PixelFormat::XRgb,
+                destination_rectangle: rect,
+                bitmap_data: vec![0; 8],
+            }),
+            GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 9 }),
+        ];
+        let mut sent = Vec::new();
+        let mut acks = Vec::new();
+        for pdu in &pdus {
+            let segment = zgfx::wrap_uncompressed(&ironrdp_core::encode_vec(pdu).unwrap());
+            acks.extend(client.process(0, &segment).unwrap());
+            sent.push(segment);
+        }
+
+        assert_eq!(*tapped.lock().unwrap(), sent, "the tap sees every segment as received");
+        assert!(updates.lock().unwrap().is_empty(), "no pixels are made");
+        let bytes = ironrdp_core::encode_vec(acks.last().unwrap().as_ref()).unwrap();
+        let GfxPdu::FrameAcknowledge(ack) = ironrdp_core::decode::<GfxPdu>(&bytes).unwrap() else {
+            panic!("expected frame ack")
+        };
+        assert_eq!(ack.frame_id, 9);
     }
 }
