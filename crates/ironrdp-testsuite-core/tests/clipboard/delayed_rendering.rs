@@ -155,6 +155,14 @@ fn initiate_copy_api() {
 
     let formats = vec![ClipboardFormat::new(ClipboardFormatId::new(13))]; // CF_UNICODETEXT
 
+    // Before the server's Monitor Ready a copy sends nothing ([MS-RDPECLIP] 1.3.2.1): a server
+    // that opens the channel late would drop it, and Monitor Ready asks for the list again.
+    let early: Vec<_> = cliprdr.initiate_copy(&formats).unwrap().into();
+    assert!(early.is_empty(), "Should send nothing before Monitor Ready");
+
+    let monitor_bytes = ironrdp_core::encode_vec(&ClipboardPdu::MonitorReady).unwrap();
+    cliprdr.process(&monitor_bytes).unwrap();
+
     // Initiate copy - should send initialization PDUs + FormatList on first call
     let result = cliprdr.initiate_copy(&formats);
     assert!(result.is_ok(), "Should successfully initiate copy");

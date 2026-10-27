@@ -421,6 +421,9 @@ pub struct Cliprdr<R: Role> {
     backend: Box<dyn CliprdrBackend>,
     capabilities: Capabilities,
     state: CliprdrState,
+    /// The server sent Monitor Ready. A client says nothing on the channel before it ([MS-RDPECLIP]
+    /// 1.3.2.1): a server may open the channel late, e.g. after an MFA prompt, and drop earlier PDUs.
+    monitor_ready: bool,
 
     /// Format IDs of the sent FormatDataRequests not yet answered, oldest
     /// first. A FormatDataResponse names no format, but [MS-RDPECLIP] requires
@@ -607,6 +610,7 @@ impl<R: Role> Cliprdr<R> {
         Self {
             backend,
             state: CliprdrState::Initialization,
+            monitor_ready: false,
             capabilities: Capabilities::new(ClipboardProtocolVersion::V2, flags),
             pending_format_data_requests: VecDeque::new(),
             local_file_list: None,
@@ -696,6 +700,7 @@ impl<R: Role> Cliprdr<R> {
         // regardless of whether the backend responds synchronously or
         // asynchronously, because `process()` for the Capabilities PDU
         // completes before `process()` for Monitor Ready begins.
+        self.monitor_ready = true;
         self.backend.on_request_format_list();
         Ok(Vec::new())
     }
@@ -748,7 +753,17 @@ impl<R: Role> Cliprdr<R> {
     }
 
     fn handle_format_list(&mut self, format_list: FormatList<'_>) -> PduResult<Vec<SvcMessage>> {
-        if R::is_server() && self.state == CliprdrState::Initialization {
+        // Receiving a Format List means the peer's clipboard channel is live and
+        // advertising formats, so the channel is operational for both roles. The
+        // client role must transition here too, not only the server: otherwise a
+        // client whose own initial (often empty) Format List was never cleanly
+        // acknowledged with a Format List Response stays stuck in Initialization
+        // forever. Every initiate_paste / request_file_contents is `require_ready`
+        // gated, so a file copied on the remote produces *nothing* until the user
+        // performs a local copy (which finally earns a Format List Response and flips
+        // the state). Transitioning on the inbound Format List makes the first remote
+        // copy work without that local-copy dance.
+        if self.state == CliprdrState::Initialization {
             debug!("Clipboard virtual channel initialized");
             self.state = CliprdrState::Ready;
             self.backend.on_ready();
@@ -922,6 +937,11 @@ impl<R: Role> Cliprdr<R> {
                         self.build_format_list(available_formats).map_err(|e| encode_err!(e))?,
                     ));
                 }
+                CliprdrState::Initialization if !R::is_server() && !self.monitor_ready => {
+                    // A local copy before the server is ready: Monitor Ready asks for the format
+                    // list again, so there is nothing to send yet.
+                    debug!("Local copy before Monitor Ready; the format list goes after it");
+                }
                 CliprdrState::Initialization => {
                     // During initialization state, first copy action is synthetic and should be sent along with
                     // capabilities and temporary directory PDUs.
@@ -930,8 +950,24 @@ impl<R: Role> Cliprdr<R> {
                         ClientTemporaryDirectory::new(self.backend.temporary_directory())
                             .map_err(|e| encode_err!(e))?,
                     ));
+                    // The synthetic init advertise must NOT be empty. On a browser client the
+                    // local clipboard is frequently empty/unreadable at connect time (no user
+                    // gesture yet), which would send an empty Format List. A terminating proxy
+                    // can special-case an empty init list ("forcing standard text formats to
+                    // prevent protocol hang") and never return a clean Format List Response, so
+                    // the client never reaches Ready and the server never forwards remote
+                    // clipboard changes -- a file copied on the remote then produces NOTHING
+                    // until the user performs a local copy (which finally advertises a non-empty
+                    // list). Advertise CF_UNICODETEXT as a floor so initialization always
+                    // completes cleanly, matching what a native client sends.
+                    let default_format = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+                    let init_formats = if available_formats.is_empty() {
+                        &default_format[..]
+                    } else {
+                        available_formats
+                    };
                     pdus.push(ClipboardPdu::FormatList(
-                        self.build_format_list(available_formats).map_err(|e| encode_err!(e))?,
+                        self.build_format_list(init_formats).map_err(|e| encode_err!(e))?,
                     ));
                 }
             }
