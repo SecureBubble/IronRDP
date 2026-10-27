@@ -270,6 +270,13 @@ impl Processor {
         } else if self.message_channel_id == Some(channel_id) {
             self.process_message_channel(data_ctx, received_at)
         } else {
+            // Take upstream's chunk-size-aware SVC dispatch, but keep our LIBERAL fallback for
+            // an unknown/unjoined channel instead of erroring out.
+            //
+            // Upstream tears the session down on an unexpected channel id. mstsc does not, and
+            // neither can we: the Bubble proxy emits stray channel-0 Send Data Indications very
+            // frequently, and treating those as fatal kills the session. Logged at debug! (not
+            // warn!) because at warn! the volume floods and freezes the browser console.
             // SVC data has no RDP Security Header (Enhanced RDP Security, or Standard RDP
             // Security at ENCRYPTION_LEVEL_NONE): include TPKT/X224/MCS.
             self.record_bandwidth_bytes(frame.len());
@@ -285,7 +292,8 @@ impl Processor {
                 )
                 .map(|data| vec![ProcessorOutput::ResponseFrame(data)])
             } else {
-                Err(reason_err!("X224", "unexpected channel received: ID {channel_id}"))
+                debug!(channel_id, "Ignoring data for an unexpected/unjoined channel");
+                Ok(Vec::new())
             }
         }
     }
