@@ -136,6 +136,11 @@ pub struct Processor {
     pointer_software_rendering: bool,
     /// Current 8bpp color palette. Updated by Palette fast-path updates.
     palette: Palette,
+    /// Raw drawing-order updates (`numberOrders` + order list) received since the
+    /// last drain. Held undecoded so a consumer can extract RAIL Window List
+    /// orders via `ironrdp-rdperp` without coupling the session to it. Drained by
+    /// [`Processor::take_orders`].
+    pending_orders: Vec<Vec<u8>>,
     /// A malformed bitmap was discarded and the client should request a complete visual recovery.
     ///
     /// Only one request is issued per activation to prevent a malformed server stream from
@@ -149,6 +154,13 @@ pub struct Processor {
 impl Processor {
     pub fn update_mouse_pos(&mut self, x: u16, y: u16) {
         self.mouse_pos_update = Some((x, y));
+    }
+
+    /// Drain the raw drawing-order updates received since the last call. Each
+    /// entry is a fast-path `Orders` update body (`numberOrders` + order list),
+    /// ready to be decoded by a Window List consumer (`ironrdp-rdperp`).
+    pub fn take_orders(&mut self) -> Vec<Vec<u8>> {
+        core::mem::take(&mut self.pending_orders)
     }
 
     /// Returns whether a malformed visual update requires a one-time full redraw request.
@@ -251,10 +263,6 @@ impl Processor {
         let update = FastPathUpdate::decode_with_code(data.as_slice(), attributes.update_code);
 
         match update {
-            Ok(FastPathUpdate::Orders(orders)) => {
-                trace!("Received Fast-Path Orders update");
-                processor_updates.push(UpdateKind::Orders(orders.to_vec()));
-            }
             Ok(FastPathUpdate::SurfaceCommands(surface_commands)) => {
                 trace!("Received Surface Commands: {} pieces", surface_commands.len());
                 let update_region = self.process_surface_commands(image, output, surface_commands)?;
@@ -272,6 +280,14 @@ impl Processor {
             Ok(FastPathUpdate::Palette(palette_data)) => {
                 trace!("Received palette update");
                 self.process_palette_update(palette_data);
+            }
+            Ok(FastPathUpdate::Orders(orders)) => {
+                trace!(len = orders.len(), "Received drawing-order update");
+                // Queue for `take_orders()`, which the web client drains to decode RAIL Window
+                // List orders through `ironrdp-rdperp` into typed geometry. Not also emitted as
+                // `UpdateKind::Orders`: nothing consumes that, and its support-level validation
+                // can end the session on a level it does not recognise.
+                self.pending_orders.push(orders.to_vec());
             }
             Err(e) => {
                 // FIXME: This seems to be a way of special-handling the error case in FastPathUpdate::decode_cursor_with_code
@@ -890,6 +906,7 @@ impl ProcessorBuilder {
             enable_server_pointer: self.enable_server_pointer,
             pointer_software_rendering: self.pointer_software_rendering,
             palette: Palette::system_default(),
+            pending_orders: Vec::new(),
             bitmap_recovery_requested: false,
             bitmap_recovery_pending: false,
             #[cfg(feature = "qoiz")]

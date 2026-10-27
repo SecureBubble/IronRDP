@@ -123,6 +123,12 @@ impl ActiveStage {
         self.fast_path_processor.update_mouse_pos(x, y);
     }
 
+    /// Drains the fast-path drawing-order updates received since the last call, undecoded
+    /// (`numberOrders` and the order list), e.g. for the client to read RemoteApp Window List orders.
+    pub fn take_rail_orders(&mut self) -> Vec<Vec<u8>> {
+        self.fast_path_processor.take_orders()
+    }
+
     /// Returns whether a malformed Fast-Path bitmap was discarded and needs a full visual recovery.
     ///
     /// The caller decides whether the negotiated capabilities permit a recovery request.
